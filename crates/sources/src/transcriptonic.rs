@@ -1,0 +1,189 @@
+//! TranscripTonic's "advanced" webhook body, as built in `extension/background-script/exporters.js`
+//! and typed in `types/index.js` (v3.4.3).
+
+use jiff::{SignedDuration, Timestamp};
+use serde::Deserialize;
+
+use crate::{ChatMessage, Platform, Segment, Source, SpeakerNaming, Transcript};
+
+#[derive(Debug, thiserror::Error)]
+pub enum ParseError {
+    #[error(
+        "TranscripTonic sent the simple webhook body; set webhook body type to advanced in its settings"
+    )]
+    SimpleBody,
+    #[error("TranscripTonic payload is not valid at {field}: {source}")]
+    InvalidPayload {
+        field: String,
+        source: serde_json::Error,
+    },
+}
+
+impl From<serde_path_to_error::Error<serde_json::Error>> for ParseError {
+    fn from(error: serde_path_to_error::Error<serde_json::Error>) -> Self {
+        Self::InvalidPayload {
+            field: error.path().to_string(),
+            source: error.into_inner(),
+        }
+    }
+}
+
+/// Parses a raw advanced webhook body.
+///
+/// # Errors
+///
+/// Returns `ParseError::SimpleBody` for the simple body, which carries locale-formatted times
+/// and a flattened transcript, and `ParseError::InvalidPayload` for anything else that does not
+/// match the advanced shape.
+pub fn parse(payload: &[u8]) -> Result<Transcript, ParseError> {
+    let header: BodyHeader = from_json(payload)?;
+    match header.webhook_body_type {
+        BodyType::Simple => return Err(ParseError::SimpleBody),
+        BodyType::Advanced => {}
+    }
+    let body: AdvancedBody = from_json(payload)?;
+    Ok(body.into_transcript())
+}
+
+// Names the failing field, such as `transcript[3].timestamp`, in the error.
+fn from_json<'de, T: Deserialize<'de>>(payload: &'de [u8]) -> Result<T, ParseError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(payload);
+    Ok(serde_path_to_error::deserialize(&mut deserializer)?)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BodyHeader {
+    webhook_body_type: BodyType,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum BodyType {
+    Simple,
+    Advanced,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdvancedBody {
+    meeting_software: MeetingSoftware,
+    meeting_title: String,
+    meeting_start_timestamp: Timestamp,
+    meeting_end_timestamp: Timestamp,
+    // JSON.stringify drops keys whose value is undefined, as on meetings stored by old versions.
+    #[serde(default)]
+    transcript: Vec<TranscriptBlock>,
+    #[serde(default)]
+    chat_messages: Vec<RawChatMessage>,
+}
+
+#[derive(Deserialize)]
+enum MeetingSoftware {
+    #[serde(rename = "Google Meet")]
+    GoogleMeet,
+    Teams,
+    Zoom,
+    /// Meetings saved before v3.2 carry no software name.
+    #[serde(rename = "")]
+    Unknown,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TranscriptBlock {
+    person_name: String,
+    timestamp: Timestamp,
+    transcript_text: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawChatMessage {
+    person_name: String,
+    timestamp: Timestamp,
+    chat_message_text: String,
+}
+
+impl AdvancedBody {
+    fn into_transcript(mut self) -> Transcript {
+        let started_at = self.meeting_start_timestamp;
+        let ended_at = self.meeting_end_timestamp;
+        let offset_s = |at: Timestamp| {
+            at.duration_since(started_at)
+                .max(SignedDuration::ZERO)
+                .as_secs_f64()
+        };
+
+        // A block is stamped when its speaker started but pushed when it closes, so overlapping
+        // captions can arrive out of order. A block runs until the next block starts.
+        self.transcript.sort_by_key(|block| block.timestamp);
+        let block_starts: Vec<f64> = self
+            .transcript
+            .iter()
+            .map(|block| offset_s(block.timestamp))
+            .collect();
+        let call_length_s = offset_s(ended_at);
+        let segments = self
+            .transcript
+            .into_iter()
+            .enumerate()
+            .map(|(index, block)| Segment {
+                start_s: block_starts[index],
+                end_s: block_starts
+                    .get(index + 1)
+                    .copied()
+                    .unwrap_or(call_length_s)
+                    .max(block_starts[index]),
+                speaker: block.person_name,
+                text: block.transcript_text,
+            })
+            .collect();
+
+        let platform = match self.meeting_software {
+            MeetingSoftware::GoogleMeet => Platform::Meet,
+            MeetingSoftware::Teams => Platform::Teams,
+            MeetingSoftware::Zoom => Platform::Zoom,
+            MeetingSoftware::Unknown => Platform::Other,
+        };
+        // Meet titles a call with no calendar event "Meet – abc-defg-hij". The code is the only
+        // link to the call in the payload, and the title says nothing about the meeting.
+        let meet_code = match platform {
+            Platform::Meet => meet_code_from_title(&self.meeting_title),
+            Platform::Teams | Platform::Zoom | Platform::Other => None,
+        };
+        let meeting_url = meet_code.map(|code| format!("https://meet.google.com/{code}"));
+        let title = Some(self.meeting_title)
+            .filter(|title| meeting_url.is_none() && !title.trim().is_empty());
+
+        Transcript {
+            source: Source::Transcriptonic,
+            started_at,
+            ended_at,
+            platform,
+            meeting_url,
+            title,
+            speaker_naming: SpeakerNaming::Real,
+            segments,
+            chat_messages: self
+                .chat_messages
+                .into_iter()
+                .map(|message| ChatMessage {
+                    sent_at: message.timestamp,
+                    sender: message.person_name,
+                    text: message.chat_message_text,
+                })
+                .collect(),
+        }
+    }
+}
+
+fn meet_code_from_title(title: &str) -> Option<&str> {
+    let code = title.strip_prefix("Meet \u{2013} ")?;
+    let groups: Vec<&str> = code.split('-').collect();
+    let is_meet_code = groups.iter().map(|group| group.len()).eq([3, 4, 3])
+        && groups
+            .iter()
+            .all(|group| group.chars().all(|letter| letter.is_ascii_lowercase()));
+    is_meet_code.then_some(code)
+}

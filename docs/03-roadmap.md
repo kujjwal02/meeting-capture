@@ -34,6 +34,12 @@ Phase 1 is useful on its own: with TranscripTonic it covers most Meet calls.
   Plugins: `autostart`, `single-instance`, `notification`, `opener`.
 - The axum receiver listens on `127.0.0.1:47615` inside the app and saves the raw TranscripTonic
   payload before parsing. TranscripTonic sends the "advanced" webhook body.
+- TranscripTonic v3.4.3 reaches `http://127.0.0.1:47615/transcriptonic` from Chrome (live test on
+  2026-10-17), so phase 1 needs no Downloads watcher.
+- TranscripTonic names the local user "You". The pipeline replaces it with the user's name from
+  settings.
+- A Meet call with no calendar event arrives titled "Meet – abc-defg-hij". The parser turns the
+  code into `meeting_url` and drops the title.
 - The tray menu shows the listener state, each signed-in calendar account, and the last 5 meetings
   with their job state. It can retry failed jobs and open a note.
 - The settings window is plain HTML: Google accounts, LLM provider, its API key, vault path, port.
@@ -72,9 +78,6 @@ Phase 1 is useful on its own: with TranscripTonic it covers most Meet calls.
 
 ## Open questions
 
-- TranscripTonic v3.4.3 should post to `http://127.0.0.1`: its manifest allows `*://*/*` as an
-  optional host permission, and its service worker sends the POST. Chrome's Local Network Access
-  rules for extensions are untested. If the live test fails, phase 1 adds the Downloads watcher.
 - Whether the akaiketech.com Workspace admin allows unverified third-party apps to read calendars.
   If not, add a second OAuth client with an "Internal" consent screen in the akaiketech.com org.
 - Anarlog's docs say mic detection is macOS and Linux only, but `crates/detect/src/mic/windows.rs`

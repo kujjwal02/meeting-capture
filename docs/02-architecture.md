@@ -77,6 +77,11 @@ flowchart LR
 ```
 
 - `caption-receiver` saves the raw payload before parsing, so a parser bug never loses a meeting.
+  The payload is synced to disk under a unique name before the reply, because TranscripTonic never
+  re-posts a meeting it saw succeed.
+- Any web page in the browser can POST to 127.0.0.1. The receiver rejects a request whose `Origin`
+  is not TranscripTonic's extension, whose `Host` is not the receiver, or whose body is not
+  `application/json`. Local tools such as curl send no `Origin` and pass.
 - It parses the payload into a `sources` transcript and hands it to the app. It does not touch the
   job store.
 
@@ -190,10 +195,19 @@ started_at: 2026-10-16T05:30:00Z
 ended_at: 2026-10-16T06:10:00Z
 platform: meet | teams | zoom | other
 meeting_url: https://meet.google.com/abc-defg-hij
+title: Weekly sync            # what the call app showed; null if none
 speaker_naming: real | me-vs-them | diarized
 segments:
   - {start_s: 0.0, end_s: 4.2, speaker: "Ujjwal", text: "..."}
+chat_messages:
+  - {sent_at: 2026-10-16T05:31:00Z, sender: "Ujjwal", text: "..."}
 ```
+
+- `start_s` and `end_s` are seconds from `started_at`.
+- TranscripTonic records only when a caption block starts. A block ends where the next one starts,
+  and the last one ends at `ended_at`.
+- TranscripTonic posts to `http://127.0.0.1:47615/transcriptonic`. A simple body is rejected with
+  HTTP 422; only the advanced body carries ISO times and per-speaker blocks.
 
 ## Platform notes
 
