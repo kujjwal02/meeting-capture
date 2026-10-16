@@ -3,8 +3,7 @@
 //! The payload is written to disk before parsing, so a parser bug never loses a meeting. The
 //! parsed transcript goes to the app over a channel; this crate never touches the job store.
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use axum::Router;
@@ -12,7 +11,6 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::post;
-use jiff::Timestamp;
 use sources::Transcript;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
@@ -84,7 +82,7 @@ async fn receive_transcriptonic(
     let payload_dir = state.payload_dir.clone();
     let payload_size = payload.len();
     let saved = tokio::task::spawn_blocking(move || {
-        save_payload(&payload_dir, &payload).map(|path| (path, payload))
+        sources::transcriptonic::save_payload(&payload_dir, &payload).map(|path| (path, payload))
     })
     .await
     .unwrap_or_else(|join_error| Err(std::io::Error::other(join_error)));
@@ -150,36 +148,4 @@ fn check_sender(headers: &HeaderMap, allowed_hosts: &[String; 2]) -> Result<(), 
         return Err("content type is not application/json");
     }
     Ok(())
-}
-
-// TranscripTonic marks a meeting posted on a 2xx reply and never sends it again, so the payload
-// must be on disk, under a name no other payload has, before the reply.
-fn save_payload(payload_dir: &Path, payload: &[u8]) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(payload_dir)?;
-    let mut staged = tempfile::NamedTempFile::new_in(payload_dir)?;
-    staged.write_all(payload)?;
-    staged.as_file().sync_all()?;
-
-    // No colons: Windows rejects them in file names.
-    let received_at = Timestamp::now().strftime("%Y%m%dT%H%M%S%.3fZ");
-    let mut copy_number = 0_u32;
-    let payload_path = loop {
-        let file_name = match copy_number {
-            0 => format!("{received_at}-transcriptonic.json"),
-            _ => format!("{received_at}-{copy_number}-transcriptonic.json"),
-        };
-        let payload_path = payload_dir.join(file_name);
-        match staged.persist_noclobber(&payload_path) {
-            Ok(_) => break payload_path,
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                staged = error.file;
-                copy_number += 1;
-            }
-            Err(error) => return Err(error.error),
-        }
-    };
-    // The rename is durable only once the folder entry is on disk. Windows has no folder fsync.
-    #[cfg(unix)]
-    std::fs::File::open(payload_dir)?.sync_all()?;
-    Ok(payload_path)
 }

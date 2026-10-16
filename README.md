@@ -26,3 +26,14 @@ just hooks
 - `just check`: every format, lint, licence and advisory check. Run it before pushing.
 - `just fmt`: rewrite files to the formatters' output.
 - `just dev`: run the tray app.
+- `cargo run -p cli -- list`: show recent meetings. `mc ingest <payload.json>` adds a saved
+  TranscripTonic body, `mc reprocess <id>` reruns every step, and `mc retry <id>` resumes a failed
+  meeting. A note you edited is kept; `mc reprocess <id> --discard-edits` overwrites it.
+
+Settings live in `settings.toml` in the app config folder (`~/Library/Application Support/
+com.ujjwalkumar.meetingcapture` on the Mac). Fields: `vault_dir` (default `~/knowledge`), `my_name`
+(replaces TranscripTonic's "You"), and `receiver_port` (default 47615). An optional `note.md.j2`
+in the same folder replaces the built-in note template.
+
+Set `MEETING_CAPTURE_HOME` to a scratch folder to keep a dev run away from the real job store. It
+then reads `config/settings.toml` and writes `data/` inside that folder.

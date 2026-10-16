@@ -48,7 +48,7 @@ Phase 1 is useful on its own: with TranscripTonic it covers most Meet calls.
   fails to parse or validate marks the job `Failed` and names the provider.
 - Job states used: `Captured`, `Matched`, `Extracted`, `Written`, `Failed`.
 - `mc reprocess <id>` and `mc ingest <file>` reuse the pipeline crates without Tauri.
-- Logs are JSON lines from `tracing`, one span per job step with `meeting_id`, field names from the
+- Logs are JSON lines from `tracing`, one span per job step with `meeting.id`, field names from the
   OpenTelemetry semantic conventions. Adding an OTLP exporter later is one `tracing-opentelemetry`
   layer.
 

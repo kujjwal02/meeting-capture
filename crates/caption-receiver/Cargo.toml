@@ -8,9 +8,7 @@ license.workspace = true
 
 [dependencies]
 axum.workspace = true
-jiff.workspace = true
 sources.workspace = true
-tempfile.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 

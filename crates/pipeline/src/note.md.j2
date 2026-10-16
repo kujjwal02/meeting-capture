@@ -1,0 +1,32 @@
+---
+{{ frontmatter }}---
+
+# {{ title }}
+
+- **When:** {{ when }} UTC
+{% if meeting_url %}
+- **Meeting URL:** {{ meeting_url }}
+{% endif %}
+{% if attendees %}
+
+## Attendees
+
+{% for attendee in attendees %}
+- {{ attendee }}
+{% endfor %}
+{% endif %}
+
+## Transcript
+
+{% for segment in segments %}
+**[{{ segment.at }}] {{ segment.speaker }}:** {{ segment.text }}
+
+{% endfor %}
+{% if chat_messages %}
+## Chat
+
+{% for message in chat_messages %}
+**[{{ message.at }}] {{ message.sender }}:** {{ message.text }}
+
+{% endfor %}
+{% endif %}

@@ -59,6 +59,12 @@ stateDiagram-v2
 
 A retry of a `Failed` job resumes at its last finished step.
 
+The tray app and `mc` share the job store. A run holds a lease on its meeting, so one run per
+meeting is active across both processes. A new capture of the same meeting bumps its input
+revision, and the run holding the lease starts over on the new input. A note edited after its
+last write is never overwritten; the job fails and names the note. The pipeline tells its own
+writes from user edits by SHA-256, so Syncthing or git changing a file's time is not an edit.
+
 Captions from TranscripTonic are already a transcript, so their job passes `Transcribed` without
 running STT.
 

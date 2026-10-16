@@ -1,6 +1,9 @@
 //! TranscripTonic's "advanced" webhook body, as built in `extension/background-script/exporters.js`
 //! and typed in `types/index.js` (v3.4.3).
 
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize;
 
@@ -153,8 +156,14 @@ impl AdvancedBody {
             Platform::Teams | Platform::Zoom | Platform::Other => None,
         };
         let meeting_url = meet_code.map(|code| format!("https://meet.google.com/{code}"));
-        let title = Some(self.meeting_title)
-            .filter(|title| meeting_url.is_none() && !title.trim().is_empty());
+        // One line, so the title reads the same in a heading, a file name and the tray menu.
+        let title = Some(
+            self.meeting_title
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+        .filter(|title| meeting_url.is_none() && !title.is_empty());
 
         Transcript {
             source: Source::Transcriptonic,
@@ -186,4 +195,42 @@ fn meet_code_from_title(title: &str) -> Option<&str> {
             .iter()
             .all(|group| group.chars().all(|letter| letter.is_ascii_lowercase()));
     is_meet_code.then_some(code)
+}
+
+/// Saves a raw payload in `payload_dir` under a name no other payload has, synced to disk.
+///
+/// TranscripTonic marks a meeting posted on a 2xx reply and never sends it again, so the payload
+/// must be durable before the receiver replies.
+///
+/// # Errors
+///
+/// Returns the I/O error that stopped the save.
+pub fn save_payload(payload_dir: &Path, payload: &[u8]) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(payload_dir)?;
+    let mut staged = tempfile::NamedTempFile::new_in(payload_dir)?;
+    staged.write_all(payload)?;
+    staged.as_file().sync_all()?;
+
+    // No colons: Windows rejects them in file names.
+    let received_at = Timestamp::now().strftime("%Y%m%dT%H%M%S%.3fZ");
+    let mut copy_number = 0_u32;
+    let payload_path = loop {
+        let file_name = match copy_number {
+            0 => format!("{received_at}-transcriptonic.json"),
+            _ => format!("{received_at}-{copy_number}-transcriptonic.json"),
+        };
+        let payload_path = payload_dir.join(file_name);
+        match staged.persist_noclobber(&payload_path) {
+            Ok(_) => break payload_path,
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                staged = error.file;
+                copy_number += 1;
+            }
+            Err(error) => return Err(error.error),
+        }
+    };
+    // The rename is durable only once the folder entry is on disk. Windows has no folder fsync.
+    #[cfg(unix)]
+    std::fs::File::open(payload_dir)?.sync_all()?;
+    Ok(payload_path)
 }
