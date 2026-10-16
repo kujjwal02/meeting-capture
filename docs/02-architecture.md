@@ -60,10 +60,13 @@ stateDiagram-v2
 A retry of a `Failed` job resumes at its last finished step.
 
 The tray app and `mc` share the job store. A run holds a lease on its meeting, so one run per
-meeting is active across both processes. A new capture of the same meeting bumps its input
-revision, and the run holding the lease starts over on the new input. A note edited after its
-last write is never overwritten; the job fails and names the note. The pipeline tells its own
-writes from user edits by SHA-256, so Syncthing or git changing a file's time is not an edit.
+meeting is active across both processes. The lease expires after 2 minutes, and a running pipeline
+renews it every 30 s. The app runs every unfinished meeting at launch and every 5 minutes after, so
+a meeting left by a crash or a quit finishes within minutes. Failed meetings wait for a retry from
+the tray or `mc retry`. A new capture of the same meeting bumps its input revision, and the run
+holding the lease starts over on the new input. A note edited after its last write is never
+overwritten; the job fails and names the note. The pipeline tells its own writes from user edits by
+SHA-256, so Syncthing or git changing a file's time is not an edit.
 
 Captions from TranscripTonic are already a transcript, so their job passes `Transcribed` without
 running STT.
@@ -89,7 +92,8 @@ flowchart LR
   is not TranscripTonic's extension, whose `Host` is not the receiver, or whose body is not
   `application/json`. Local tools such as curl send no `Origin` and pass.
 - It parses the payload into a `sources` transcript and hands it to the app. It does not touch the
-  job store.
+  job store. It replies 200 only after the app has recorded the meeting; otherwise TranscripTonic
+  gets an error and offers a retry.
 
 ### Audio (phases 2, 3, 5, 7)
 

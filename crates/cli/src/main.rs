@@ -49,11 +49,11 @@ fn main() -> anyhow::Result<()> {
     let store = JobStore::open(&app_dirs.job_store_file())?;
     let pipeline = Pipeline::new(app_dirs.clone(), settings, store);
 
-    let ist = TimeZone::get("Asia/Kolkata").context("no time zone data for Asia/Kolkata")?;
+    let time_zone = pipeline.settings().time_zone.clone();
     match cli.command {
         Command::Ingest { payload_file } => {
             let id = ingest(&pipeline, &app_dirs, &payload_file)?;
-            print_outcome(&pipeline.run(id)?, &ist);
+            print_outcome(&pipeline.run(id)?, &time_zone);
         }
         Command::Reprocess {
             meeting_id,
@@ -61,15 +61,15 @@ fn main() -> anyhow::Result<()> {
         } => {
             print_outcome(
                 &pipeline.reprocess(MeetingId::new(meeting_id), discard_edits)?,
-                &ist,
+                &time_zone,
             );
         }
         Command::Retry { meeting_id } => {
-            print_outcome(&pipeline.run(MeetingId::new(meeting_id))?, &ist);
+            print_outcome(&pipeline.run(MeetingId::new(meeting_id))?, &time_zone);
         }
         Command::List { limit } => {
             for meeting in pipeline.store().recent(limit)? {
-                print_meeting(&meeting, &ist);
+                print_meeting(&meeting, &time_zone);
             }
         }
     }
@@ -91,25 +91,25 @@ fn ingest(
     Ok(pipeline.record_transcriptonic(&payload_path, &transcript)?)
 }
 
-fn print_outcome(outcome: &RunOutcome, ist: &TimeZone) {
+fn print_outcome(outcome: &RunOutcome, time_zone: &TimeZone) {
     match outcome {
-        RunOutcome::Finished(meeting) => print_meeting(meeting, ist),
+        RunOutcome::Finished(meeting) => print_meeting(meeting, time_zone),
         RunOutcome::AlreadyRunning => {
             println!("another process is running this meeting; it will pick up the new input");
         }
     }
 }
 
-fn print_meeting(meeting: &Meeting, ist: &TimeZone) {
+fn print_meeting(meeting: &Meeting, time_zone: &TimeZone) {
     let started_at = meeting
         .started_at
-        .to_zoned(ist.clone())
-        .strftime("%Y-%m-%d %H:%M IST");
+        .to_zoned(time_zone.clone())
+        .strftime("%Y-%m-%d %H:%M %Z");
     println!(
         "{:>4}  {}  {:<9}  {}",
         meeting.id,
         started_at,
-        format!("{:?}", meeting.state()),
+        meeting.state().label(),
         meeting.title.as_deref().unwrap_or("(no title)"),
     );
     if let Some(failure) = &meeting.failure {

@@ -1,37 +1,78 @@
-//! Tray app. Runs from login with no Dock icon and no window until settings open.
+//! Tray app with no Dock icon and no window. Receives TranscripTonic's webhook and runs the
+//! pipeline for each meeting. Starts at login once "Start at login" is on.
 
 // Release builds on Windows would otherwise open a console window next to the tray icon.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use tauri::RunEvent;
-use tauri::menu::{Menu, MenuItem};
-use tauri::tray::TrayIconBuilder;
+mod launch;
+mod meetings;
+mod tray;
 
-const QUIT_MENU_ID: &str = "quit";
+use std::sync::{Arc, Mutex, PoisonError};
+
+use jobs::JobStore;
+use pipeline::Pipeline;
+use pipeline::settings::{AppDirs, Settings};
+use tauri::{AppHandle, Manager, RunEvent};
+use tauri_plugin_autostart::MacosLauncher;
+
+#[derive(Debug, Clone)]
+pub(crate) enum Listener {
+    Starting,
+    Listening { port: u16 },
+    Stopped { reason: String },
+}
+
+pub(crate) struct AppState {
+    pub app_dirs: AppDirs,
+    /// `None` when the settings or the job store failed to load. The listener then says why.
+    pub pipeline: Option<Arc<Pipeline>>,
+    pub listener: Mutex<Listener>,
+}
+
+impl AppState {
+    pub fn listener(&self) -> Listener {
+        self.listener
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// Records the listener state and shows it in the tray.
+pub(crate) fn set_listener(app: &AppHandle, listener: Listener) {
+    match &listener {
+        Listener::Starting => {}
+        Listener::Listening { port } => tracing::info!(server.port = port, "listening"),
+        Listener::Stopped { reason } => {
+            tracing::error!(exception.message = reason, "not listening");
+        }
+    }
+    *app.state::<AppState>()
+        .listener
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = listener;
+    tray::refresh(app);
+}
 
 fn main() -> tauri::Result<()> {
     let app = tauri::Builder::default()
+        // Registered first, so a second launch exits before it binds the port.
+        .plugin(tauri_plugin_single_instance::init(|_, _, _| {
+            tracing::info!("a second launch was refused; the tray app is already running");
+        }))
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            None,
+        ))
+        .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            #[cfg(target_os = "macos")]
-            app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-
-            let quit = MenuItem::with_id(app, QUIT_MENU_ID, "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&quit])?;
-            let icon = app
-                .default_window_icon()
-                .cloned()
-                .ok_or("no app icon bundled")?;
-            TrayIconBuilder::new()
-                .icon(icon)
-                .tooltip("Meeting Capture")
-                .menu(&menu)
-                .on_menu_event(|app, event| {
-                    if event.id().as_ref() == QUIT_MENU_ID {
-                        app.exit(0);
-                    }
-                })
-                .build(app)?;
-            Ok(())
+            // Tauri panics on a setup error, and a login item has no terminal, so the log is the
+            // only place the cause can show.
+            setup(app).inspect_err(|error| {
+                tracing::error!(exception.message = %error, "app setup failed");
+                eprintln!("app setup failed: {error}");
+            })
         })
         .build(tauri::generate_context!())?;
 
@@ -44,5 +85,62 @@ fn main() -> tauri::Result<()> {
             api.prevent_exit();
         }
     });
+    Ok(())
+}
+
+fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "macos")]
+    app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+
+    let app_dirs = AppDirs::locate()?;
+    app_dirs.create()?;
+    init_logging(&app_dirs)?;
+
+    let loaded = Settings::load(&app_dirs)
+        .map_err(|error| error.to_string())
+        .and_then(|settings| {
+            let store =
+                JobStore::open(&app_dirs.job_store_file()).map_err(|error| error.to_string())?;
+            Ok((settings, store))
+        });
+    let (pipeline, listener) = match loaded {
+        Ok((settings, store)) => {
+            let port = settings.receiver_port;
+            let pipeline = Arc::new(Pipeline::new(app_dirs.clone(), settings, store));
+            (Some((pipeline, port)), Listener::Starting)
+        }
+        Err(reason) => (None, Listener::Stopped { reason }),
+    };
+    app.manage(AppState {
+        app_dirs,
+        pipeline: pipeline.as_ref().map(|(pipeline, _)| Arc::clone(pipeline)),
+        listener: Mutex::new(listener.clone()),
+    });
+    tray::create(app.handle())?;
+    match pipeline {
+        Some((pipeline, port)) => meetings::start(app.handle().clone(), pipeline, port),
+        None => set_listener(app.handle(), listener),
+    }
+    Ok(())
+}
+
+pub(crate) const LOG_FILE_NAME: &str = "app.log";
+
+// JSON lines in the app's log folder. A tray app has no terminal to write to.
+fn init_logging(app_dirs: &AppDirs) -> std::io::Result<()> {
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(app_dirs.log_dir().join(LOG_FILE_NAME))?;
+    tracing_subscriber::fmt()
+        .json()
+        .with_writer(Mutex::new(log_file))
+        .init();
+    // A panic on a worker thread would otherwise reach only stderr, which a login item discards.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        tracing::error!(exception.message = %panic, "panic");
+        default_hook(panic);
+    }));
     Ok(())
 }

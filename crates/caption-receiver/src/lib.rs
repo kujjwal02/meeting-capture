@@ -1,7 +1,8 @@
 //! Accepts TranscripTonic's webhook on 127.0.0.1 and saves the raw payload.
 //!
 //! The payload is written to disk before parsing, so a parser bug never loses a meeting. The
-//! parsed transcript goes to the app over a channel; this crate never touches the job store.
+//! parsed transcript goes to the app over a channel; this crate never touches the job store. The
+//! reply waits until the app has recorded the meeting, so a 200 means the meeting is safe.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::post;
 use sources::Transcript;
 use tokio::net::TcpListener;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// The default receiver port, set in TranscripTonic as `http://127.0.0.1:47615/transcriptonic`.
 pub const DEFAULT_PORT: u16 = 47615;
@@ -31,6 +32,8 @@ const MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 pub struct ReceivedCaptions {
     pub payload_path: PathBuf,
     pub transcript: Transcript,
+    /// The app sends `Ok` once the meeting is in the job store, or the reason it is not.
+    pub recorded: oneshot::Sender<Result<(), String>>,
 }
 
 struct ReceiverState {
@@ -114,18 +117,37 @@ async fn receive_transcriptonic(
         }
     };
 
+    let (recorded, is_recorded) = oneshot::channel();
     let captions = ReceivedCaptions {
-        payload_path,
+        payload_path: payload_path.clone(),
         transcript,
+        recorded,
     };
-    if let Err(unsent) = state.received.send(captions).await {
+    if state.received.send(captions).await.is_err() {
         tracing::error!(
-            file.path = %unsent.0.payload_path.display(),
+            file.path = %payload_path.display(),
             "app stopped taking transcripts; payload kept on disk"
         );
         return StatusCode::SERVICE_UNAVAILABLE;
     }
-    StatusCode::OK
+    match is_recorded.await {
+        Ok(Ok(())) => StatusCode::OK,
+        Ok(Err(reason)) => {
+            tracing::error!(
+                file.path = %payload_path.display(),
+                exception.message = reason,
+                "could not record the meeting; payload kept on disk"
+            );
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+        Err(_) => {
+            tracing::error!(
+                file.path = %payload_path.display(),
+                "app dropped the meeting before recording it; payload kept on disk"
+            );
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+    }
 }
 
 // Any web page in the user's browser can POST to 127.0.0.1. Pages always send their own Origin,

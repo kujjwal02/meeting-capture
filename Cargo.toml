@@ -13,6 +13,9 @@ license = "MIT"
 [workspace.dependencies]
 tauri = { version = "2.12", features = ["tray-icon"] }
 tauri-build = "2.7"
+tauri-plugin-autostart = "2.7"
+tauri-plugin-opener = "2.7"
+tauri-plugin-single-instance = "2.5"
 anyhow = "1.0"
 axum = "0.8"
 jiff = { version = "0.2", features = ["serde"] }
@@ -33,6 +36,7 @@ serde-saphyr = "2.0"
 sha2 = "0.11"
 tempfile = "3.27"
 toml = "1.1"
+caption-receiver = { path = "crates/caption-receiver" }
 jobs = { path = "crates/jobs" }
 pipeline = { path = "crates/pipeline" }
 sources = { path = "crates/sources" }

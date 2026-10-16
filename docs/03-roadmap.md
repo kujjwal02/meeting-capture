@@ -32,8 +32,9 @@ Progress is tracked in the [checklist](05-checklist.md).
 
 ## Phase 1 detail
 
-- The app runs in the background from login, tray only (`ActivationPolicy::Accessory` on macOS).
-  Plugins: `autostart`, `single-instance`, `notification`, `opener`.
+- The app runs in the background, tray only (`ActivationPolicy::Accessory` on macOS), and starts
+  at login once "Start at login" is on. Plugins: `autostart`, `single-instance`, `opener`, and
+  `notification` from build step 5.
 - The axum receiver listens on `127.0.0.1:47615` inside the app and saves the raw TranscripTonic
   payload before parsing. TranscripTonic sends the "advanced" webhook body.
 - TranscripTonic v3.4.3 reaches `http://127.0.0.1:47615/transcriptonic` from Chrome (live test on
@@ -45,6 +46,7 @@ Progress is tracked in the [checklist](05-checklist.md).
 - The tray menu shows the listener state, each signed-in calendar account, and the last 5 meetings
   with their job state. It can retry failed jobs and open a note.
 - The settings window is plain HTML: Google accounts, LLM provider, its API key, vault path, port.
+  It arrives with Google sign-in in build step 4; until then the tray opens `settings.toml`.
 - LLM provider is a closed choice: `anthropic` (default, Claude Haiku 5.5) or `openai-compatible`
   (base URL and model). The endpoint must support JSON-schema structured output; a reply that
   fails to parse or validate marks the job `Failed` and names the provider.

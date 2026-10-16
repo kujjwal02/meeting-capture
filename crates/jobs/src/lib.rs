@@ -77,6 +77,19 @@ pub enum JobState {
     Failed,
 }
 
+impl JobState {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            JobState::Captured => "Captured",
+            JobState::Matched => "Matched",
+            JobState::Extracted => "Extracted",
+            JobState::Written => "Written",
+            JobState::Failed => "Failed",
+        }
+    }
+}
+
 /// The stored input a meeting's transcript is parsed from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {
@@ -138,8 +151,9 @@ impl Meeting {
     }
 }
 
-/// Proof that this process runs the pipeline for one meeting.
-#[derive(Debug)]
+/// Proof that this process runs the pipeline for one meeting. A clone lets a second thread keep
+/// the lease alive.
+#[derive(Debug, Clone)]
 pub struct RunLease {
     id: MeetingId,
     token: String,
@@ -197,8 +211,11 @@ pub enum StoreError {
 }
 
 /// A lease not renewed for this long belongs to a process that died mid-run. Every step update
-/// renews it; a step that can take longer must call `JobStore::renew_lease`.
-const LEASE_EXPIRY_MS: i64 = 30 * 60 * 1000;
+/// renews it, and a running pipeline calls `JobStore::renew_lease` well within this time.
+pub const LEASE_EXPIRY: Duration = Duration::from_mins(2);
+
+#[expect(clippy::cast_possible_truncation, reason = "two minutes fits in i64")]
+const LEASE_EXPIRY_MS: i64 = LEASE_EXPIRY.as_millis() as i64;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -338,6 +355,36 @@ impl JobStore {
             "SELECT {MEETING_COLUMNS} FROM meetings ORDER BY started_at DESC LIMIT ?1"
         ))?;
         let rows = statement.query_map([limit], read_meeting)?;
+        rows.map(|row| row?).collect()
+    }
+
+    /// Meetings that stopped before their note was written without a recorded failure: the app
+    /// quit or crashed mid-run, or a capture arrived while it was down. Oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError` when the query fails or a row is invalid.
+    pub fn unfinished(&self) -> Result<Vec<Meeting>, StoreError> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(&format!(
+            "SELECT {MEETING_COLUMNS} FROM meetings
+             WHERE finished_step != ?1 AND failure IS NULL ORDER BY started_at"
+        ))?;
+        let rows = statement.query_map([Step::Written.as_str()], read_meeting)?;
+        rows.map(|row| row?).collect()
+    }
+
+    /// Meetings whose last run failed, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError` when the query fails or a row is invalid.
+    pub fn failed(&self) -> Result<Vec<Meeting>, StoreError> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(&format!(
+            "SELECT {MEETING_COLUMNS} FROM meetings WHERE failure IS NOT NULL ORDER BY started_at"
+        ))?;
+        let rows = statement.query_map([], read_meeting)?;
         rows.map(|row| row?).collect()
     }
 

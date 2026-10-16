@@ -22,6 +22,7 @@ pub(crate) struct NoteInput<'a> {
     pub calendar_match: &'a CalendarMatch,
     pub is_extracted: bool,
     pub my_name: Option<&'a str>,
+    pub time_zone: &'a TimeZone,
 }
 
 impl NoteInput<'_> {
@@ -80,7 +81,7 @@ pub(crate) fn render(
     };
 
     let transcript = note.transcript;
-    let started_at = transcript.started_at.to_zoned(TimeZone::UTC);
+    let started_at = transcript.started_at.to_zoned(note.time_zone.clone());
     let attendees: Vec<String> = note
         .calendar_match
         .event
@@ -146,7 +147,7 @@ pub(crate) fn render(
         .render(minijinja::context! {
             frontmatter,
             title => inline_markdown(note.title()),
-            when => started_at.strftime("%Y-%m-%d %H:%M").to_string(),
+            when => started_at.strftime("%Y-%m-%d %H:%M %Z").to_string(),
             meeting_url => transcript.meeting_url.as_deref(),
             attendees => attendees.iter().map(|attendee| inline_markdown(attendee)).collect::<Vec<_>>(),
             segments => minijinja::value::Serde(&segments),
@@ -157,7 +158,7 @@ pub(crate) fn render(
 
 fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String, PipelineError> {
     let transcript = note.transcript;
-    let started_at = transcript.started_at.to_zoned(TimeZone::UTC);
+    let started_at = transcript.started_at.to_zoned(note.time_zone.clone());
     let mut tags = vec!["area/meetings", "topic/transcript", "status/active"];
     if !note.is_extracted {
         tags.push(NEEDS_EXTRACTION_TAG);
@@ -167,7 +168,7 @@ fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String
         date: started_at.strftime("%Y-%m-%d").to_string(),
         created: started_at.strftime("%Y-%m-%d %H:%M").to_string(),
         updated: Timestamp::now()
-            .to_zoned(TimeZone::UTC)
+            .to_zoned(note.time_zone.clone())
             .strftime("%Y-%m-%d")
             .to_string(),
         tags,
@@ -183,7 +184,7 @@ fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String
 /// Note paths to try for a new meeting, in order: `YYYY/MM/yyyy-mm-dd-hhmm-<title-slug>.md`
 /// under `meetings_dir`, then the same with the meeting id, which is unique to the meeting.
 pub(crate) fn note_path_candidates(meetings_dir: &Path, note: &NoteInput<'_>) -> [PathBuf; 2] {
-    let started_at = note.transcript.started_at.to_zoned(TimeZone::UTC);
+    let started_at = note.transcript.started_at.to_zoned(note.time_zone.clone());
     let month_dir = meetings_dir
         .join(started_at.strftime("%Y").to_string())
         .join(started_at.strftime("%m").to_string());

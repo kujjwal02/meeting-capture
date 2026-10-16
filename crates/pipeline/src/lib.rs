@@ -4,7 +4,10 @@ pub mod calendar;
 mod note;
 pub mod settings;
 
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::{Duration, Instant};
 
 use jobs::{
     InputKind, JobStore, LeaseRelease, Meeting, MeetingId, NotePathClaim, RunLease, Step,
@@ -40,6 +43,8 @@ pub enum PipelineError {
         "note {path} was edited after the last write; run `mc reprocess <id> --discard-edits` to overwrite it"
     )]
     NoteEdited { path: PathBuf },
+    #[error("the pipeline crashed: {0}")]
+    Panicked(String),
     #[error("could not write note {path}: {source}")]
     WriteNote {
         path: PathBuf,
@@ -56,6 +61,9 @@ pub enum RunOutcome {
     AlreadyRunning,
 }
 
+// Longer than any step should take, LLM call included.
+const MAX_RUN_TIME: Duration = Duration::from_mins(15);
+
 pub struct Pipeline {
     app_dirs: AppDirs,
     settings: Settings,
@@ -70,6 +78,11 @@ impl Pipeline {
             settings,
             store,
         }
+    }
+
+    #[must_use]
+    pub fn settings(&self) -> &Settings {
+        &self.settings
     }
 
     #[must_use]
@@ -109,11 +122,43 @@ impl Pipeline {
             tracing::info!("another run holds this meeting");
             return Ok(RunOutcome::AlreadyRunning);
         };
+        let (stop_renewing, is_run_over) = std::sync::mpsc::channel::<()>();
+        let renewed_lease = lease.clone();
         let mut lease = LeaseGuard {
             store: &self.store,
             lease: Some(lease),
         };
-        self.run_leased(&mut lease)
+        std::thread::scope(|scope| {
+            scope.spawn(move || self.keep_lease_alive(&renewed_lease, &is_run_over));
+            let outcome = self.run_leased(&mut lease);
+            drop(stop_renewing);
+            outcome
+        })
+    }
+
+    // A step such as the LLM call can outlast the lease. Renewing from a second thread keeps the
+    // lease short, so a crashed process frees its meetings within `jobs::LEASE_EXPIRY`. Renewal
+    // stops after `MAX_RUN_TIME`, so a hung run frees its meeting too; the note write checks the
+    // lease, so the hung run cannot overwrite a later run's note.
+    fn keep_lease_alive(&self, lease: &RunLease, is_run_over: &std::sync::mpsc::Receiver<()>) {
+        let _span =
+            tracing::info_span!("pipeline.lease", meeting.id = %lease.meeting_id()).entered();
+        let renew_until = Instant::now() + MAX_RUN_TIME;
+        while let Err(RecvTimeoutError::Timeout) = is_run_over.recv_timeout(jobs::LEASE_EXPIRY / 4)
+        {
+            if Instant::now() > renew_until {
+                tracing::error!("run is still going after 15 minutes; letting the lease expire");
+                return;
+            }
+            match self.store.renew_lease(lease) {
+                Ok(()) => {}
+                // The run gave the lease back between two checks.
+                Err(StoreError::LeaseLost(_)) => return,
+                Err(error) => {
+                    tracing::warn!(exception.message = %error, "could not renew the run lease");
+                }
+            }
+        }
     }
 
     /// Runs every step again from the stored input. The note keeps its path. Without
@@ -136,7 +181,13 @@ impl Pipeline {
         loop {
             let meeting = self.store.get(id)?;
             let revision = meeting.input_revision;
-            let release = match self.run_steps(lease.held(), &meeting) {
+            // A panic in a step becomes a recorded failure, so the sweep does not rerun the
+            // meeting forever and the tray shows the cause.
+            let steps = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                self.run_steps(lease.held(), &meeting)
+            }))
+            .unwrap_or_else(|panic| Err(PipelineError::Panicked(panic_message(panic.as_ref()))));
+            let release = match steps {
                 Ok(()) => self.store.release_run(lease.held(), revision)?,
                 Err(PipelineError::Store(StoreError::Superseded(_))) => continue,
                 Err(error @ PipelineError::Store(StoreError::LeaseLost(_))) => return Err(error),
@@ -217,6 +268,7 @@ impl Pipeline {
                 calendar_match: &calendar_match,
                 is_extracted,
                 my_name: self.settings.my_name.as_deref(),
+                time_zone: &self.settings.time_zone,
             };
             let contents = note::render(&note, &self.app_dirs.note_template_file())?;
             let note_sha256 = note::note_sha256(contents.as_bytes());
@@ -232,7 +284,10 @@ impl Pipeline {
                 &self.app_dirs.note_staging_dir(),
                 &note_path,
                 &contents,
-                || check_note_unedited(&note_path, meeting),
+                || {
+                    self.store.renew_lease(lease)?;
+                    check_note_unedited(&note_path, meeting)
+                },
             )?;
             self.store.mark_written(lease, revision, &note_sha256)?;
             tracing::info!(file.path = %note_path.display(), "note written");
@@ -314,6 +369,14 @@ fn check_note_unedited(note_path: &Path, meeting: &Meeting) -> Result<(), Pipeli
             path: note_path.to_path_buf(),
             source,
         }),
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    match (panic.downcast_ref::<&str>(), panic.downcast_ref::<String>()) {
+        (Some(message), _) => (*message).to_owned(),
+        (None, Some(message)) => message.clone(),
+        (None, None) => "a panic with no message".to_owned(),
     }
 }
 

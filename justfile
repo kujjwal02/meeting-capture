@@ -33,3 +33,16 @@ hooks:
 # Run the tray app in dev mode.
 dev:
     cd crates/app && cargo tauri dev
+
+# The self-signed identity that signs the Mac app.
+signing-identity := "Meeting Capture Dev"
+
+# Create the signing identity in the login keychain, once per Mac.
+[macos]
+signing-cert:
+    scripts/create-signing-cert.sh "{{signing-identity}}"
+
+# Build the signed Mac app bundle. Run `just signing-cert` once first.
+[macos]
+bundle:
+    cd crates/app && APPLE_SIGNING_IDENTITY="{{signing-identity}}" cargo tauri build --bundles app

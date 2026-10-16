@@ -21,7 +21,7 @@ crates.io on 2026-10-17.
 | Job execution | Own state table on rusqlite |  | See below: the one piece we write | apalis 1.0: released 2026-10-12, apalis-sqlite has 39k downloads in 90 days, and its task model does not give the per-meeting state the tray shows |
 | Retry | backon | 1.6 | Async backoff with jitter | backoff: last release 2021 |
 | Settings file | toml + directories | 1.1 / 6.0 | Plain TOML in the OS config folder, owned by the pipeline crate; the mc CLI reads it without Tauri | tauri-plugin-store: JSON tied to the Tauri app, the CLI could not read it |
-| Time | jiff | 0.2 | Time zones built in (UTC stored, IST shown), DST-safe arithmetic | chrono: needs chrono-tz for zones, weaker API. time: no zone database |
+| Time | jiff | 0.2 | Time zones built in (UTC stored, the configured zone shown), DST-safe arithmetic | chrono: needs chrono-tz for zones, weaker API. time: no zone database |
 | Note rendering | minijinja + serde-saphyr | 3.0 / 2.0 | Runtime template, so the note shape changes without a rebuild. serde-saphyr writes the YAML frontmatter | askama: compiled-in templates. serde_yaml: deprecated. serde_yml: RUSTSEC-2025-0068, unsound |
 | Atomic write | tempfile | 3.27 | NamedTempFile::persist renames into place on the same volume | atomic-write-file: writes the temp file inside the vault folder, where Syncthing sees it |
 | File names | slug | 0.1 | Lowercase ASCII slugs; deunicode transliterates non-Latin event titles. 7.8M downloads in 90 days, last release 2024-08, a finished 100-line crate | sanitize-filename: keeps case and spaces. Own slugifier: would drop Hindi titles to nothing |

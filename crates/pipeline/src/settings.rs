@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use directories::{ProjectDirs, UserDirs};
+use jiff::tz::TimeZone;
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -23,6 +24,14 @@ pub enum SettingsError {
     VaultDirMissing { path: PathBuf },
     #[error("settings field my_name: must not be blank")]
     BlankMyName,
+    #[error(
+        "settings field time_zone: {name:?} is not a time zone; use an IANA name such as \"Asia/Kolkata\" or \"Europe/London\""
+    )]
+    UnknownTimeZone { name: String },
+    #[error(
+        "settings field time_zone: the device time zone is unknown ({reason}); set an IANA name such as \"Asia/Kolkata\""
+    )]
+    NoDeviceTimeZone { reason: String },
     #[error("could not create app folder {path}: {source}")]
     CreateDir {
         path: PathBuf,
@@ -70,6 +79,7 @@ impl AppDirs {
             &self.config_dir,
             &self.payload_dir(),
             &self.note_staging_dir(),
+            &self.log_dir(),
         ] {
             std::fs::create_dir_all(path).map_err(|source| SettingsError::CreateDir {
                 path: path.clone(),
@@ -101,6 +111,11 @@ impl AppDirs {
         self.data_dir.join("payloads")
     }
 
+    #[must_use]
+    pub fn log_dir(&self) -> PathBuf {
+        self.data_dir.join("logs")
+    }
+
     /// Notes are written here first, then renamed into the vault, so Syncthing never sees a
     /// half-written note.
     #[must_use]
@@ -115,6 +130,8 @@ pub struct Settings {
     /// Replaces "You", the name TranscripTonic gives the local user.
     pub my_name: Option<String>,
     pub receiver_port: u16,
+    /// Note names, dates and the times the tray and `mc` show. Stored times stay UTC.
+    pub time_zone: TimeZone,
 }
 
 #[derive(Deserialize)]
@@ -123,9 +140,28 @@ struct SettingsFile {
     vault_dir: Option<PathBuf>,
     my_name: Option<String>,
     receiver_port: Option<u16>,
+    time_zone: Option<String>,
 }
 
 const DEFAULT_RECEIVER_PORT: u16 = 47615;
+
+/// Written when the user opens a settings file that does not exist yet.
+pub const SETTINGS_TEMPLATE: &str = "\
+# Meeting Capture settings. Quit and reopen the app after a change.
+# Uncomment a line to change it from the default.
+
+# The Obsidian vault. Notes go under areas/meetings.
+# vault_dir = \"/Users/you/knowledge\"
+
+# Replaces \"You\" in TranscripTonic transcripts.
+# my_name = \"Your Name\"
+
+# The port in TranscripTonic's webhook URL, http://127.0.0.1:47615/transcriptonic.
+# receiver_port = 47615
+
+# The IANA time zone for note names and shown times. Defaults to the device's time zone.
+# time_zone = \"Asia/Kolkata\"
+";
 
 impl Settings {
     /// Loads and validates the settings file. A missing file gives the defaults.
@@ -144,6 +180,7 @@ impl Settings {
                 vault_dir: None,
                 my_name: None,
                 receiver_port: None,
+                time_zone: None,
             },
             Err(source) => return Err(SettingsError::Read { path, source }),
         };
@@ -165,10 +202,19 @@ impl Settings {
         {
             return Err(SettingsError::BlankMyName);
         }
+        let time_zone = match file.time_zone {
+            Some(name) => {
+                TimeZone::get(&name).map_err(|_| SettingsError::UnknownTimeZone { name })?
+            }
+            None => TimeZone::try_system().map_err(|error| SettingsError::NoDeviceTimeZone {
+                reason: error.to_string(),
+            })?,
+        };
         Ok(Self {
             vault_dir,
             my_name: file.my_name,
             receiver_port: file.receiver_port.unwrap_or(DEFAULT_RECEIVER_PORT),
+            time_zone,
         })
     }
 

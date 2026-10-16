@@ -26,14 +26,26 @@ just hooks
 - `just check`: every format, lint, licence and advisory check. Run it before pushing.
 - `just fmt`: rewrite files to the formatters' output.
 - `just dev`: run the tray app.
+- `just signing-cert`: once per Mac, add a self-signed code-signing identity to the login
+  keychain, so macOS keeps the app's permissions across rebuilds. Needs `brew install openssl@3`.
+- `just bundle`: build the signed `Meeting Capture.app` in `target/release/bundle/macos`.
 - `cargo run -p cli -- list`: show recent meetings. `mc ingest <payload.json>` adds a saved
   TranscripTonic body, `mc reprocess <id>` reruns every step, and `mc retry <id>` resumes a failed
   meeting. A note you edited is kept; `mc reprocess <id> --discard-edits` overwrites it.
 
+The tray menu shows whether the receiver is listening and the last 5 meetings with their state. Each
+meeting can open its note or retry a failure, and "Retry failed" retries them all. "Start at login"
+adds a LaunchAgent; dev builds show it disabled. "Show log file" selects the app's JSON log in
+Finder, `logs/app.log` in the app data folder (`~/Library/Application Support/
+com.ujjwalkumar.meetingcapture` on the Mac).
+
 Settings live in `settings.toml` in the app config folder (`~/Library/Application Support/
 com.ujjwalkumar.meetingcapture` on the Mac). Fields: `vault_dir` (default `~/knowledge`), `my_name`
-(replaces TranscripTonic's "You"), and `receiver_port` (default 47615). An optional `note.md.j2`
-in the same folder replaces the built-in note template.
+(replaces TranscripTonic's "You"), `receiver_port` (default 47615), and `time_zone` (an IANA name
+such as `Asia/Kolkata`; default the device's zone, used for note names, note dates and shown times).
+An optional `note.md.j2` in the same folder replaces the built-in note template. "Open settings
+file" in the tray creates the file with every field commented out. Quit and reopen the app after a
+change.
 
 Set `MEETING_CAPTURE_HOME` to a scratch folder to keep a dev run away from the real job store. It
 then reads `config/settings.toml` and writes `data/` inside that folder.

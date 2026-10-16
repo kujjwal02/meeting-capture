@@ -61,23 +61,39 @@ Done when:
 - [x] Transcript text escaped, so it cannot add tags, links, headings or comments to a note.
 - [x] Edit guard: a note the user edited is never overwritten (SHA-256 of each write).
 - [x] "You" replaced by your name from settings.
+- [x] Note names, note dates and shown times use the `time_zone` setting, by default the
+  device's. Stored times stay UTC.
 - [x] `mc ingest`, `mc reprocess [--discard-edits]`, `mc retry`, `mc list`. Times shown in IST.
 - [x] JSON logs from `tracing` with OpenTelemetry field names.
 - [x] Review by two subagents; findings fixed.
 
 ### Step 3: tray app
 
-- [ ] Receiver runs inside the app; each payload becomes a job and runs the pipeline.
-- [ ] The receiver replies 200 only after the job is recorded.
-- [ ] At launch, run every job left in `Captured` or with an expired lease.
-- [ ] Autostart at login, single instance, tray only (`ActivationPolicy::Accessory`).
-- [ ] Tray menu: listener state, the last 5 meetings with job state, retry a failed job, open a
-  note.
-- [ ] Settings window (plain HTML): vault path, port, your name.
-- [ ] Self-signed build.
+- [x] Receiver runs inside the app; each payload becomes a job and runs the pipeline.
+- [x] The receiver replies 200 only after the job is recorded.
+- [x] Every unfinished meeting runs at launch and every 5 minutes, each on its own thread. A dead
+  process's lease expires after 2 minutes; a running pipeline renews it every 30 s for up to
+  15 minutes. The note write checks the lease first.
+- [x] A panic in a run is recorded as the meeting's failure. Panics and setup errors go to the
+  log.
+- [x] Single instance, tray only (`ActivationPolicy::Accessory`, `LSUIElement`).
+- [x] "Start at login" toggle in the tray (a LaunchAgent), release builds only.
+- [x] Tray menu: listener state, the last 5 meetings with job state, open a note, retry one or
+  all failed meetings, open the settings file, show the log file.
+- [x] JSON log in `logs/app.log` in the app data folder.
+- [x] Every tray "open" names its app: notes open in Obsidian (else the text editor), the
+  settings file in the text editor, the log file selected in Finder. None depends on a file
+  type's default app.
+- [x] `just signing-cert` creates a self-signed identity; `just bundle` signs the app with it.
+- [ ] Create the signing identity and build a signed bundle.
+- [ ] Check the tray menu by hand: listener line, meetings, retry, open note, start at login.
+- [ ] After a reboot the tray icon appears with no Dock icon and no window, and says
+  "Listening".
 
 ### Step 4: Google sign-in and calendar match
 
+- [ ] Settings window (plain HTML) with the sign-in button, vault path, port and your name.
+  Until then the tray opens `settings.toml`.
 - [ ] OAuth client of type "Desktop app", consent screen "External" and "In production".
 - [ ] "Add Google account": authorization code flow with PKCE and a loopback redirect in the
   default browser.
@@ -96,10 +112,13 @@ Done when:
   (base URL and model).
 - [ ] Extraction with `prompt_typed` and a JSON schema. A reply that fails to validate marks the
   job `Failed` and names the provider.
-- [ ] Lease renewed during the LLM call.
+- [x] Lease renewed during the LLM call (step 3 renews it for every run).
+- [ ] Timeouts on the LLM call, so a hung call fails instead of waiting for the lease cap.
 - [ ] Fallback note: transcript only, tagged `status/needs-extraction`, retried later.
 - [ ] Note sections rewritten without losing the user's edits elsewhere in the note.
 - [ ] Settings window: LLM provider and API key.
+- [ ] A note-edited failure offers "Overwrite my edits" in the tray, so it can be cleared without
+  `mc`.
 - [ ] "Note written" notification.
 - [ ] Compare Haiku 5.5 against GLM-5.3-Flash on five real transcripts.
 

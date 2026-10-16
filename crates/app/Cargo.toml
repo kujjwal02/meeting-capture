@@ -10,7 +10,17 @@ license.workspace = true
 tauri-build.workspace = true
 
 [dependencies]
+caption-receiver.workspace = true
+jiff.workspace = true
+jobs.workspace = true
+pipeline.workspace = true
 tauri.workspace = true
+tauri-plugin-autostart.workspace = true
+tauri-plugin-opener.workspace = true
+tauri-plugin-single-instance.workspace = true
+tokio = { workspace = true, features = ["net", "sync", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
