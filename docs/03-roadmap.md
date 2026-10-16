@@ -16,6 +16,8 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 
 Phase 1 is useful on its own: with TranscripTonic it covers most Meet calls.
 
+Progress is tracked in the [checklist](05-checklist.md).
+
 ## Phase 0 detail
 
 - `rust-toolchain.toml` pins Rust 1.98.1 with `clippy` and `rustfmt`.
