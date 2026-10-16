@@ -1,0 +1,6 @@
+[global]
+line_length = 100
+
+[MD013]
+tables = false
+code_blocks = false

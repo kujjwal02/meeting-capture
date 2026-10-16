@@ -1,0 +1,14 @@
+scratch/
+target/
+.DS_Store
+.env
+fixtures/private/
+# Call recordings never enter the repo.
+*.wav
+*.m4a
+*.mp3
+*.mp4
+*.mkv
+*.webm
+crates/app/gen/
+.vscode/

@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+default-members = ["crates/app"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.98"
+publish = false
+license = "MIT"
+
+[workspace.dependencies]
+tauri = { version = "2.12", features = ["tray-icon"] }
+tauri-build = "2.7"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"

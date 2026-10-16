@@ -1,0 +1,5 @@
+# Windows checkouts keep LF so rustfmt and biome output matches on both machines.
+* text=auto eol=lf
+*.png binary
+*.icns binary
+*.ico binary

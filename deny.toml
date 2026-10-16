@@ -1,0 +1,42 @@
+[graph]
+all-features = true
+# The app ships on Mac and Windows only; Linux-only crates (gtk-rs) are out of scope.
+targets = [
+  "aarch64-apple-darwin",
+  "x86_64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
+]
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+# The list covers crates arriving in later phases, so some entries are unused today.
+unused-allowed-license = "allow"
+allow = [
+  "MIT",
+  "MIT-0",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Zlib",
+  "Unicode-3.0",
+  "MPL-2.0",
+]
+
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# Workspace path dependencies carry no version and would otherwise count as wildcards.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
