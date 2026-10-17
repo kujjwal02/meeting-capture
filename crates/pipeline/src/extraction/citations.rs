@@ -91,8 +91,8 @@ pub(super) fn check(notes: MeetingNotes, prompt: &Prompt) -> CheckedNotes {
             Some(ActionItem {
                 citations: checker.check_item(item.citations)?,
                 task: item.task,
-                owner: item.owner,
-                due: item.due,
+                owner: present(item.owner),
+                due: present(item.due),
             })
         })
         .collect();
@@ -113,8 +113,8 @@ pub(super) fn check(notes: MeetingNotes, prompt: &Prompt) -> CheckedNotes {
             Some(Commitment {
                 citations: checker.check_item(item.citations)?,
                 task: item.task,
-                recipient: item.recipient,
-                due: item.due,
+                recipient: present(item.recipient),
+                due: present(item.due),
                 strength: item.strength,
             })
         })
@@ -283,6 +283,11 @@ fn best_segment<'a>(segments: &'a [LineSegment], quote: &[String]) -> &'a LineSe
 // Whole words in order, so "he s" never matches inside "the sea".
 fn holds_phrase(line: &[String], quote: &[String]) -> bool {
     !quote.is_empty() && line.windows(quote.len()).any(|window| window == quote)
+}
+
+// Models told to send null for an unknown owner or date sometimes send "" instead.
+fn present(text: Option<String>) -> Option<String> {
+    text.filter(|text| !text.trim().is_empty())
 }
 
 /// Lower case, punctuation as spaces, fillers gone.

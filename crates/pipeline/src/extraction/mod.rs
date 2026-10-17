@@ -102,6 +102,7 @@ pub enum CommitmentStrength {
 #[serde(deny_unknown_fields)]
 pub struct Citation {
     /// The [n] number of the transcript line.
+    #[schemars(schema_with = "segment_id_schema")]
     pub segment_id: u32,
     /// 3 to 15 words copied exactly from that line, caption errors included.
     pub quote: String,
@@ -112,10 +113,20 @@ const MAX_SUMMARY_CHARS: usize = 1500;
 // 15 words of long Hinglish words still fit.
 const MAX_QUOTE_CHARS: usize = 200;
 
-/// The JSON schema of a reply, for providers that take one.
+// schemars would add `format: uint32`, which is not a standard format and which strict schema
+// checkers reject. The parser still holds the id to a `u32`.
+fn segment_id_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type": "integer"})
+}
+
+/// The JSON schema of a reply, for Claude Code. It refuses the `$schema` URI schemars adds.
 #[must_use]
 pub fn reply_schema() -> serde_json::Value {
-    schemars::schema_for!(MeetingNotes).to_value()
+    let mut schema = schemars::schema_for!(MeetingNotes).to_value();
+    if let Some(object) = schema.as_object_mut() {
+        object.remove("$schema");
+    }
+    schema
 }
 
 /// Reads a reply that should be one JSON object. Models that cannot be held to a schema wrap it
@@ -199,7 +210,10 @@ pub fn reply_errors(notes: &MeetingNotes, prompt: &Prompt) -> Vec<String> {
         );
     }
     for (index, item) in notes.action_items.iter().enumerate() {
-        if let Some(owner) = &item.owner
+        if let Some(owner) = item
+            .owner
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
             && !prompt.is_on_roster(owner)
         {
             errors.push(format!(

@@ -3,6 +3,8 @@
 pub mod calendar;
 pub mod extraction;
 pub mod google;
+pub mod keychain;
+pub mod llm;
 mod note;
 pub mod settings;
 
@@ -128,7 +130,7 @@ impl Pipeline {
             &transcript,
             self.settings.my_name.as_deref(),
             &attendees,
-            &[],
+            &self.settings.llm.glossary,
         ))
     }
 

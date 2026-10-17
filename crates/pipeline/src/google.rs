@@ -15,6 +15,8 @@ use oauth2::{
 };
 use serde::Deserialize;
 
+pub use crate::keychain::{Keychain, KeychainError};
+
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
@@ -32,12 +34,8 @@ const MAX_EVENTS: &str = "250";
 
 #[derive(Debug, thiserror::Error)]
 pub enum GoogleError {
-    // The reason is text: some keyring errors carry the raw secret bytes in their Debug output.
-    #[error("could not {action} in the OS keychain: {reason}")]
-    Keychain {
-        action: &'static str,
-        reason: String,
-    },
+    #[error(transparent)]
+    Keychain(#[from] KeychainError),
     #[error("Google account {email} needs to sign in again")]
     SignInAgain { email: String },
     #[error("the Google client secret is not set; add it in Settings")]
@@ -145,58 +143,7 @@ impl OAuthClient {
     }
 }
 
-/// This install's entries in the macOS Keychain or Windows Credential Manager.
-#[derive(Debug, Clone)]
-pub struct Keychain {
-    service: String,
-}
-
 impl Keychain {
-    #[must_use]
-    pub fn new(service: String) -> Self {
-        Self { service }
-    }
-
-    fn read(&self, user: &str) -> Result<Option<String>, GoogleError> {
-        let keychain_error = |source: keyring::Error| GoogleError::Keychain {
-            action: "read a secret",
-            reason: source.to_string(),
-        };
-        match keyring::Entry::new(&self.service, user)
-            .map_err(keychain_error)?
-            .get_password()
-        {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(source) => Err(keychain_error(source)),
-        }
-    }
-
-    fn write(&self, user: &str, secret: &str) -> Result<(), GoogleError> {
-        let keychain_error = |source: keyring::Error| GoogleError::Keychain {
-            action: "save a secret",
-            reason: source.to_string(),
-        };
-        keyring::Entry::new(&self.service, user)
-            .map_err(keychain_error)?
-            .set_password(secret)
-            .map_err(keychain_error)
-    }
-
-    fn delete(&self, user: &str) -> Result<(), GoogleError> {
-        let keychain_error = |source: keyring::Error| GoogleError::Keychain {
-            action: "delete a secret",
-            reason: source.to_string(),
-        };
-        match keyring::Entry::new(&self.service, user)
-            .map_err(keychain_error)?
-            .delete_credential()
-        {
-            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(source) => Err(keychain_error(source)),
-        }
-    }
-
     /// # Errors
     ///
     /// Returns `GoogleError::Keychain` when the keychain refuses the read.
@@ -208,7 +155,7 @@ impl Keychain {
     ///
     /// Returns `GoogleError::Keychain` when the keychain refuses the write.
     pub fn set_client_secret(&self, client_secret: &str) -> Result<(), GoogleError> {
-        self.write(CLIENT_SECRET_USER, client_secret)
+        Ok(self.write(CLIENT_SECRET_USER, client_secret)?)
     }
 
     /// The OAuth client for `client_id`, with its secret from the keychain.
@@ -250,7 +197,7 @@ impl Keychain {
                 tracing::warn!(user.email = email, exception.message = %error, "could not revoke the Google grant");
             }
         }
-        self.delete(&user)
+        Ok(self.delete(&user)?)
     }
 }
 

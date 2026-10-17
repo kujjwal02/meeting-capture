@@ -40,6 +40,28 @@ pub enum SettingsError {
     GoogleClientId { client_id: String },
     #[error("settings field google.accounts: {email:?} is not an email address or is listed twice")]
     GoogleAccount { email: String },
+    #[error("settings field llm.{field}: required for provider {provider}")]
+    LlmFieldMissing {
+        field: &'static str,
+        provider: &'static str,
+    },
+    #[error("settings field llm.{field}: provider {provider} does not use it; remove it")]
+    LlmFieldUnused {
+        field: &'static str,
+        provider: &'static str,
+    },
+    #[error(
+        "settings field llm.base_url: {url:?} must be an https URL, or http on localhost, 127.0.0.1 or [::1]"
+    )]
+    LlmBaseUrl { url: String },
+    #[error("settings field llm.model: must not be blank")]
+    BlankLlmModel,
+    #[error(
+        "settings field llm.glossary: entries must not be blank, and at most {max} are allowed"
+    )]
+    LlmGlossary { max: usize },
+    #[error("settings field llm.claude_path: {path} is not a file{hint}")]
+    ClaudePath { path: PathBuf, hint: &'static str },
     #[error("could not write settings file {path}: {source}")]
     Write {
         path: PathBuf,
@@ -143,6 +165,12 @@ impl AppDirs {
         self.data_dir.join("logs")
     }
 
+    /// The empty working folder for Claude Code, so it reads no project files.
+    #[must_use]
+    pub fn claude_code_dir(&self) -> PathBuf {
+        self.data_dir.join("claude-code")
+    }
+
     /// Notes are written here first, then renamed into the vault, so Syncthing never sees a
     /// half-written note.
     #[must_use]
@@ -160,6 +188,82 @@ pub struct Settings {
     /// Note names, dates and the times the tray and `mc` show. Stored times stay UTC.
     pub time_zone: TimeZone,
     pub google: GoogleSettings,
+    pub llm: LlmSettings,
+}
+
+/// The LLM that writes the notes. Validated once on load.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmSettings {
+    /// No provider: extraction is off and notes carry only the transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderKind>,
+    /// The provider's default when absent; required for `openai-compatible`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// `openai-compatible` only, for example `https://openrouter.ai/api/v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    /// `claude-code` only. Claude Code's own default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
+    /// Names and terms the captions often mishear, given to the model to spell right.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub glossary: Vec<String>,
+    /// `claude-code` only: the `claude` binary, when it is not in a standard install folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKind {
+    /// The Anthropic API, with a key from the keychain.
+    Anthropic,
+    /// Any endpoint that speaks the `OpenAI` Chat Completions API, such as `OpenRouter` or Ollama.
+    OpenaiCompatible,
+    /// A signed-in Claude Code, billed to the user's Claude plan.
+    ClaudeCode,
+}
+
+impl ProviderKind {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenaiCompatible => "openai-compatible",
+            Self::ClaudeCode => "claude-code",
+        }
+    }
+
+    /// The model used when the settings name none.
+    #[must_use]
+    pub fn default_model(self) -> Option<&'static str> {
+        match self {
+            Self::Anthropic => Some("claude-haiku-5-5"),
+            Self::ClaudeCode => Some("sonnet"),
+            Self::OpenaiCompatible => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Effort {
+    Low,
+    Medium,
+    High,
+}
+
+impl Effort {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,6 +291,8 @@ pub struct SettingsFile {
     pub time_zone: Option<String>,
     #[serde(default)]
     pub google: GoogleSettings,
+    #[serde(default)]
+    pub llm: LlmSettings,
 }
 
 const DEFAULT_RECEIVER_PORT: u16 = 47615;
@@ -203,6 +309,12 @@ const SETTINGS_HEADER: &str = "\
 # time_zone: the IANA time zone for note names and shown times. Default: the device's.
 # [google] client_id: the Desktop app OAuth client. Its secret is in the OS keychain.
 # [google] accounts: signed-in accounts. On a tied calendar match the first one wins.
+# [llm] provider: anthropic, openai-compatible or claude-code. Absent: notes carry no summary.
+# [llm] model: defaults to claude-haiku-5-5 (anthropic) or sonnet (claude-code).
+# [llm] base_url: the openai-compatible endpoint. API keys are in the OS keychain.
+# [llm] effort: low, medium or high, claude-code only.
+# [llm] glossary: names and terms the captions often mishear.
+# [llm] claude_path: the claude binary, when it is not in a standard install folder.
 
 ";
 
@@ -307,17 +419,115 @@ impl Settings {
                 });
             }
         }
+        file.llm.validate()?;
         Ok(Self {
             vault_dir,
             my_name: file.my_name,
             receiver_port: file.receiver_port.unwrap_or(DEFAULT_RECEIVER_PORT),
             time_zone,
             google: file.google,
+            llm: file.llm,
         })
     }
 
     #[must_use]
     pub fn meetings_dir(&self) -> PathBuf {
         self.vault_dir.join(Path::new("areas").join("meetings"))
+    }
+}
+
+// Each word costs prompt tokens on every call, and past about a hundred they stop helping.
+const MAX_GLOSSARY_ENTRIES: usize = 100;
+
+impl LlmSettings {
+    /// # Errors
+    ///
+    /// Returns `SettingsError` naming the first invalid `llm` field.
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        let llm = self;
+        if llm
+            .model
+            .as_deref()
+            .is_some_and(|model| model.trim().is_empty())
+        {
+            return Err(SettingsError::BlankLlmModel);
+        }
+        if llm.glossary.len() > MAX_GLOSSARY_ENTRIES
+            || llm.glossary.iter().any(|entry| entry.trim().is_empty())
+        {
+            return Err(SettingsError::LlmGlossary {
+                max: MAX_GLOSSARY_ENTRIES,
+            });
+        }
+        let Some(provider) = llm.provider else {
+            return Ok(());
+        };
+        let unused = |field| SettingsError::LlmFieldUnused {
+            field,
+            provider: provider.as_str(),
+        };
+        let missing = |field| SettingsError::LlmFieldMissing {
+            field,
+            provider: provider.as_str(),
+        };
+        match provider {
+            ProviderKind::Anthropic | ProviderKind::OpenaiCompatible => {
+                if llm.effort.is_some() {
+                    return Err(unused("effort"));
+                }
+                if llm.claude_path.is_some() {
+                    return Err(unused("claude_path"));
+                }
+            }
+            ProviderKind::ClaudeCode => {
+                if let Some(path) = &llm.claude_path {
+                    if !path.is_file() {
+                        return Err(SettingsError::ClaudePath {
+                            path: path.clone(),
+                            hint: "",
+                        });
+                    }
+                    // npm's .cmd shim needs cmd.exe, which reparses the arguments.
+                    if path.extension().is_some_and(|extension| {
+                        extension.eq_ignore_ascii_case("cmd")
+                            || extension.eq_ignore_ascii_case("bat")
+                    }) {
+                        return Err(SettingsError::ClaudePath {
+                            path: path.clone(),
+                            hint: "; use claude.exe from the native installer, not the npm .cmd shim",
+                        });
+                    }
+                }
+            }
+        }
+        match provider {
+            ProviderKind::OpenaiCompatible => {
+                let url = llm.base_url.as_deref().ok_or_else(|| missing("base_url"))?;
+                // The transcript and the API key travel in the request, so plain http is for a
+                // local server only.
+                let is_allowed =
+                    reqwest::Url::parse(url).is_ok_and(|parsed| match parsed.scheme() {
+                        "https" => true,
+                        "http" => {
+                            matches!(parsed.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"))
+                        }
+                        _ => false,
+                    });
+                if !is_allowed {
+                    return Err(SettingsError::LlmBaseUrl {
+                        url: url.to_owned(),
+                    });
+                }
+                if llm.model.is_none() {
+                    return Err(missing("model"));
+                }
+            }
+            ProviderKind::Anthropic | ProviderKind::ClaudeCode => {
+                if llm.base_url.is_some() {
+                    return Err(unused("base_url"));
+                }
+            }
+        }
+        Ok(())
     }
 }

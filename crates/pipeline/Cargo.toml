@@ -14,6 +14,8 @@ keyring.workspace = true
 minijinja.workspace = true
 oauth2.workspace = true
 reqwest.workspace = true
+rig-agent.workspace = true
+rig-core.workspace = true
 schemars.workspace = true
 slug.workspace = true
 serde.workspace = true
@@ -24,6 +26,7 @@ sha2.workspace = true
 sources.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
 toml.workspace = true
 tracing.workspace = true
 
