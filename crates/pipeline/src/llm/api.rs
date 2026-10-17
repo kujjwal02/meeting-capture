@@ -12,8 +12,8 @@ use rig_core::providers::anthropic::AnthropicConfig;
 use rig_core::providers::openai::OpenAIConfig;
 use rig_core::providers::openai::wire::{Auth, OPENAI};
 
-use super::{Conversation, ExtractionError, Reply, SYSTEM_PROMPT};
-use crate::extraction::MeetingNotes;
+use super::{Conversation, ExtractionError, SYSTEM_PROMPT};
+use crate::extraction::{MeetingNotes, Reply};
 use crate::settings::ProviderKind;
 
 // A 60-minute call's notes come back in well under a minute; a slow local model gets the rest.

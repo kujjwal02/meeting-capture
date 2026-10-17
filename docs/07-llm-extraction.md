@@ -3,8 +3,10 @@
 The extract step turns a transcript into meeting notes: a summary, decisions, action items, open
 questions, my commitments and possible caption errors. Every item cites the transcript lines it
 comes from, and the app checks each quote against the transcript before it writes the note. All of
-it is in the `pipeline` crate: `extraction/` holds the types, prompt and quote check, and `llm/`
-holds the providers.
+it is in the `pipeline` crate: `extraction/` holds the types, prompt, reply check and quote check,
+and `llm/` holds the providers. `extraction::judge` rules on one reply for steps 4 to 6: accepted,
+repair or rejected. The provider loop, `mc extract --reply` and the `check_reply` example all call
+it. The example also calls `extraction::check_quotes`, which traces each citation with no verdict.
 
 ## Flow
 
@@ -36,7 +38,8 @@ flowchart LR
 5. A reply that fails to parse or check goes back to the model with the errors, at most twice. A
    third bad reply fails the attempt with `InvalidReply`. Quotes not found in the transcript also
    get a repair turn, but the last reply is kept with those citations dropped. So are bad caption
-   fixes: the last reply is kept without them.
+   fixes: the last reply is kept without them. `mc extract --reply` judges a saved reply as the
+   last reply, with no repair turn.
 6. The quote check finds each quote in the transcript and gives it a verdict. An item whose
    citations all fail is dropped. When more than half the items drop, the attempt fails with
    `InvalidReply`. The log records the counts as `extraction.citations.*`.

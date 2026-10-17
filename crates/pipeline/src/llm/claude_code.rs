@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use super::{Conversation, ExtractionError, Reply, SYSTEM_PROMPT};
-use crate::extraction::{self, MeetingNotes};
+use super::{Conversation, ExtractionError, SYSTEM_PROMPT};
+use crate::extraction::{self, Reply};
 use crate::settings::{AppDirs, Effort, LlmSettings};
 
 // A turn on a 60-minute call took under a minute in testing; Opus on a busy plan can take several.
@@ -297,14 +297,8 @@ impl Session {
             });
         }
         Ok(match event.structured_output {
-            Some(object) => match serde_path_to_error::deserialize::<_, MeetingNotes>(object) {
-                Ok(notes) => Reply::Parsed(notes),
-                Err(error) => Reply::Unparsed(format!("{}: {}", error.path(), error.inner())),
-            },
-            None => match extraction::parse_reply(&text) {
-                Ok(notes) => Reply::Parsed(notes),
-                Err(error) => Reply::Unparsed(error),
-            },
+            Some(object) => Reply::from_value(object),
+            None => Reply::read(&text),
         })
     }
 

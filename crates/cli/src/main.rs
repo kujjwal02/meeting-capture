@@ -6,7 +6,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use jiff::tz::TimeZone;
 use jobs::{InputKind, JobState, JobStore, Meeting, MeetingId};
-use pipeline::extraction::{self, CheckedNotes, Prompt};
+use pipeline::extraction::{self, CheckedNotes, Prompt, Turn, Verdict};
 use pipeline::llm::Provider;
 use pipeline::settings::{AppDirs, ProviderKind, Settings};
 use pipeline::{Pipeline, RunOutcome};
@@ -192,19 +192,22 @@ enum InputKindArg {
 fn check_saved_reply(prompt: &Prompt, reply_file: &Path) -> anyhow::Result<CheckedNotes> {
     let reply = std::fs::read_to_string(reply_file)
         .with_context(|| format!("could not read {}", reply_file.display()))?;
-    let mut notes = extraction::parse_reply(&reply).map_err(anyhow::Error::msg)?;
-    let errors = extraction::reply_errors(&notes, prompt);
-    if !errors.is_empty() {
-        anyhow::bail!(
+    // A saved reply gets no repair turn, so it is judged as the last reply.
+    match extraction::judge(&reply, prompt, Turn::Last) {
+        Verdict::Accepted {
+            notes,
+            dropped_caption_fixes,
+        } => {
+            for error in dropped_caption_fixes {
+                eprintln!("caption fix dropped: {error}");
+            }
+            Ok(notes)
+        }
+        Verdict::Repair { errors } | Verdict::Rejected { errors, .. } => anyhow::bail!(
             "the reply does not fit this meeting:\n- {}",
             errors.join("\n- ")
-        );
+        ),
     }
-    // A saved reply gets no repair turn, so it is treated as the last reply.
-    for error in extraction::drop_bad_caption_fixes(&mut notes, prompt) {
-        eprintln!("caption fix dropped: {error}");
-    }
-    Ok(extraction::check_citations(notes, prompt))
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]

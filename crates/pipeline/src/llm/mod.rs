@@ -6,7 +6,7 @@ mod claude_code;
 
 pub use claude_code::{ClaudeCodeAuth, claude_code_auth};
 
-use crate::extraction::{self, CheckedNotes, MeetingNotes, Prompt};
+use crate::extraction::{CheckedNotes, Prompt, Reply, Turn, Verdict};
 use crate::settings::{AppDirs, LlmSettings, ProviderKind};
 
 /// Why an extraction produced no notes. Each message names the provider and model.
@@ -69,13 +69,6 @@ enum Backend {
     ClaudeCode(claude_code::ClaudeCode),
 }
 
-/// One reply, parsed or not.
-pub(crate) enum Reply {
-    Parsed(MeetingNotes),
-    /// Why the reply is not a `MeetingNotes`, with the path of the field.
-    Unparsed(String),
-}
-
 /// An open conversation with the model. Each `send` is one user turn.
 pub(crate) trait Conversation {
     fn send(&mut self, message: &str) -> Result<Reply, ExtractionError>;
@@ -133,8 +126,8 @@ impl Provider {
         &self.label
     }
 
-    /// Asks the model for notes, sends its mistakes back up to `MAX_REPAIRS` times, then checks
-    /// every quote.
+    /// Asks the model for notes and sends its mistakes back up to `MAX_REPAIRS` times, as
+    /// `extraction::judge` rules on each reply.
     ///
     /// # Errors
     ///
@@ -156,40 +149,31 @@ impl Provider {
         let mut reply = conversation.send(&prompt.render())?;
         let mut repairs = 0;
         loop {
-            let errors = match reply {
-                Reply::Parsed(mut notes) => {
-                    let mut errors = extraction::reply_errors(&notes, prompt);
-                    // The notes stand without a bad caption fix, so the last reply drops it
-                    // rather than fail.
-                    if repairs == MAX_REPAIRS {
-                        let dropped = extraction::drop_bad_caption_fixes(&mut notes, prompt);
-                        if !dropped.is_empty() {
-                            tracing::warn!(
-                                extraction.errors = %dropped.join("; "),
-                                "caption fixes dropped from the last reply"
-                            );
-                        }
-                    } else {
-                        errors.extend(extraction::caption_fix_errors(&notes, prompt));
-                    }
-                    // The last reply is kept with its bad quotes dropped, unless that drops most
-                    // items.
-                    if errors.is_empty() && repairs < MAX_REPAIRS {
-                        errors = extraction::quote_errors(&notes, prompt);
-                    }
-                    if errors.is_empty() {
-                        return self.keep_checked(notes, prompt);
-                    }
-                    errors
-                }
-                Reply::Unparsed(error) => vec![format!("the reply is not valid: {error}")],
+            let turn = if repairs == MAX_REPAIRS {
+                Turn::Last
+            } else {
+                Turn::CanRepair
             };
-            if repairs == MAX_REPAIRS {
-                return Err(ExtractionError::InvalidReply {
-                    provider: self.label.clone(),
+            let errors = match reply.judge(prompt, turn) {
+                Verdict::Accepted {
+                    notes,
+                    dropped_caption_fixes,
+                } => {
+                    log_dropped_caption_fixes(&dropped_caption_fixes);
+                    return Ok(notes);
+                }
+                Verdict::Rejected {
                     errors,
-                });
-            }
+                    dropped_caption_fixes,
+                } => {
+                    log_dropped_caption_fixes(&dropped_caption_fixes);
+                    return Err(ExtractionError::InvalidReply {
+                        provider: self.label.clone(),
+                        errors,
+                    });
+                }
+                Verdict::Repair { errors } => errors,
+            };
             repairs += 1;
             tracing::warn!(
                 extraction.repair = repairs,
@@ -202,23 +186,13 @@ impl Provider {
             ))?;
         }
     }
+}
 
-    fn keep_checked(
-        &self,
-        notes: MeetingNotes,
-        prompt: &Prompt,
-    ) -> Result<CheckedNotes, ExtractionError> {
-        let item_count = notes.item_count();
-        let checked = extraction::check_citations(notes, prompt);
-        let dropped_count = item_count - checked.item_count();
-        if dropped_count * 2 > item_count {
-            return Err(ExtractionError::InvalidReply {
-                provider: self.label.clone(),
-                errors: vec![format!(
-                    "{dropped_count} of {item_count} items cite only quotes that are not in the transcript"
-                )],
-            });
-        }
-        Ok(checked)
+fn log_dropped_caption_fixes(dropped_caption_fixes: &[String]) {
+    if !dropped_caption_fixes.is_empty() {
+        tracing::warn!(
+            extraction.errors = %dropped_caption_fixes.join("; "),
+            "caption fixes dropped from the last reply"
+        );
     }
 }
