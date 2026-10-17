@@ -14,16 +14,21 @@ keyring.workspace = true
 minijinja.workspace = true
 oauth2.workspace = true
 reqwest.workspace = true
+schemars.workspace = true
 slug.workspace = true
 serde.workspace = true
 serde-saphyr.workspace = true
 serde_json.workspace = true
+serde_path_to_error.workspace = true
 sha2.workspace = true
 sources.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 toml.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
 
 [lints]
 workspace = true

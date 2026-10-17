@@ -6,6 +6,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use jiff::tz::TimeZone;
 use jobs::{JobStore, Meeting, MeetingId};
+use pipeline::extraction;
 use pipeline::settings::{AppDirs, Settings};
 use pipeline::{Pipeline, RunOutcome};
 
@@ -29,6 +30,14 @@ enum Command {
     },
     /// Resume a failed meeting at the step that failed.
     Retry { meeting_id: i64 },
+    /// Check a recorded LLM reply against a meeting's transcript and print the checked notes as
+    /// JSON. Writes nothing.
+    Extract {
+        meeting_id: i64,
+        /// A saved reply: one JSON object in the reply schema.
+        #[arg(long)]
+        reply: PathBuf,
+    },
     /// Show the most recent meetings.
     List {
         #[arg(long, default_value_t = 10)]
@@ -67,6 +76,9 @@ fn main() -> anyhow::Result<()> {
         Command::Retry { meeting_id } => {
             print_outcome(&pipeline.run(MeetingId::new(meeting_id))?, &time_zone);
         }
+        Command::Extract { meeting_id, reply } => {
+            extract(&pipeline, MeetingId::new(meeting_id), &reply)?;
+        }
         Command::List { limit } => {
             for meeting in pipeline.store().recent(limit)? {
                 print_meeting(&meeting, &time_zone);
@@ -89,6 +101,23 @@ fn ingest(
     let payload_path = sources::transcriptonic::save_payload(&app_dirs.payload_dir(), &payload)
         .context("could not save the payload in the app folder")?;
     Ok(pipeline.record_transcriptonic(&payload_path, &transcript)?)
+}
+
+fn extract(pipeline: &Pipeline, id: MeetingId, reply_file: &Path) -> anyhow::Result<()> {
+    let prompt = pipeline.extraction_prompt(id)?;
+    let reply = std::fs::read_to_string(reply_file)
+        .with_context(|| format!("could not read {}", reply_file.display()))?;
+    let notes = extraction::parse_reply(&reply).map_err(anyhow::Error::msg)?;
+    let errors = extraction::reply_errors(&notes, &prompt);
+    if !errors.is_empty() {
+        anyhow::bail!(
+            "the reply does not fit this meeting:\n- {}",
+            errors.join("\n- ")
+        );
+    }
+    let checked = extraction::check_citations(notes, &prompt);
+    println!("{}", serde_json::to_string_pretty(&checked)?);
+    Ok(())
 }
 
 fn print_outcome(outcome: &RunOutcome, time_zone: &TimeZone) {

@@ -16,6 +16,7 @@ clap.workspace = true
 jiff.workspace = true
 jobs.workspace = true
 pipeline.workspace = true
+serde_json.workspace = true
 sources.workspace = true
 tracing-subscriber.workspace = true
 

@@ -91,11 +91,7 @@ pub(crate) fn render(
     let frontmatter = frontmatter_yaml(note, &attendees)?;
 
     let speaker_name = |speaker: &str| -> String {
-        let my_name = match transcript.speaker_naming {
-            SpeakerNaming::Real => note.my_name.filter(|_| speaker == "You"),
-            SpeakerNaming::MeVsThem | SpeakerNaming::Diarized => None,
-        };
-        inline_markdown(my_name.unwrap_or(speaker))
+        inline_markdown(speaker_name(transcript, note.my_name, speaker))
     };
     let speakers: Vec<String> = transcript
         .segments
@@ -154,6 +150,33 @@ pub(crate) fn render(
             chat_messages => minijinja::value::Serde(&chat_messages),
         })?;
     Ok(rendered)
+}
+
+// TranscripTonic's name for the local user.
+const TRANSCRIPTONIC_ME: &str = "You";
+
+/// The name a transcript speaker goes by in the note and the prompt.
+pub(crate) fn speaker_name<'a>(
+    transcript: &Transcript,
+    my_name: Option<&'a str>,
+    speaker: &'a str,
+) -> &'a str {
+    match transcript.speaker_naming {
+        SpeakerNaming::Real if speaker == TRANSCRIPTONIC_ME => my_name.unwrap_or(speaker),
+        SpeakerNaming::Real | SpeakerNaming::MeVsThem | SpeakerNaming::Diarized => speaker,
+    }
+}
+
+/// The local user's speaker name, when the transcript can tell which speaker that is.
+pub(crate) fn my_speaker_name<'a>(
+    transcript: &Transcript,
+    my_name: Option<&'a str>,
+) -> Option<&'a str> {
+    match transcript.speaker_naming {
+        SpeakerNaming::Real => Some(my_name.unwrap_or(TRANSCRIPTONIC_ME)),
+        // The recorder's stem labels arrive with it in phase 3; diarized labels are anonymous.
+        SpeakerNaming::MeVsThem | SpeakerNaming::Diarized => None,
+    }
 }
 
 fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String, PipelineError> {

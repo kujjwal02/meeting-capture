@@ -1,6 +1,7 @@
 //! Calendar match, LLM extraction and the vault write. No Tauri dependency.
 
 pub mod calendar;
+pub mod extraction;
 pub mod google;
 mod note;
 pub mod settings;
@@ -16,7 +17,8 @@ use jobs::{
 };
 use sources::Transcript;
 
-use crate::calendar::GoogleAccounts;
+use crate::calendar::{CalendarMatch, GoogleAccounts};
+use crate::extraction::Prompt;
 use crate::google::{GoogleError, Keychain};
 use crate::note::NoteInput;
 use crate::settings::{AppDirs, Settings};
@@ -103,6 +105,31 @@ impl Pipeline {
     #[must_use]
     pub fn store(&self) -> &JobStore {
         &self.store
+    }
+
+    /// The extraction prompt for a meeting, from its stored input and calendar match.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineError` when the meeting, its input or its stored match cannot be read.
+    pub fn extraction_prompt(&self, id: MeetingId) -> Result<Prompt, PipelineError> {
+        let meeting = self.store.get(id)?;
+        let transcript = load_transcript(&meeting)?;
+        let calendar_match: Option<CalendarMatch> = meeting
+            .calendar_match_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?;
+        let attendees = calendar_match
+            .and_then(|calendar_match| calendar_match.event)
+            .map(|event| event.attendees)
+            .unwrap_or_default();
+        Ok(Prompt::new(
+            &transcript,
+            self.settings.my_name.as_deref(),
+            &attendees,
+            &[],
+        ))
     }
 
     /// Records a TranscripTonic payload that is already saved at `payload_path`. A re-post of a
