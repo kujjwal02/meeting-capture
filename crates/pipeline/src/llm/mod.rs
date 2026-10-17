@@ -162,8 +162,21 @@ impl Provider {
         let mut repairs = 0;
         loop {
             let errors = match reply {
-                Reply::Parsed(notes) => {
+                Reply::Parsed(mut notes) => {
                     let mut errors = extraction::reply_errors(&notes, prompt);
+                    // The notes stand without a bad caption fix, so the last reply drops it
+                    // rather than fail.
+                    if repairs == MAX_REPAIRS {
+                        let dropped = extraction::drop_bad_caption_fixes(&mut notes, prompt);
+                        if !dropped.is_empty() {
+                            tracing::warn!(
+                                extraction.errors = %dropped.join("; "),
+                                "caption fixes dropped from the last reply"
+                            );
+                        }
+                    } else {
+                        errors.extend(extraction::caption_fix_errors(&notes, prompt));
+                    }
                     // The last reply is kept with its bad quotes dropped, unless that drops most
                     // items.
                     if errors.is_empty() && repairs < MAX_REPAIRS {

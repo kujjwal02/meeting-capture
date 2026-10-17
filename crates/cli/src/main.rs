@@ -170,13 +170,17 @@ fn ingest(
 fn check_saved_reply(prompt: &Prompt, reply_file: &Path) -> anyhow::Result<CheckedNotes> {
     let reply = std::fs::read_to_string(reply_file)
         .with_context(|| format!("could not read {}", reply_file.display()))?;
-    let notes = extraction::parse_reply(&reply).map_err(anyhow::Error::msg)?;
+    let mut notes = extraction::parse_reply(&reply).map_err(anyhow::Error::msg)?;
     let errors = extraction::reply_errors(&notes, prompt);
     if !errors.is_empty() {
         anyhow::bail!(
             "the reply does not fit this meeting:\n- {}",
             errors.join("\n- ")
         );
+    }
+    // A saved reply gets no repair turn, so it is treated as the last reply.
+    for error in extraction::drop_bad_caption_fixes(&mut notes, prompt) {
+        eprintln!("caption fix dropped: {error}");
     }
     Ok(extraction::check_citations(notes, prompt))
 }

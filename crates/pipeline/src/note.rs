@@ -246,6 +246,15 @@ struct NotesView {
     action_items: Vec<ItemView>,
     open_questions: Vec<ItemView>,
     my_commitments: Vec<ItemView>,
+    caption_fixes: Vec<CaptionFixView>,
+}
+
+#[derive(Serialize)]
+struct CaptionFixView {
+    heard: String,
+    likely: String,
+    is_unsure: bool,
+    links: String,
 }
 
 #[derive(Serialize)]
@@ -261,27 +270,38 @@ struct ItemView {
 
 impl ItemView {
     fn new(text: &str, citations: &[CheckedCitation]) -> Self {
-        let mut linked: Vec<u32> = Vec::new();
-        let mut links = Vec::new();
-        for citation in citations {
-            if !linked.contains(&citation.segment_id) {
-                linked.push(citation.segment_id);
-                links.push(format!(
-                    "[[#^s{}|{}]]",
-                    citation.segment_id,
-                    offset_label(citation.start_s)
-                ));
-            }
-        }
         Self {
             text: inline_markdown(text),
-            links: links.join(" "),
+            links: citation_links(citations),
             owner: None,
             recipient: None,
             due: None,
             strength: None,
         }
     }
+}
+
+// The template follows a task with ", for <name>" or "(due <date>)", so a closing full stop would
+// land mid-line.
+fn without_full_stop(task: &str) -> &str {
+    task.trim_end().trim_end_matches('.')
+}
+
+/// One `[[#^s<id>|<time>]]` link per cited segment, space separated.
+fn citation_links(citations: &[CheckedCitation]) -> String {
+    let mut linked: Vec<u32> = Vec::new();
+    let mut links = Vec::new();
+    for citation in citations {
+        if !linked.contains(&citation.segment_id) {
+            linked.push(citation.segment_id);
+            links.push(format!(
+                "[[#^s{}|{}]]",
+                citation.segment_id,
+                offset_label(citation.start_s)
+            ));
+        }
+    }
+    links.join(" ")
 }
 
 // What the model wrote is escaped like transcript text: it quotes the call, and the call is data.
@@ -300,7 +320,7 @@ fn notes_view(notes: &CheckedNotes) -> NotesView {
             .map(|item| ItemView {
                 owner: escaped(&item.owner),
                 due: escaped(&item.due),
-                ..ItemView::new(&item.task, &item.citations)
+                ..ItemView::new(without_full_stop(&item.task), &item.citations)
             })
             .collect(),
         open_questions: notes
@@ -319,7 +339,17 @@ fn notes_view(notes: &CheckedNotes) -> NotesView {
                     CommitmentStrength::Hedged => "hedged",
                     CommitmentStrength::Aspirational => "aspirational",
                 }),
-                ..ItemView::new(&item.task, &item.citations)
+                ..ItemView::new(without_full_stop(&item.task), &item.citations)
+            })
+            .collect(),
+        caption_fixes: notes
+            .caption_fixes
+            .iter()
+            .map(|fix| CaptionFixView {
+                heard: inline_markdown(&fix.heard),
+                likely: inline_markdown(&fix.likely),
+                is_unsure: fix.is_unsure,
+                links: citation_links(&fix.citations),
             })
             .collect(),
     }

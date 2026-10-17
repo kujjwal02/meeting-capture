@@ -13,7 +13,7 @@ pub use prompt::Prompt;
 /// reply and `CheckedCitation` once the quotes are checked, so the schema sent to the model and
 /// the notes kept in the job store cannot drift apart.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, bound(deserialize = "C: Deserialize<'de>"))]
 #[schemars(rename = "MeetingNotes")]
 pub struct MeetingNotes<C = Citation> {
     /// 3 to 6 sentences on what the call was about and where it ended.
@@ -21,8 +21,14 @@ pub struct MeetingNotes<C = Citation> {
     pub decisions: Vec<Decision<C>>,
     pub action_items: Vec<ActionItem<C>>,
     pub open_questions: Vec<OpenQuestion<C>>,
-    /// Only what "me" said they would do, in the first person.
+    /// What "me" said they would do, and what "me" said should be done with no other owner, in
+    /// the first person.
     pub my_commitments: Vec<Commitment<C>>,
+    /// Captioned words that look misheard, with what the speaker most likely said. Notes stored
+    /// before this field existed read as an empty list.
+    #[serde(default)]
+    #[schemars(required)]
+    pub caption_fixes: Vec<CaptionFix<C>>,
 }
 
 impl<C> MeetingNotes<C> {
@@ -88,6 +94,24 @@ pub struct Commitment<C = Citation> {
     pub citations: Vec<C>,
 }
 
+/// A guess at what the captions misheard. The citation's quote holds `heard`, so the quote check
+/// proves the words were captioned that way.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+#[schemars(rename = "CaptionFix")]
+pub struct CaptionFix<C = Citation> {
+    /// The words as captioned, copied from the line.
+    pub heard: String,
+    /// What the speaker most likely said: the words only.
+    pub likely: String,
+    /// True for a guess from little evidence, such as a name the call never says plainly.
+    #[serde(default)]
+    #[schemars(required)]
+    pub is_unsure: bool,
+    #[schemars(length(min = 1))]
+    pub citations: Vec<C>,
+}
+
 // The levels come from the FollowThrough commitments tool.
 /// How firm a commitment is: a promise, a "might" or "will try", or a "we should someday".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -145,8 +169,8 @@ pub fn parse_reply(reply: &str) -> Result<MeetingNotes, String> {
         .map_err(|error| format!("{}: {}", error.path(), error.inner()))
 }
 
-/// Everything wrong with a parsed reply, each with its path, for a repair turn. Empty when the
-/// reply can be checked.
+/// Everything wrong with a parsed reply outside `caption_fixes`, each with its path, for a repair
+/// turn. Empty when the reply can be checked.
 #[must_use]
 pub fn reply_errors(notes: &MeetingNotes, prompt: &Prompt) -> Vec<String> {
     let mut errors = Vec::new();
@@ -158,56 +182,37 @@ pub fn reply_errors(notes: &MeetingNotes, prompt: &Prompt) -> Vec<String> {
             "summary must be at most {MAX_SUMMARY_CHARS} characters"
         ));
     }
-    let mut check_item = |path: String, text: &str, citations: &[Citation]| {
-        if text.trim().is_empty() {
-            errors.push(format!("{path}: the text must not be empty"));
-        }
-        if citations.is_empty() {
-            errors.push(format!("{path}.citations must have at least one citation"));
-        }
-        for (index, citation) in citations.iter().enumerate() {
-            let path = format!("{path}.citations[{index}]");
-            if !prompt.has_segment(citation.segment_id) {
-                errors.push(format!(
-                    "{path}.segment_id {} is not a line in the transcript",
-                    citation.segment_id
-                ));
-            }
-            let quote_chars = citation.quote.chars().count();
-            if citation.quote.trim().is_empty() || quote_chars > MAX_QUOTE_CHARS {
-                errors.push(format!(
-                    "{path}.quote must be 3 to 15 words copied from the line"
-                ));
-            }
-        }
-    };
     for (index, item) in notes.decisions.iter().enumerate() {
-        check_item(
-            format!("decisions[{index}]"),
+        errors.extend(item_errors(
+            &format!("decisions[{index}]"),
             &item.decision,
             &item.citations,
-        );
+            prompt,
+        ));
     }
     for (index, item) in notes.action_items.iter().enumerate() {
-        check_item(
-            format!("action_items[{index}]"),
+        errors.extend(item_errors(
+            &format!("action_items[{index}]"),
             &item.task,
             &item.citations,
-        );
+            prompt,
+        ));
     }
     for (index, item) in notes.open_questions.iter().enumerate() {
-        check_item(
-            format!("open_questions[{index}]"),
+        errors.extend(item_errors(
+            &format!("open_questions[{index}]"),
             &item.question,
             &item.citations,
-        );
+            prompt,
+        ));
     }
     for (index, item) in notes.my_commitments.iter().enumerate() {
-        check_item(
-            format!("my_commitments[{index}]"),
+        errors.extend(item_errors(
+            &format!("my_commitments[{index}]"),
             &item.task,
             &item.citations,
-        );
+            prompt,
+        ));
     }
     for (index, item) in notes.action_items.iter().enumerate() {
         if let Some(owner) = item
@@ -218,6 +223,87 @@ pub fn reply_errors(notes: &MeetingNotes, prompt: &Prompt) -> Vec<String> {
         {
             errors.push(format!(
                 "action_items[{index}].owner {owner:?} is not on the speaker roster; use a roster name or null"
+            ));
+        }
+    }
+    errors
+}
+
+/// Everything wrong with the reply's `caption_fixes`, each with its path, for a repair turn. Kept
+/// apart from `reply_errors`, since the notes stand without a bad guess.
+#[must_use]
+pub fn caption_fix_errors(notes: &MeetingNotes, prompt: &Prompt) -> Vec<String> {
+    notes
+        .caption_fixes
+        .iter()
+        .enumerate()
+        .flat_map(|(index, fix)| fix_errors(index, fix, prompt))
+        .collect()
+}
+
+/// Removes each caption fix with an error and returns the errors, for the log.
+pub fn drop_bad_caption_fixes(notes: &mut MeetingNotes, prompt: &Prompt) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut index = 0;
+    notes.caption_fixes.retain(|fix| {
+        let fix_errors = fix_errors(index, fix, prompt);
+        index += 1;
+        let is_good = fix_errors.is_empty();
+        errors.extend(fix_errors);
+        is_good
+    });
+    errors
+}
+
+fn item_errors(path: &str, text: &str, citations: &[Citation], prompt: &Prompt) -> Vec<String> {
+    let mut errors = Vec::new();
+    if text.trim().is_empty() {
+        errors.push(format!("{path}: the text must not be empty"));
+    }
+    if citations.is_empty() {
+        errors.push(format!("{path}.citations must have at least one citation"));
+    }
+    for (index, citation) in citations.iter().enumerate() {
+        let path = format!("{path}.citations[{index}]");
+        if !prompt.has_segment(citation.segment_id) {
+            errors.push(format!(
+                "{path}.segment_id {} is not a line in the transcript",
+                citation.segment_id
+            ));
+        }
+        let quote_chars = citation.quote.chars().count();
+        if citation.quote.trim().is_empty() || quote_chars > MAX_QUOTE_CHARS {
+            errors.push(format!(
+                "{path}.quote must be 3 to 15 words copied from the line"
+            ));
+        }
+    }
+    errors
+}
+
+fn fix_errors(index: usize, fix: &CaptionFix, prompt: &Prompt) -> Vec<String> {
+    let path = format!("caption_fixes[{index}]");
+    let mut errors = item_errors(&path, &fix.heard, &fix.citations, prompt);
+    if fix.likely.trim().is_empty() || citations::same_words(&fix.heard, &fix.likely) {
+        errors.push(format!(
+            "{path}.likely must be your guess at the words, different from heard"
+        ));
+    }
+    if fix.likely.chars().count() > MAX_QUOTE_CHARS {
+        errors.push(format!(
+            "{path}.likely must be at most {MAX_QUOTE_CHARS} characters"
+        ));
+    }
+    if fix.likely.contains(['(', ')', '?']) {
+        errors.push(format!(
+            "{path}.likely must be one guess with no comment; set is_unsure for doubt"
+        ));
+    }
+    for (citation_index, citation) in fix.citations.iter().enumerate() {
+        if !citations::quote_holds(&citation.quote, &fix.heard) {
+            errors.push(format!(
+                "{path}.citations[{citation_index}].quote must contain the heard words {:?}",
+                fix.heard
             ));
         }
     }

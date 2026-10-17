@@ -71,6 +71,18 @@
 {% endif %}
 %% mc:end my-commitments %%
 
+%% mc:begin caption-fixes %%
+{% if notes and notes.caption_fixes %}
+## Possible caption errors
+
+The notes above read these words as the guess shown. Check them against the call.
+
+{% for fix in notes.caption_fixes %}
+- "{{ fix.heard }}" {% if fix.is_unsure %}may have meant{% else %}probably meant{% endif %} "{{ fix.likely }}" {{ fix.links }}
+{% endfor %}
+{% endif %}
+%% mc:end caption-fixes %%
+
 %% mc:begin transcript %%
 ## Transcript
 

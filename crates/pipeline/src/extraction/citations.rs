@@ -5,7 +5,10 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::prompt::{LineSegment, Prompt};
-use super::{ActionItem, CheckedNotes, Citation, Commitment, Decision, MeetingNotes, OpenQuestion};
+use super::{
+    ActionItem, CaptionFix, CheckedNotes, Citation, Commitment, Decision, MeetingNotes,
+    OpenQuestion,
+};
 
 /// A citation after the check. `segment_id` and `start_s` name the transcript segment that holds
 /// the quote, which may differ from the line the model cited.
@@ -69,7 +72,20 @@ pub(super) fn missing_quotes(notes: &MeetingNotes, prompt: &Prompt) -> Vec<Strin
     for (index, item) in notes.my_commitments.iter().enumerate() {
         check_item(format!("my_commitments[{index}]"), &item.citations);
     }
+    for (index, fix) in notes.caption_fixes.iter().enumerate() {
+        check_item(format!("caption_fixes[{index}]"), &fix.citations);
+    }
     errors
+}
+
+/// Whether `quote` holds the words of `heard` in order, compared as the quote check compares.
+pub(super) fn quote_holds(quote: &str, heard: &str) -> bool {
+    holds_phrase(&words(quote), &words(heard))
+}
+
+/// Whether two texts have the same words, compared as the quote check compares.
+pub(super) fn same_words(left: &str, right: &str) -> bool {
+    words(left) == words(right)
 }
 
 pub(super) fn check(notes: MeetingNotes, prompt: &Prompt) -> CheckedNotes {
@@ -119,6 +135,34 @@ pub(super) fn check(notes: MeetingNotes, prompt: &Prompt) -> CheckedNotes {
             })
         })
         .collect();
+    let caption_fixes = notes
+        .caption_fixes
+        .into_iter()
+        .filter_map(|fix| {
+            let citations = checker.check_item(fix.citations)?;
+            // A fuzzy or moved match can land on a line without the heard words, and then
+            // nothing proves the captions said them.
+            let heard = words(&fix.heard);
+            let citations: Vec<CheckedCitation> = citations
+                .into_iter()
+                .filter(|citation| checker.line_holds(citation.segment_id, &heard))
+                .collect();
+            if citations.is_empty() {
+                checker.dropped_items += 1;
+                tracing::debug!(
+                    extraction.heard = %fix.heard,
+                    "no cited line holds the heard words; caption fix dropped"
+                );
+                return None;
+            }
+            Some(CaptionFix {
+                citations,
+                heard: fix.heard,
+                likely: fix.likely,
+                is_unsure: fix.is_unsure,
+            })
+        })
+        .collect();
     checker.log_counts();
     MeetingNotes {
         summary: notes.summary,
@@ -126,6 +170,7 @@ pub(super) fn check(notes: MeetingNotes, prompt: &Prompt) -> CheckedNotes {
         action_items,
         open_questions,
         my_commitments,
+        caption_fixes,
     }
 }
 
@@ -238,6 +283,13 @@ impl<'a> Checker<'a> {
                 .map(|index| (CitationVerdict::Moved, index));
         }
         None
+    }
+
+    /// Whether the line that holds segment `segment_id` has `phrase`, whole words in order.
+    fn line_holds(&self, segment_id: u32, phrase: &[String]) -> bool {
+        self.prompt
+            .line_index(segment_id)
+            .is_some_and(|index| holds_phrase(&self.line_words[index], phrase))
     }
 
     /// The line among `candidates` that covers most of the quote, if any reaches the threshold.

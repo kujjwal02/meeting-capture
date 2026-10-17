@@ -50,9 +50,7 @@ fn main() -> anyhow::Result<()> {
     let reply =
         std::fs::read_to_string(reply_path).with_context(|| format!("reading {reply_path}"))?;
     let notes = extraction::parse_reply(&reply).map_err(anyhow::Error::msg)?;
-    for error in extraction::reply_errors(&notes, &prompt) {
-        println!("reply error: {error}");
-    }
+    print_reply_errors(&notes, &prompt);
 
     // Tag every citation with its path, so dropped ones can be told apart after the check.
     let mut cited: Vec<(String, u32, String)> = Vec::new();
@@ -121,4 +119,12 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_reply_errors(notes: &extraction::MeetingNotes, prompt: &Prompt) {
+    let mut errors = extraction::reply_errors(notes, prompt);
+    errors.extend(extraction::caption_fix_errors(notes, prompt));
+    for error in errors {
+        println!("reply error: {error}");
+    }
 }

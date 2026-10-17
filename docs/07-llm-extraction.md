@@ -1,9 +1,10 @@
 # LLM extraction
 
 The extract step turns a transcript into meeting notes: a summary, decisions, action items, open
-questions and my commitments. Every item cites the transcript lines it comes from, and the app
-checks each quote against the transcript before it writes the note. All of it is in the `pipeline`
-crate: `extraction/` holds the types, prompt and quote check, and `llm/` holds the providers.
+questions, my commitments and possible caption errors. Every item cites the transcript lines it
+comes from, and the app checks each quote against the transcript before it writes the note. All of
+it is in the `pipeline` crate: `extraction/` holds the types, prompt and quote check, and `llm/`
+holds the providers.
 
 ## Flow
 
@@ -34,7 +35,8 @@ flowchart LR
    roster.
 5. A reply that fails to parse or check goes back to the model with the errors, at most twice. A
    third bad reply fails the attempt with `InvalidReply`. Quotes not found in the transcript also
-   get a repair turn, but the last reply is kept with those citations dropped.
+   get a repair turn, but the last reply is kept with those citations dropped. So are bad caption
+   fixes: the last reply is kept without them.
 6. The quote check finds each quote in the transcript and gives it a verdict. An item whose
    citations all fail is dropped. When more than half the items drop, the attempt fails with
    `InvalidReply`. The log records the counts as `extraction.citations.*`.
@@ -50,6 +52,27 @@ flowchart LR
 The matcher ignores case, punctuation and 10 filler words such as "um" and "like". Captions mishear
 words, so an exact match on raw text would fail good quotes. A quote under 3 words counts only when
 it is the whole line, such as "Agreed": a word or two occurs by chance in most lines.
+
+## Caption errors
+
+Meet captions mishear names, jargon and short words: "QA" becomes "Kyoi", "monorepo" becomes
+"mono ripple", "ship" becomes "sleep". The prompt tells the model to read past such words from the
+topic, the roster, the glossary and the sound, and to write items with the likely meaning. It must
+not drop an item because its words were misheard.
+
+Each guess that changes the meaning goes in `caption_fixes`:
+
+- `heard`: the words as captioned. The citation quote must contain them. The quote check then
+  keeps a fix only when a line it locates holds those words, so the captions said them.
+- `likely`: one guess, words only, at most 200 characters. The reply check rejects a guess equal to
+  `heard`, and a guess with brackets or a question mark.
+- `is_unsure`: true for a guess from little evidence. The note then says "may have meant" instead
+  of "probably meant".
+
+A bad fix gets a repair turn like any error. On the last reply, the app drops the bad fixes and
+keeps the rest, since the notes stand without a guess. Fixes do not count toward `item_count`, so
+they never decide whether too many items dropped. Notes
+stored before the field existed read it as an empty list.
 
 ## Providers
 
@@ -156,7 +179,8 @@ reading view.
 ```
 
 - Sections, in order: `details`, `summary`, `decisions`, `action-items`, `open-questions`,
-  `my-commitments`, `transcript`. A note without notes keeps all markers, with empty sections.
+  `my-commitments`, `caption-fixes`, `transcript`. A note without notes keeps all markers, with
+  empty sections.
 - Each transcript paragraph ends in a block id `^s<n>`. Citations link to it as
   `[[#^s<n>|mm:ss]]`.
 - My commitments are tasks (`- [ ]`). The strength shows unless it is "committed".
@@ -168,14 +192,21 @@ reading view.
 
 The pipeline tells its own writes from user edits by SHA-256. On a rerun:
 
-1. The note matches a hash the pipeline wrote: the app writes the new render as is.
-2. The user edited the note outside the sections: the app splices. Each marked section is
-   replaced. Text outside the markers stays. The app's frontmatter keys are rewritten; keys and
+1. The app splices the render into the note on disk. Each marked section is replaced. Text
+   outside the markers stays, on every rerun. The app's frontmatter keys are rewritten; keys and
    tags the user added stay as written.
-3. The user edited inside a section, such as ticking a commitment: the splice refuses. The job
+2. A section the template added since the last write goes before the next section the note has,
+   in template order. A section the template no longer renders is removed when it holds the app's
+   text, and stays when the user edited it. A note written from a template without markers is
+   replaced by the render as is.
+3. The user deleted a section, markers and all: it stays deleted. The job store keeps its hash, so
+   the app knows it wrote that section once.
+4. The user edited inside a section, such as ticking a commitment: the splice refuses. The job
    store keeps each section's SHA-256 as last written (migration 3, `note_section_sha256s`), and a
    section that no longer matches is the user's.
-4. A marker is missing, repeated, nested or unmatched: the splice refuses.
+5. A marker is repeated, nested or unmatched: the splice refuses.
+6. A custom template without markers: the render replaces a note the pipeline wrote as is, and a
+   user-edited note fails with `NoteEdited`.
 
 A refused splice fails the run with `NoteEdited`, which names the section and leaves the note as
 it is. The tray offers "Overwrite my edits", which reprocesses with the edits discarded.

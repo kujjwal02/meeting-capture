@@ -14,14 +14,14 @@ const BEGIN: &str = "%% mc:begin ";
 const END: &str = "%% mc:end ";
 const MARKER_CLOSE: &str = " %%";
 
-/// SHA-256 of each marked section's contents in a note the app renders, by section name.
+/// SHA-256 of each marked section's contents in a note, by section name.
 ///
 /// # Errors
 ///
-/// Returns why the template's markers do not line up.
-pub(crate) fn section_sha256s(rendered: &str) -> Result<BTreeMap<String, String>, String> {
-    let (_, body) = split_frontmatter(rendered);
-    let pieces = pieces(body).map_err(|reason| format!("in the template, {reason}"))?;
+/// Returns why the markers do not line up.
+pub(crate) fn section_sha256s(note: &str) -> Result<BTreeMap<String, String>, String> {
+    let (_, body) = split_frontmatter(note);
+    let pieces = pieces(body)?;
     Ok(pieces
         .iter()
         .filter_map(|piece| match piece {
@@ -34,7 +34,7 @@ pub(crate) fn section_sha256s(rendered: &str) -> Result<BTreeMap<String, String>
 }
 
 /// The note with `rendered`'s sections and frontmatter keys put into `on_disk`. `written` holds
-/// each section's hash as the app last wrote it.
+/// the hash of each section the app last wrote, by name.
 ///
 /// # Errors
 ///
@@ -58,46 +58,26 @@ pub(crate) fn splice(
     let rendered_pieces =
         pieces(rendered_body).map_err(|reason| format!("in the template, {reason}"))?;
 
-    let section_names = |pieces: &[Piece<'_>]| -> Vec<String> {
-        let mut names: Vec<String> = pieces
+    let rendered_sections = sections(&rendered_pieces);
+    let rendered_content = |name: &str| {
+        rendered_sections
             .iter()
-            .filter_map(|piece| match piece {
-                Piece::Section { name, .. } => Some((*name).to_owned()),
-                Piece::Text(_) => None,
-            })
-            .collect();
-        names.sort();
-        names
+            .find(|(rendered_name, _)| *rendered_name == name)
+            .map(|(_, content)| *content)
     };
-    let (disk_names, rendered_names) =
-        (section_names(&disk_pieces), section_names(&rendered_pieces));
-    if disk_names != rendered_names {
-        let missing: Vec<&str> = rendered_names
-            .iter()
-            .filter(|name| !disk_names.contains(name))
-            .map(String::as_str)
-            .collect();
-        return Err(format!(
-            "the mc:begin/mc:end markers for {} are missing or extra",
-            if missing.is_empty() {
-                "some sections".to_owned()
-            } else {
-                missing.join(", ")
-            }
-        ));
-    }
+    let disk_sections = sections(&disk_pieces);
 
-    let edited: Vec<&str> = disk_pieces
+    let is_as_written = |name: &str, content: &str| {
+        written
+            .get(name)
+            .is_some_and(|sha256| *sha256 == note::note_sha256(content.as_bytes()))
+    };
+
+    // Only sections the render replaces need to be as the app wrote them.
+    let edited: Vec<&str> = disk_sections
         .iter()
-        .filter_map(|piece| match piece {
-            Piece::Section { name, content } => {
-                let is_as_written = written
-                    .get(*name)
-                    .is_some_and(|sha256| *sha256 == note::note_sha256(content.as_bytes()));
-                (!is_as_written).then_some(*name)
-            }
-            Piece::Text(_) => None,
-        })
+        .filter(|(name, content)| rendered_content(name).is_some() && !is_as_written(name, content))
+        .map(|(name, _)| *name)
         .collect();
     if !edited.is_empty() {
         return Err(format!(
@@ -111,26 +91,62 @@ pub(crate) fn splice(
         ));
     }
 
+    // A section missing from the note with a stored hash was deleted by the user, markers and
+    // all, and stays deleted. One without a hash is new to the template: it goes before the next
+    // section the note has, in template order, or at the end.
+    let mut new_sections = rendered_sections
+        .iter()
+        .filter(|(name, _)| {
+            !written.contains_key(*name)
+                && !disk_sections.iter().any(|(disk_name, _)| disk_name == name)
+        })
+        .peekable();
     let mut body = String::with_capacity(rendered_body.len() + disk_body.len() / 4);
+    let write_section = |body: &mut String, name: &str, content: &str| {
+        let _ = writeln!(body, "{BEGIN}{name}{MARKER_CLOSE}");
+        body.push_str(content);
+        let _ = writeln!(body, "{END}{name}{MARKER_CLOSE}");
+    };
+    let template_position = |name: &str| {
+        rendered_sections
+            .iter()
+            .position(|(rendered_name, _)| *rendered_name == name)
+    };
+    let mut is_after_dropped_section = false;
     for piece in &disk_pieces {
         match piece {
-            Piece::Text(text) => body.push_str(text),
-            Piece::Section { name, .. } => {
-                let content = rendered_pieces
-                    .iter()
-                    .find_map(|rendered| match rendered {
-                        Piece::Section {
-                            name: rendered_name,
-                            content,
-                        } if rendered_name == name => Some(*content),
-                        Piece::Section { .. } | Piece::Text(_) => None,
-                    })
-                    .unwrap_or_default();
-                let _ = writeln!(body, "{BEGIN}{name}{MARKER_CLOSE}");
-                body.push_str(content);
-                let _ = writeln!(body, "{END}{name}{MARKER_CLOSE}");
+            // Keeps one blank line where a dropped section sat between two blank lines.
+            Piece::Text(text) if is_after_dropped_section && body.ends_with("\n\n") => {
+                body.push_str(text.strip_prefix('\n').unwrap_or(text));
             }
+            Piece::Text(text) => body.push_str(text),
+            Piece::Section { name, content } => match rendered_content(name) {
+                Some(rendered) => {
+                    let position = template_position(name);
+                    while let Some((new_name, new_content)) =
+                        new_sections.next_if(|(new_name, _)| template_position(new_name) < position)
+                    {
+                        write_section(&mut body, new_name, new_content);
+                        body.push('\n');
+                    }
+                    write_section(&mut body, name, rendered);
+                }
+                // A section the template no longer renders is dropped when it holds the app's own
+                // text, and kept when the user edited it.
+                None if is_as_written(name, content) => {
+                    is_after_dropped_section = true;
+                    continue;
+                }
+                None => write_section(&mut body, name, content),
+            },
         }
+        is_after_dropped_section = false;
+    }
+    for (new_name, new_content) in new_sections {
+        if !body.ends_with("\n\n") {
+            body.push('\n');
+        }
+        write_section(&mut body, new_name, new_content);
     }
 
     let frontmatter = match (disk_frontmatter, rendered_frontmatter) {
@@ -139,6 +155,17 @@ pub(crate) fn splice(
         (_, None) => return Err("the template writes no frontmatter".to_owned()),
     };
     Ok(format!("---\n{frontmatter}---\n{body}"))
+}
+
+/// Each marked section's name and contents, in order.
+fn sections<'a>(pieces: &[Piece<'a>]) -> Vec<(&'a str, &'a str)> {
+    pieces
+        .iter()
+        .filter_map(|piece| match piece {
+            Piece::Section { name, content } => Some((*name, *content)),
+            Piece::Text(_) => None,
+        })
+        .collect()
 }
 
 enum Piece<'a> {

@@ -9,6 +9,7 @@ mod note;
 pub mod settings;
 mod splice;
 
+use std::collections::BTreeMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
@@ -380,12 +381,16 @@ impl Pipeline {
                 Some(note_path) => note_path.clone(),
                 None => self.claim_note_path(lease, revision, &note)?,
             };
-            let section_sha256s =
+            let rendered_section_sha256s =
                 splice::section_sha256s(&rendered).map_err(|reason| PipelineError::NoteEdited {
                     path: note_path.clone(),
-                    reason,
+                    reason: format!("in the template, {reason}"),
                 })?;
-            let (contents, edited_sha256) = fit_to_note(&note_path, meeting, rendered)?;
+            let FittedNote {
+                contents,
+                edited_sha256,
+                section_sha256s,
+            } = fit_to_note(&note_path, meeting, rendered, rendered_section_sha256s)?;
             let note_sha256 = note::note_sha256(contents.as_bytes());
             // Recorded first, so after a crash or a re-post mid-write the next run still knows
             // the note on disk is its own.
@@ -590,22 +595,38 @@ fn known_note_sha256s(meeting: &Meeting) -> Vec<&str> {
         .collect()
 }
 
-// The contents to write: the render as is over the pipeline's own note, or spliced into the
-// note the user edited. The second value is the edited note's hash, which the write checks
-// again just before the rename.
+struct FittedNote {
+    contents: String,
+    /// The hash of the edited note the splice started from, which the write checks again just
+    /// before the rename.
+    edited_sha256: Option<String>,
+    /// Stored after the write, so the next rerun can tell the app's sections from the user's.
+    section_sha256s: BTreeMap<String, String>,
+}
+
+// The contents to write: the render spliced into the note on disk, so text the user added outside
+// the sections survives every rerun, not only the first.
 fn fit_to_note(
     note_path: &Path,
     meeting: &Meeting,
     rendered: String,
-) -> Result<(String, Option<String>), PipelineError> {
+    rendered_section_sha256s: BTreeMap<String, String>,
+) -> Result<FittedNote, PipelineError> {
+    let as_rendered = |rendered: String, section_sha256s: BTreeMap<String, String>| FittedNote {
+        contents: rendered,
+        edited_sha256: None,
+        section_sha256s,
+    };
     let known = known_note_sha256s(meeting);
     // No hash: a new note, or edits the user chose to discard.
     if known.is_empty() {
-        return Ok((rendered, None));
+        return Ok(as_rendered(rendered, rendered_section_sha256s));
     }
     let on_disk = match std::fs::read_to_string(note_path) {
         Ok(on_disk) => on_disk,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((rendered, None)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(as_rendered(rendered, rendered_section_sha256s));
+        }
         Err(source) => {
             return Err(PipelineError::ReadFile {
                 path: note_path.to_path_buf(),
@@ -614,18 +635,48 @@ fn fit_to_note(
         }
     };
     let on_disk_sha256 = note::note_sha256(on_disk.as_bytes());
-    if known.contains(&on_disk_sha256.as_str()) {
-        return Ok((rendered, None));
+    let is_as_written = known.contains(&on_disk_sha256.as_str());
+    let note_edited = |reason: String| PipelineError::NoteEdited {
+        path: note_path.to_path_buf(),
+        reason,
+    };
+    // A custom template without markers leaves nothing to splice into.
+    if rendered_section_sha256s.is_empty() {
+        return if is_as_written {
+            Ok(as_rendered(rendered, rendered_section_sha256s))
+        } else {
+            Err(note_edited(
+                "the note template has no mc:begin/mc:end markers, so the app cannot keep your edits"
+                    .to_owned(),
+            ))
+        };
     }
-    let spliced =
-        splice::splice(&on_disk, &rendered, &meeting.note_section_sha256s).map_err(|reason| {
-            PipelineError::NoteEdited {
-                path: note_path.to_path_buf(),
-                reason,
-            }
-        })?;
-    tracing::info!(file.path = %note_path.display(), "note was edited; keeping the edits outside the app's sections");
-    Ok((spliced, Some(on_disk_sha256)))
+    let mut written = meeting.note_section_sha256s.clone();
+    if is_as_written {
+        let on_disk_section_sha256s = splice::section_sha256s(&on_disk)
+            .map_err(|reason| note_edited(format!("in the note, {reason}")))?;
+        // Written from a template without markers: every section would land after the old text.
+        if on_disk_section_sha256s.is_empty() {
+            return Ok(as_rendered(rendered, rendered_section_sha256s));
+        }
+        // A note the pipeline wrote holds its sections as written, which covers a write that
+        // crashed before the store recorded its section hashes.
+        written.extend(on_disk_section_sha256s);
+    }
+    let spliced = splice::splice(&on_disk, &rendered, &written).map_err(note_edited)?;
+    let mut section_sha256s = splice::section_sha256s(&spliced)
+        .map_err(|reason| note_edited(format!("in the spliced note, {reason}")))?;
+    // A section the user deleted keeps its hash, so later reruns leave it out too.
+    for (name, sha256) in written {
+        if rendered_section_sha256s.contains_key(&name) {
+            section_sha256s.entry(name).or_insert(sha256);
+        }
+    }
+    Ok(FittedNote {
+        contents: spliced,
+        edited_sha256: Some(on_disk_sha256),
+        section_sha256s,
+    })
 }
 
 // Run just before the rename: the note must still be one the pipeline wrote, or the edited note
