@@ -12,6 +12,7 @@ mod splice;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
@@ -27,7 +28,7 @@ use crate::google::GoogleError;
 use crate::keychain::Keychain;
 use crate::llm::{ExtractionError, Provider};
 use crate::note::NoteInput;
-use crate::settings::{AppDirs, Settings};
+use crate::settings::{AppDirs, LlmSettings, Settings};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -79,7 +80,9 @@ const MAX_RUN_TIME: Duration = Duration::from_mins(15);
 
 // After each failed extraction, the next try waits this long. A failure after the last one fails
 // the meeting. Spaced to outlast a rate-limit window or a laptop that went offline.
-const EXTRACTION_RETRY_DELAYS: [Duration; 3] = [
+/// How many times a failed extraction is tried again before the meeting fails.
+pub const EXTRACTION_RETRIES: u32 = 3;
+const EXTRACTION_RETRY_DELAYS: [Duration; EXTRACTION_RETRIES as usize] = [
     Duration::from_mins(5),
     Duration::from_mins(30),
     Duration::from_hours(2),
@@ -91,6 +94,8 @@ pub struct Pipeline {
     store: JobStore,
     google: GoogleAccounts,
     keychain: Keychain,
+    /// Replaced from the settings window, so a new provider applies to the next run.
+    llm: RwLock<LlmSettings>,
 }
 
 impl Pipeline {
@@ -98,13 +103,54 @@ impl Pipeline {
     pub fn new(app_dirs: AppDirs, settings: Settings, store: JobStore) -> Self {
         let keychain = Keychain::new(app_dirs.keychain_service());
         let google = GoogleAccounts::new(keychain.clone(), &settings.google);
+        let llm = RwLock::new(settings.llm.clone());
         Self {
             app_dirs,
             settings,
             store,
             google,
             keychain,
+            llm,
         }
+    }
+
+    /// The LLM settings the next run uses.
+    #[must_use]
+    pub fn llm(&self) -> LlmSettings {
+        self.llm
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Applies new LLM settings to the next run. When a provider is set, notes written without
+    /// notes are queued for extraction, and the count is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineError::Store` when the meetings cannot be queued.
+    pub fn replace_llm(&self, llm: LlmSettings) -> Result<usize, PipelineError> {
+        let has_provider = llm.provider.is_some();
+        *self.llm.write().unwrap_or_else(PoisonError::into_inner) = llm;
+        if !has_provider {
+            return Ok(0);
+        }
+        let queued = self.store.schedule_missing_extractions()?;
+        tracing::info!(meeting.count = queued, "LLM settings applied");
+        Ok(queued)
+    }
+
+    /// Whether the meeting's note differs from every write the pipeline made, so a rerun has to
+    /// splice into it or overwrite it.
+    #[must_use]
+    pub fn has_edited_note(&self, meeting: &Meeting) -> bool {
+        let known = known_note_sha256s(meeting);
+        let Some(note_path) = &meeting.note_path else {
+            return false;
+        };
+        !known.is_empty()
+            && std::fs::read(note_path)
+                .is_ok_and(|on_disk| !known.contains(&note::note_sha256(&on_disk).as_str()))
     }
 
     #[must_use]
@@ -445,7 +491,7 @@ impl Pipeline {
             transcript,
             self.settings.my_name.as_deref(),
             attendees,
-            &self.settings.llm.glossary,
+            &self.llm().glossary,
         )
     }
 
@@ -455,10 +501,11 @@ impl Pipeline {
         &self,
         prompt: &Prompt,
     ) -> Result<Option<(CheckedNotes, String)>, (String, ExtractionError)> {
-        let Some(label) = self.settings.llm.label() else {
+        let llm = self.llm();
+        let Some(label) = llm.label() else {
             return Ok(None);
         };
-        let provider = Provider::from_settings(&self.settings.llm, &self.keychain, &self.app_dirs)
+        let provider = Provider::from_settings(&llm, &self.keychain, &self.app_dirs)
             .map_err(|error| (label.clone(), error))?
             .expect("a provider is set, since the settings give a label");
         let notes = provider

@@ -32,6 +32,46 @@ function renderAccounts(accounts) {
   }
 }
 
+let llm = null;
+
+// Shows the fields the chosen provider takes, with its default model and key state.
+function showProviderFields() {
+  const provider = field("llm-provider").value;
+  for (const element of document.querySelectorAll("[data-for]")) {
+    element.hidden = !element.dataset.for.split(" ").includes(provider);
+  }
+  const defaultModels = {
+    anthropic: llm?.anthropic_default_model,
+    "claude-code": llm?.claude_code_default_model,
+  };
+  field("llm-model").placeholder = defaultModels[provider] ?? "Required";
+  const hasKey = {
+    anthropic: llm?.has_anthropic_key,
+    "openai-compatible": llm?.has_openai_compatible_key,
+  };
+  field("llm-api-key").placeholder = hasKey[provider]
+    ? "Saved in the keychain"
+    : provider === "openai-compatible"
+      ? "Leave blank for a local server"
+      : "";
+}
+
+async function checkClaudeCode() {
+  const button = field("check-claude-code");
+  const status = field("claude-code-status");
+  button.disabled = true;
+  status.textContent = "Checking…";
+  status.classList.remove("error");
+  try {
+    status.textContent = await invoke("claude_code_check");
+  } catch (error) {
+    status.textContent = String(error);
+    status.classList.add("error");
+  } finally {
+    button.disabled = false;
+  }
+}
+
 async function load() {
   try {
     const settings = await invoke("settings_load");
@@ -43,6 +83,12 @@ async function load() {
     field("client-secret").value = "";
     field("client-secret").placeholder = settings.has_client_secret ? "Saved in the keychain" : "";
     field("settings-file").textContent = settings.settings_file;
+    llm = settings.llm;
+    field("llm-provider").value = llm.provider ?? "";
+    field("llm-model").value = llm.model ?? "";
+    field("llm-base-url").value = llm.base_url ?? "";
+    field("llm-api-key").value = "";
+    showProviderFields();
     renderAccounts(settings.accounts);
   } catch (error) {
     showMessage(String(error), true);
@@ -59,10 +105,13 @@ async function save(event) {
     time_zone: field("time-zone").value,
     client_id: field("client-id").value,
     client_secret: field("client-secret").value,
+    llm_provider: field("llm-provider").value || null,
+    llm_model: field("llm-model").value,
+    llm_base_url: field("llm-base-url").value,
+    llm_api_key: field("llm-api-key").value,
   };
   try {
-    await invoke("settings_save", { form });
-    showMessage("Saved.", false);
+    showMessage(await invoke("settings_save", { form }), false);
     await load();
   } catch (error) {
     showMessage(String(error), true);
@@ -113,4 +162,10 @@ async function removeAccount(email) {
 field("settings").addEventListener("submit", save);
 field("client-file").addEventListener("change", readClientFile);
 field("add-account").addEventListener("click", addAccount);
+field("llm-provider").addEventListener("change", () => {
+  // A model name belongs to one provider; the field then shows the new provider's default.
+  field("llm-model").value = "";
+  showProviderFields();
+});
+field("check-claude-code").addEventListener("click", checkClaudeCode);
 load();

@@ -34,7 +34,9 @@ label {
 
 input[type="text"],
 input[type="password"],
-input[type="number"] {
+input[type="number"],
+input[type="url"],
+select {
   font: inherit;
   padding: 4px 6px;
 }
@@ -69,6 +71,12 @@ footer {
   margin-top: 16px;
 }
 
-#message.error {
+#message.error,
+#claude-code-status.error {
   color: #c0392b;
+}
+
+/* Outranks the label rule, whose display: flex would show fields hidden for another provider. */
+[hidden] {
+  display: none;
 }

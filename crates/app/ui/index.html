@@ -43,6 +43,44 @@
       </section>
 
       <section>
+        <h2>Meeting notes (LLM)</h2>
+        <p class="hint">
+          Writes the summary, decisions, action items and your commitments, each linked to the
+          transcript line it comes from. Without a provider, notes carry the transcript only.
+        </p>
+        <label>
+          Provider
+          <select id="llm-provider">
+            <option value="">None</option>
+            <option value="claude-code">Claude Code (your Claude plan)</option>
+            <option value="anthropic">Anthropic API</option>
+            <option value="openai-compatible">OpenAI-compatible API (OpenRouter, Ollama)</option>
+          </select>
+        </label>
+        <label data-for="anthropic openai-compatible claude-code">
+          Model
+          <input type="text" id="llm-model" autocomplete="off" spellcheck="false">
+        </label>
+        <label data-for="openai-compatible">
+          Base URL
+          <input
+            type="url"
+            id="llm-base-url"
+            placeholder="https://openrouter.ai/api/v1"
+            spellcheck="false"
+          >
+        </label>
+        <label data-for="anthropic openai-compatible">
+          API key
+          <input type="password" id="llm-api-key" autocomplete="off">
+        </label>
+        <div data-for="claude-code">
+          <button type="button" id="check-claude-code">Check Claude Code</button>
+          <p id="claude-code-status" class="hint" role="status"></p>
+        </div>
+      </section>
+
+      <section>
         <h2>Notes</h2>
         <label>
           Vault folder

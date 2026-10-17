@@ -11,12 +11,12 @@ tauri-build.workspace = true
 
 [dependencies]
 caption-receiver.workspace = true
-jiff.workspace = true
 jobs.workspace = true
 pipeline.workspace = true
 serde.workspace = true
 tauri.workspace = true
 tauri-plugin-autostart.workspace = true
+tauri-plugin-notification.workspace = true
 tauri-plugin-opener.workspace = true
 tauri-plugin-single-instance.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "time"] }

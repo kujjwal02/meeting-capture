@@ -70,12 +70,14 @@ fn main() -> tauri::Result<()> {
             None,
         ))
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
             settings_window::settings_load,
             settings_window::settings_save,
             settings_window::client_file_read,
             settings_window::google_account_add,
             settings_window::google_account_remove,
+            settings_window::claude_code_check,
         ])
         .setup(|app| {
             // Tauri panics on a setup error, and a login item has no terminal, so the log is the

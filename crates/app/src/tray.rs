@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use jobs::{JobState, Meeting, MeetingId};
-use pipeline::Pipeline;
+use pipeline::{EXTRACTION_RETRIES, Pipeline};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
@@ -23,6 +23,7 @@ const MAX_REASON_CHARS: usize = 80;
 enum MenuAction {
     OpenNote(MeetingId),
     Retry(MeetingId),
+    OverwriteEdits(MeetingId),
     RetryFailed,
     StartAtLogin,
     OpenSettings,
@@ -35,6 +36,7 @@ impl MenuAction {
         match self {
             MenuAction::OpenNote(id) => format!("open-note:{id}"),
             MenuAction::Retry(id) => format!("retry:{id}"),
+            MenuAction::OverwriteEdits(id) => format!("overwrite-edits:{id}"),
             MenuAction::RetryFailed => "retry-failed".to_owned(),
             MenuAction::StartAtLogin => "start-at-login".to_owned(),
             MenuAction::OpenSettings => "open-settings".to_owned(),
@@ -50,6 +52,9 @@ impl MenuAction {
         }
         if let Some(id) = id.strip_prefix("retry:") {
             return meeting_id(id).map(MenuAction::Retry);
+        }
+        if let Some(id) = id.strip_prefix("overwrite-edits:") {
+            return meeting_id(id).map(MenuAction::OverwriteEdits);
         }
         [
             MenuAction::RetryFailed,
@@ -174,11 +179,7 @@ fn append_meetings(app: &AppHandle, menu: &Menu<Wry>, pipeline: &Pipeline) -> ta
         menu.append(&label_entry(app, "No meetings yet")?)?;
     }
     for meeting in &recent {
-        menu.append(&meeting_submenu(
-            app,
-            meeting,
-            &pipeline.settings().time_zone,
-        )?)?;
+        menu.append(&meeting_submenu(app, pipeline, meeting)?)?;
     }
     let failed_count = match store.failed() {
         Ok(failed) => failed.len(),
@@ -197,9 +198,10 @@ fn append_meetings(app: &AppHandle, menu: &Menu<Wry>, pipeline: &Pipeline) -> ta
 
 fn meeting_submenu(
     app: &AppHandle,
+    pipeline: &Pipeline,
     meeting: &Meeting,
-    time_zone: &jiff::tz::TimeZone,
 ) -> tauri::Result<Submenu<Wry>> {
+    let time_zone = &pipeline.settings().time_zone;
     let started_at = meeting
         .started_at
         .to_zoned(time_zone.clone())
@@ -217,6 +219,19 @@ fn meeting_submenu(
     if let Some(failure) = &meeting.failure {
         submenu.append(&label_entry(app, &shorten(failure, MAX_FAILURE_CHARS))?)?;
     }
+    if let (JobState::ExtractionPending, Some(retry_at), Some(error)) = (
+        job_state,
+        meeting.next_extraction_at,
+        &meeting.extraction_error,
+    ) {
+        let retry_at = retry_at.to_zoned(time_zone.clone()).strftime("%H:%M %Z");
+        let label = format!(
+            "Extraction pending, retry {} of {EXTRACTION_RETRIES} at {retry_at}",
+            meeting.extraction_attempts
+        );
+        submenu.append(&label_entry(app, &label)?)?;
+        submenu.append(&label_entry(app, &shorten(error, MAX_FAILURE_CHARS))?)?;
+    }
     submenu.append(&action_entry(
         app,
         &MenuAction::OpenNote(meeting.id),
@@ -229,6 +244,15 @@ fn meeting_submenu(
         "Retry",
         job_state == JobState::Failed,
     )?)?;
+    // A rerun splices into an edited note; this is for a note whose markers it cannot place.
+    if job_state == JobState::Failed && pipeline.has_edited_note(meeting) {
+        submenu.append(&action_entry(
+            app,
+            &MenuAction::OverwriteEdits(meeting.id),
+            "Overwrite my edits",
+            true,
+        )?)?;
+    }
     Ok(submenu)
 }
 
@@ -267,6 +291,14 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
             if let Some(pipeline) = &state.pipeline {
                 let (app, pipeline) = (app.clone(), Arc::clone(pipeline));
                 tauri::async_runtime::spawn_blocking(move || meetings::run(&app, &pipeline, id));
+            }
+        }
+        MenuAction::OverwriteEdits(id) => {
+            if let Some(pipeline) = &state.pipeline {
+                let (app, pipeline) = (app.clone(), Arc::clone(pipeline));
+                tauri::async_runtime::spawn_blocking(move || {
+                    meetings::overwrite_edits(&app, &pipeline, id);
+                });
             }
         }
         MenuAction::RetryFailed => {

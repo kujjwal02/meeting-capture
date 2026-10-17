@@ -1,13 +1,15 @@
 //! Turns received captions into jobs and runs the pipeline for them, off the async runtime.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use caption_receiver::ReceivedCaptions;
-use jobs::MeetingId;
+use jobs::{JobState, Meeting, MeetingId};
 use pipeline::{Pipeline, RunOutcome};
 use tauri::AppHandle;
+use tauri_plugin_notification::NotificationExt as _;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -16,6 +18,8 @@ use crate::{Listener, set_listener};
 // Picks up meetings a crash, a quit or a store error left unfinished. A dead process's lease
 // expires after `jobs::LEASE_EXPIRY`, so a sweep soon after launch can still find one held.
 const SWEEP_INTERVAL: Duration = Duration::from_mins(5);
+// Two, so one slow run does not hold up the rest, and few enough LLM calls for a rate limit.
+const SWEEP_WORKERS: usize = 2;
 
 pub(crate) fn start(app: AppHandle, pipeline: Arc<Pipeline>, port: u16) {
     tauri::async_runtime::spawn(sweep_unfinished(app.clone(), Arc::clone(&pipeline)));
@@ -75,12 +79,70 @@ pub(crate) fn run(app: &AppHandle, pipeline: &Pipeline, id: MeetingId) {
     match pipeline.run(id) {
         Ok(RunOutcome::Finished(meeting)) => {
             tracing::info!(meeting.id = %id, meeting.state = meeting.state().label(), "run finished");
+            notify_outcome(app, pipeline, &meeting);
         }
         Ok(RunOutcome::AlreadyRunning) => {}
         // Step failures are logged and recorded by the pipeline; this covers store errors too.
         Err(error) => tracing::warn!(meeting.id = %id, exception.message = %error, "run stopped"),
     }
     crate::tray::refresh(app);
+}
+
+/// Runs the meeting again from its stored input and overwrites the note, edits included.
+pub(crate) fn overwrite_edits(app: &AppHandle, pipeline: &Pipeline, id: MeetingId) {
+    if let Err(error) = pipeline.reprocess(id, true) {
+        tracing::warn!(meeting.id = %id, exception.message = %error, "run stopped");
+    }
+    crate::tray::refresh(app);
+}
+
+// One notification when the note is written, and one when its notes fail for good. A retry that
+// writes the note again without notes stays quiet.
+fn notify_outcome(app: &AppHandle, pipeline: &Pipeline, meeting: &Meeting) {
+    let title = meeting.title.as_deref().unwrap_or("Untitled call");
+    let (heading, body) = match meeting.state() {
+        JobState::Written if meeting.extraction_json.is_some() => {
+            ("Note written", format!("{title}, with notes"))
+        }
+        JobState::Written => ("Note written", format!("{title}, transcript only")),
+        JobState::ExtractionPending if meeting.extraction_attempts == 1 => {
+            let retry_at = meeting
+                .next_extraction_at
+                .map_or_else(String::new, |retry_at| {
+                    let time_zone = pipeline.settings().time_zone.clone();
+                    format!(
+                        "; next try at {}",
+                        retry_at.to_zoned(time_zone).strftime("%H:%M %Z")
+                    )
+                });
+            (
+                "Note written",
+                format!("{title}, transcript only: the notes failed{retry_at}"),
+            )
+        }
+        JobState::Failed
+            if meeting.failure.is_some() && meeting.failure == meeting.extraction_error =>
+        {
+            (
+                "Notes failed",
+                format!("{title} keeps the transcript only. The tray shows why."),
+            )
+        }
+        JobState::Captured
+        | JobState::Matched
+        | JobState::Extracted
+        | JobState::ExtractionPending
+        | JobState::Failed => return,
+    };
+    let shown = app
+        .notification()
+        .builder()
+        .title(heading)
+        .body(body)
+        .show();
+    if let Err(error) = shown {
+        tracing::warn!(exception.message = %error, "could not show the notification");
+    }
 }
 
 pub(crate) fn retry_failed(app: &AppHandle, pipeline: &Pipeline) {
@@ -96,28 +158,51 @@ pub(crate) fn retry_failed(app: &AppHandle, pipeline: &Pipeline) {
     }
 }
 
+/// Starts a sweep in the background, unless one is still running.
+pub(crate) fn run_unfinished(app: &AppHandle, pipeline: &Arc<Pipeline>) {
+    let (app, pipeline) = (app.clone(), Arc::clone(pipeline));
+    tauri::async_runtime::spawn_blocking(move || sweep(&app, &pipeline));
+}
+
 async fn sweep_unfinished(app: AppHandle, pipeline: Arc<Pipeline>) {
     let mut interval = tokio::time::interval(SWEEP_INTERVAL);
     loop {
         interval.tick().await;
-        let lister = Arc::clone(&pipeline);
-        let unfinished =
-            tauri::async_runtime::spawn_blocking(move || lister.store().unfinished()).await;
-        let unfinished = match unfinished {
-            Ok(Ok(unfinished)) => unfinished,
-            Ok(Err(error)) => {
-                tracing::error!(exception.message = %error, "could not list unfinished meetings");
-                continue;
-            }
-            Err(error) => {
-                tracing::error!(exception.message = %error, "listing unfinished meetings crashed");
-                continue;
-            }
-        };
-        // One thread per meeting, so a hung run never holds up the others or the next sweep.
-        for meeting in unfinished {
-            let (app, pipeline) = (app.clone(), Arc::clone(&pipeline));
-            tauri::async_runtime::spawn_blocking(move || run(&app, &pipeline, meeting.id));
-        }
+        run_unfinished(&app, &pipeline);
     }
+}
+
+// Runs every unfinished meeting and due extraction retry on `SWEEP_WORKERS` threads. Saving a
+// provider can queue every old note at once, and that many LLM calls in parallel would hit the
+// rate limit together and then retry together. A sweep that finds the last one still running
+// returns; the next tick picks up what is left.
+fn sweep(app: &AppHandle, pipeline: &Pipeline) {
+    static IS_SWEEPING: AtomicBool = AtomicBool::new(false);
+    if IS_SWEEPING.swap(true, Ordering::AcqRel) {
+        tracing::info!("the last sweep is still running; skipping this one");
+        return;
+    }
+    let unfinished = match pipeline.store().unfinished() {
+        Ok(unfinished) => unfinished,
+        Err(error) => {
+            tracing::error!(exception.message = %error, "could not list unfinished meetings");
+            IS_SWEEPING.store(false, Ordering::Release);
+            return;
+        }
+    };
+    let queue = Mutex::new(unfinished.into_iter().map(|meeting| meeting.id));
+    std::thread::scope(|scope| {
+        for _ in 0..SWEEP_WORKERS {
+            scope.spawn(|| {
+                loop {
+                    let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
+                    let Some(id) = next else {
+                        return;
+                    };
+                    run(app, pipeline, id);
+                }
+            });
+        }
+    });
+    IS_SWEEPING.store(false, Ordering::Release);
 }
