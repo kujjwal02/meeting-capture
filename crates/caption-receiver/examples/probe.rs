@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use caption_receiver::{DEFAULT_PORT, WEBHOOK_PATH};
-use sources::Transcript;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
@@ -21,10 +20,7 @@ async fn main() -> anyhow::Result<()> {
         .context("usage: probe <payload-dir | payload-file>")?
         .into();
     if payload_path.is_file() {
-        let payload = std::fs::read(&payload_path)?;
-        let transcript = sources::transcriptonic::parse(&payload)?;
-        print_summary(&payload_path, &transcript);
-        return Ok(());
+        return print_summary(&payload_path);
     }
     let payload_dir = payload_path;
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, DEFAULT_PORT));
@@ -36,15 +32,20 @@ async fn main() -> anyhow::Result<()> {
     let (sender, mut received) = mpsc::channel(8);
     let server = tokio::spawn(caption_receiver::serve(listener, payload_dir, sender));
     while let Some(captions) = received.recv().await {
-        print_summary(&captions.payload_path, &captions.transcript);
+        let summary = print_summary(&captions.payload_path);
         // The probe keeps no job store; the saved payload is the record.
-        let _ = captions.recorded.send(Ok(()));
+        let _ = captions
+            .recorded
+            .send(summary.map_err(|error| error.to_string()));
     }
     server.await??;
     Ok(())
 }
 
-fn print_summary(payload_path: &Path, transcript: &Transcript) {
+fn print_summary(payload_path: &Path) -> anyhow::Result<()> {
+    let payload = std::fs::read(payload_path)
+        .with_context(|| format!("could not read {}", payload_path.display()))?;
+    let transcript = sources::transcriptonic::parse(&payload)?;
     println!(
         "{}: {:?} {:?} {:?}, {} to {}, {} segments, {} chat messages",
         payload_path.display(),
@@ -62,4 +63,5 @@ fn print_summary(payload_path: &Path, transcript: &Transcript) {
             segment.start_s, segment.end_s, segment.speaker, segment.text
         );
     }
+    Ok(())
 }

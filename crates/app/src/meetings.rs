@@ -61,11 +61,9 @@ fn payload_dir(app: &AppHandle) -> std::path::PathBuf {
 }
 
 fn record_and_run(app: &AppHandle, pipeline: &Pipeline, captions: ReceivedCaptions) {
-    let recorded = pipeline.record(
-        InputKind::TranscriptonicPayload,
-        &captions.payload_path,
-        &captions.transcript,
-    );
+    // A read error on the saved payload also replies 500. TranscripTonic's retry posts it again,
+    // and the receiver saves it under a new name.
+    let recorded = pipeline.take_in(InputKind::TranscriptonicPayload, &captions.payload_path);
     let reply = recorded.as_ref().map(|_| ()).map_err(ToString::to_string);
     if captions.recorded.send(reply).is_err() {
         tracing::warn!("TranscripTonic disconnected before the reply");

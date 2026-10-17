@@ -1,8 +1,10 @@
 //! Accepts TranscripTonic's webhook on 127.0.0.1 and saves the raw payload.
 //!
 //! The payload is written to disk before parsing, so a parser bug never loses a meeting. The
-//! parsed transcript goes to the app over a channel; this crate never touches the job store. The
-//! reply waits until the app has recorded the meeting, so a 200 means the meeting is safe.
+//! receiver parses the payload only to reject a bad one with 422. The saved file's path goes to
+//! the app over a channel, and the app records the meeting from that file; this crate never
+//! touches the job store. The reply waits until the app has recorded the meeting, so a 200 means
+//! the meeting is safe.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,7 +14,6 @@ use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::routing::post;
-use sources::Transcript;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
@@ -27,11 +28,10 @@ const TRANSCRIPTONIC_ORIGIN: &str = "chrome-extension://ciepnfnceimjehngolkijpnb
 // A four-hour Meet call is about 800 KB of advanced body.
 const MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
-/// A parsed transcript and the raw payload file it came from.
+/// A saved payload that parses as a TranscripTonic transcript.
 #[derive(Debug)]
 pub struct ReceivedCaptions {
     pub payload_path: PathBuf,
-    pub transcript: Transcript,
     /// The app sends `Ok` once the meeting is in the job store, or the reason it is not.
     pub recorded: oneshot::Sender<Result<(), String>>,
 }
@@ -105,22 +105,18 @@ async fn receive_transcriptonic(
         "saved TranscripTonic payload"
     );
 
-    let transcript = match sources::transcriptonic::parse(&payload) {
-        Ok(transcript) => transcript,
-        Err(error) => {
-            tracing::error!(
-                file.path = %payload_path.display(),
-                exception.message = %error,
-                "could not parse TranscripTonic payload"
-            );
-            return StatusCode::UNPROCESSABLE_ENTITY;
-        }
-    };
+    if let Err(error) = sources::transcriptonic::parse(&payload) {
+        tracing::error!(
+            file.path = %payload_path.display(),
+            exception.message = %error,
+            "could not parse TranscripTonic payload"
+        );
+        return StatusCode::UNPROCESSABLE_ENTITY;
+    }
 
     let (recorded, is_recorded) = oneshot::channel();
     let captions = ReceivedCaptions {
         payload_path: payload_path.clone(),
-        transcript,
         recorded,
     };
     if state.received.send(captions).await.is_err() {

@@ -6,8 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use huddle_captions::{HuddleHealth, Notice, WatchPaths, WatchSettings};
-use jobs::InputKind;
-use pipeline::Pipeline;
+use pipeline::{InputError, Intake, IntakeError, Pipeline};
 use tauri::{AppHandle, Manager as _};
 use tauri_plugin_notification::NotificationExt as _;
 
@@ -137,40 +136,31 @@ impl Reporter {
     }
 }
 
-// A huddle shorter than the setting, or with almost no captions, was most likely a misclick or a
-// quick check, so it writes no note. Its log stays, and `mc ingest` can still write one.
-const MIN_CAPTION_SEGMENTS: usize = 3;
-
 fn record_and_run(app: &AppHandle, pipeline: &Pipeline, log_path: &Path) {
     let _span = tracing::info_span!("huddle.record", file.path = %log_path.display()).entered();
-    let transcript = match std::fs::read(log_path)
-        .map_err(|error| error.to_string())
-        .and_then(|log| sources::slack_huddle::parse(&log).map_err(|error| error.to_string()))
-    {
-        Ok(transcript) => transcript,
-        Err(error) => {
-            tracing::error!(exception.message = error, "could not read a huddle log");
-            notify(app, "Slack huddle not recorded", &error);
-            set_aside(log_path);
-            return;
-        }
-    };
-    let length_s = transcript.duration().as_secs();
-    let min_huddle_s = i64::from(app.state::<AppState>().slack().min_huddle_seconds);
-    if length_s < min_huddle_s || transcript.segments.len() < MIN_CAPTION_SEGMENTS {
-        tracing::info!(
-            huddle.length_s = length_s,
-            caption.segments = transcript.segments.len(),
-            "short huddle; no note"
-        );
-        return;
-    }
-    match pipeline.record(InputKind::SlackHuddleLog, log_path, &transcript) {
-        Ok(id) => {
+    // Read for each huddle, so a new setting applies to the next one without a restart.
+    let min_huddle_seconds = app.state::<AppState>().slack().min_huddle_seconds;
+    let taken_in = pipeline.take_in_huddle_log_unless_short(log_path, min_huddle_seconds);
+    match taken_in {
+        Ok(Intake::Recorded(id)) => {
             crate::tray::refresh(app);
             crate::meetings::run(app, pipeline, id);
         }
-        Err(error) => {
+        // Its log stays, and `mc ingest` can still write its note.
+        Ok(Intake::TooShort) => {}
+        Err(IntakeError::Input(error)) => {
+            tracing::error!(exception.message = %error, "could not read a huddle log");
+            // The banner has little room, and the span already names the file.
+            let cause = match &error {
+                InputError::Read { source, .. } => source.to_string(),
+                InputError::ParseTranscriptonic(_) | InputError::ParseSlackHuddle(_) => {
+                    error.to_string()
+                }
+            };
+            notify(app, "Slack huddle not recorded", &cause);
+            set_aside(log_path);
+        }
+        Err(error @ (IntakeError::Copy { .. } | IntakeError::Store(_))) => {
             tracing::error!(exception.message = %error, "could not record a huddle");
             notify(app, "Slack huddle not recorded", &error.to_string());
         }

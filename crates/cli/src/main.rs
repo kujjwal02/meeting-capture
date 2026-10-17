@@ -77,10 +77,7 @@ fn main() -> anyhow::Result<()> {
     let time_zone = pipeline.settings().time_zone.clone();
     match cli.command {
         Command::Ingest { input_file, kind } => {
-            let id = match kind {
-                InputKindArg::TranscriptonicPayload => ingest(&pipeline, &app_dirs, &input_file)?,
-                InputKindArg::SlackHuddleLog => ingest_huddle(&pipeline, &app_dirs, &input_file)?,
-            };
+            let id = pipeline.take_in(kind.into(), &input_file)?;
             print_outcome(&pipeline.run(id)?, &time_zone);
         }
         Command::Reprocess {
@@ -147,46 +144,19 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-// Copies the payload into the app's payload folder under a new name, so the job never depends on
-// a file the user may move, delete or reuse.
-fn ingest(
-    pipeline: &Pipeline,
-    app_dirs: &AppDirs,
-    payload_file: &Path,
-) -> anyhow::Result<MeetingId> {
-    let payload = std::fs::read(payload_file)
-        .with_context(|| format!("could not read {}", payload_file.display()))?;
-    let transcript = sources::transcriptonic::parse(&payload)?;
-    let payload_path = sources::transcriptonic::save_payload(&app_dirs.payload_dir(), &payload)
-        .context("could not save the payload in the app folder")?;
-    Ok(pipeline.record(InputKind::TranscriptonicPayload, &payload_path, &transcript)?)
-}
-
-// Copies the log into the app's huddle folder under its start time, unless it is already there.
-// A huddle the app skipped as too short is already there, and ingesting it writes its note.
-fn ingest_huddle(
-    pipeline: &Pipeline,
-    app_dirs: &AppDirs,
-    log_file: &Path,
-) -> anyhow::Result<MeetingId> {
-    let log = std::fs::read(log_file)
-        .with_context(|| format!("could not read {}", log_file.display()))?;
-    let transcript = sources::slack_huddle::parse(&log)?;
-    let log_path = app_dirs
-        .huddle_log_dir()
-        .join(sources::slack_huddle::log_file_name(transcript.started_at));
-    let is_in_place = std::fs::canonicalize(log_file).ok() == std::fs::canonicalize(&log_path).ok();
-    if !is_in_place {
-        std::fs::copy(log_file, &log_path)
-            .with_context(|| format!("could not copy the log to {}", log_path.display()))?;
-    }
-    Ok(pipeline.record(InputKind::SlackHuddleLog, &log_path, &transcript)?)
-}
-
 #[derive(Clone, Copy, clap::ValueEnum)]
 enum InputKindArg {
     TranscriptonicPayload,
     SlackHuddleLog,
+}
+
+impl From<InputKindArg> for InputKind {
+    fn from(kind: InputKindArg) -> Self {
+        match kind {
+            InputKindArg::TranscriptonicPayload => InputKind::TranscriptonicPayload,
+            InputKindArg::SlackHuddleLog => InputKind::SlackHuddleLog,
+        }
+    }
 }
 
 fn check_saved_reply(prompt: &Prompt, reply_file: &Path) -> anyhow::Result<CheckedNotes> {

@@ -706,7 +706,6 @@ dependencies = [
  "jobs",
  "pipeline",
  "serde_json",
- "sources",
  "tracing-subscriber",
 ]
 
@@ -2637,7 +2636,6 @@ dependencies = [
  "jobs",
  "pipeline",
  "serde",
- "sources",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",

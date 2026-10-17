@@ -464,7 +464,7 @@ pub fn is_dm(channel: &str) -> bool {
 
 /// "Huddle in #team-review" for a channel, "Huddle with <names>" for a DM.
 #[must_use]
-pub fn huddle_title(channel: &str) -> String {
+fn huddle_title(channel: &str) -> String {
     if is_dm(channel) {
         format!("Huddle with {channel}")
     } else {

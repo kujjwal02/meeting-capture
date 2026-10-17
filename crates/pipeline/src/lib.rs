@@ -3,6 +3,7 @@
 pub mod calendar;
 pub mod extraction;
 pub mod google;
+mod intake;
 pub mod llm;
 mod note;
 pub mod settings;
@@ -15,17 +16,20 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use jobs::{
-    Extraction, ExtractionFailure, InputKind, JobStore, LeasedRun, Meeting, MeetingId,
-    NotePathClaim, RunOutcome, Step, StepError, StoreError,
+    Extraction, ExtractionFailure, JobStore, LeasedRun, Meeting, MeetingId, NotePathClaim,
+    RunOutcome, Step, StepError, StoreError,
 };
 use sources::Transcript;
 
 use crate::calendar::{CalendarMatch, GoogleAccounts};
 use crate::extraction::{CheckedNotes, Prompt};
 use crate::google::GoogleError;
+use crate::intake::read_transcript;
 use crate::llm::{ExtractionError, Provider};
 use crate::note::NoteInput;
 use crate::settings::{AppDirs, LlmSettings, Settings};
+
+pub use crate::intake::{InputError, Intake, IntakeError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
@@ -37,9 +41,7 @@ pub enum PipelineError {
         source: std::io::Error,
     },
     #[error(transparent)]
-    ParseTranscriptonic(#[from] sources::transcriptonic::ParseError),
-    #[error(transparent)]
-    ParseSlackHuddle(#[from] sources::slack_huddle::ParseError),
+    Input(#[from] InputError),
     #[error("stored step output is not valid JSON: {0}")]
     StepOutput(#[from] serde_json::Error),
     #[error("calendar match failed: {0}")]
@@ -166,32 +168,12 @@ impl Pipeline {
     /// Returns `PipelineError` when the meeting, its input or its stored match cannot be read.
     pub fn extraction_prompt(&self, id: MeetingId) -> Result<Prompt, PipelineError> {
         let meeting = self.store.get(id)?;
-        let transcript = load_transcript(&meeting)?;
+        let transcript = read_transcript(meeting.input_kind, &meeting.input_path)?;
         let calendar_match: CalendarMatch = match meeting.calendar_match_json.as_deref() {
             Some(stored) => serde_json::from_str(stored)?,
             None => CalendarMatch { event: None },
         };
         Ok(self.prompt(&transcript, &calendar_match))
-    }
-
-    /// Records a meeting whose input of `kind` is already saved at `input_path`. Recording a
-    /// meeting already in the store, such as a re-posted payload, reuses that meeting and its note.
-    ///
-    /// # Errors
-    ///
-    /// Returns `PipelineError::Store` when the write fails.
-    pub fn record(
-        &self,
-        kind: InputKind,
-        input_path: &Path,
-        transcript: &Transcript,
-    ) -> Result<MeetingId, PipelineError> {
-        Ok(self.store.upsert_captured(
-            kind,
-            input_path,
-            transcript.started_at,
-            transcript.title.as_deref(),
-        )?)
     }
 
     /// Runs every step after the meeting's last finished one. On failure the job is marked
@@ -224,7 +206,7 @@ impl Pipeline {
     fn run_steps(&self, run: &LeasedRun<'_>) -> Result<(), PipelineError> {
         let meeting = run.meeting();
         let id = meeting.id;
-        let transcript = load_transcript(meeting)?;
+        let transcript = read_transcript(meeting.input_kind, &meeting.input_path)?;
 
         let calendar_match = if meeting.finished_step < Step::Matched {
             let _span = tracing::info_span!("pipeline.match", meeting.id = %id).entered();
@@ -532,17 +514,6 @@ fn check_note_unchanged(
             path: note_path.to_path_buf(),
             source,
         }),
-    }
-}
-
-fn load_transcript(meeting: &Meeting) -> Result<Transcript, PipelineError> {
-    let input = std::fs::read(&meeting.input_path).map_err(|source| PipelineError::ReadFile {
-        path: meeting.input_path.clone(),
-        source,
-    })?;
-    match meeting.input_kind {
-        InputKind::TranscriptonicPayload => Ok(sources::transcriptonic::parse(&input)?),
-        InputKind::SlackHuddleLog => Ok(sources::slack_huddle::parse(&input)?),
     }
 }
 
