@@ -190,7 +190,18 @@ pub struct Extraction<'a> {
     pub provider: &'a str,
 }
 
-/// A failed extraction, as recorded once the note is written without notes.
+/// How the extraction of a run that writes the note ended, as `LeasedRun::mark_written` records
+/// it.
+#[derive(Debug, Clone, Copy)]
+pub enum ExtractionAtWrite<'a> {
+    /// The run stored its notes, or that no provider is set, before the write. Or the run owed
+    /// no extraction.
+    Recorded,
+    /// The note is written without notes.
+    Failed(ExtractionFailure<'a>),
+}
+
+/// A failed extraction, as recorded with the note written without notes.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractionFailure<'a> {
     /// `<provider>/<model>`, or the provider alone when it could not be set up.
@@ -459,6 +470,11 @@ impl JobStore {
     }
 }
 
+// The note half of `LeasedRun::mark_written`, shared so the note records the same way whatever
+// the extraction outcome.
+const NOTE_WRITTEN: &str = "finished_step = ?6, note_sha256 = ?7, pending_note_sha256s = NULL,
+    note_section_sha256s = ?8";
+
 impl LeasedRun<'_> {
     /// `title` is the calendar event title, else the title the call app showed.
     ///
@@ -493,39 +509,6 @@ impl LeasedRun<'_> {
                 extraction_attempts = 0, extraction_error = NULL, next_extraction_at_ms = NULL,
                 failure = NULL, failure_kind = NULL",
             &[&Step::Extracted.as_str(), &extraction_json, &provider],
-        )
-    }
-
-    /// Records a failed extraction once the note is written without notes. The retry schedule
-    /// sets the next try, and the sweep runs it. After the last retry, or at once for a lasting
-    /// error, the meeting fails with the error.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
-    pub fn record_extraction_failure(
-        &self,
-        failure: ExtractionFailure<'_>,
-    ) -> Result<(), StoreError> {
-        let ExtractionFailure {
-            provider,
-            error,
-            persistence,
-        } = failure;
-        let next = retry_schedule::after_failure(self.meeting(), persistence);
-        let retry_at_ms = next.retry_at.map(Timestamp::as_millisecond);
-        self.update(
-            "extraction_provider = ?6, extraction_attempts = ?7, extraction_error = ?8,
-                next_extraction_at_ms = ?9,
-                failure = CASE WHEN ?9 IS NULL THEN ?8 ELSE NULL END,
-                failure_kind = CASE WHEN ?9 IS NULL THEN ?10 ELSE NULL END",
-            &[
-                &provider,
-                &next.attempts,
-                &error,
-                &retry_at_ms,
-                &FailureKind::Extraction.as_str(),
-            ],
         )
     }
 
@@ -576,6 +559,12 @@ impl LeasedRun<'_> {
         )
     }
 
+    /// Records the note as written and, when it failed, the run's extraction, in one statement.
+    /// A crash before it leaves the step and the extraction as they were before the write, plus
+    /// the pending note hash, so the sweep or a manual retry runs the meeting again. After a failed extraction the retry schedule sets the next try, and the
+    /// sweep runs it. After the last retry, or at once for a lasting error, the meeting fails with
+    /// the error.
+    ///
     /// # Errors
     ///
     /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
@@ -583,20 +572,45 @@ impl LeasedRun<'_> {
         &self,
         note_sha256: &str,
         section_sha256s: &BTreeMap<String, String>,
+        extraction: ExtractionAtWrite<'_>,
     ) -> Result<(), StoreError> {
-        let section_lines: Vec<String> = section_sha256s
+        let section_lines = section_sha256s
             .iter()
             .map(|(section, sha256)| format!("{section} {sha256}"))
-            .collect();
-        self.update(
-            "finished_step = ?6, note_sha256 = ?7, pending_note_sha256s = NULL, failure = NULL,
-                failure_kind = NULL,
-                note_section_sha256s = ?8",
-            &[
-                &Step::Written.as_str(),
-                &note_sha256,
-                &section_lines.join("\n"),
-            ],
-        )
+            .collect::<Vec<_>>()
+            .join("\n");
+        let written = Step::Written.as_str();
+        match extraction {
+            ExtractionAtWrite::Recorded => self.update(
+                &format!("{NOTE_WRITTEN}, failure = NULL, failure_kind = NULL"),
+                &[&written, &note_sha256, &section_lines],
+            ),
+            ExtractionAtWrite::Failed(ExtractionFailure {
+                provider,
+                error,
+                persistence,
+            }) => {
+                let next = retry_schedule::after_failure(self.meeting(), persistence);
+                let retry_at_ms = next.retry_at.map(Timestamp::as_millisecond);
+                self.update(
+                    &format!(
+                        "{NOTE_WRITTEN}, extraction_provider = ?9, extraction_attempts = ?10,
+                            extraction_error = ?11, next_extraction_at_ms = ?12,
+                            failure = CASE WHEN ?12 IS NULL THEN ?11 ELSE NULL END,
+                            failure_kind = CASE WHEN ?12 IS NULL THEN ?13 ELSE NULL END"
+                    ),
+                    &[
+                        &written,
+                        &note_sha256,
+                        &section_lines,
+                        &provider,
+                        &next.attempts,
+                        &error,
+                        &retry_at_ms,
+                        &FailureKind::Extraction.as_str(),
+                    ],
+                )
+            }
+        }
     }
 }

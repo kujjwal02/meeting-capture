@@ -17,8 +17,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use jobs::{
-    Extraction, ExtractionFailure, JobStore, LeasedRun, MeetingId, RunOutcome, Step, StepError,
-    StoreError,
+    ErrorPersistence, Extraction, ExtractionAtWrite, ExtractionFailure, JobStore, LeasedRun,
+    MeetingId, RunOutcome, Step, StepError, StoreError,
 };
 use sources::Transcript;
 
@@ -245,24 +245,35 @@ impl Pipeline {
                 time_zone: &self.settings.time_zone,
             };
             let rendered = render::note(&note, &self.app_dirs.note_template_file())?;
-            let note_path = self
-                .vault
-                .write(run, &note.started_at(), note.title(), &rendered)?;
+            let extraction_at_write = match &extraction {
+                ExtractOutcome::Notes { .. } | ExtractOutcome::NoNotes => {
+                    ExtractionAtWrite::Recorded
+                }
+                ExtractOutcome::Failed {
+                    provider,
+                    error_message,
+                    persistence,
+                } => ExtractionAtWrite::Failed(ExtractionFailure {
+                    provider,
+                    error: error_message,
+                    persistence: *persistence,
+                }),
+            };
+            let note_path = self.vault.write(
+                run,
+                &note.started_at(),
+                note.title(),
+                &rendered,
+                extraction_at_write,
+            )?;
             tracing::info!(file.path = %note_path.display(), "note written");
-        }
-
-        if let ExtractOutcome::Failed { provider, error } = &extraction {
-            run.record_extraction_failure(ExtractionFailure {
-                provider,
-                error: &error.to_string(),
-                persistence: error.persistence(),
-            })?;
         }
         Ok(())
     }
 
-    // Runs the LLM and records the notes. A failure is returned, not recorded: the note is
-    // written first, so the transcript reaches the vault either way.
+    // Runs the LLM and records the notes. A failure is returned, not recorded: the note write
+    // records it in the same statement, so the transcript reaches the vault either way and a
+    // crash cannot leave a written note with no owed extraction.
     fn extract_step(
         &self,
         run: &LeasedRun<'_>,
@@ -291,7 +302,11 @@ impl Pipeline {
             }
             Err((provider, error)) => {
                 tracing::warn!(exception.message = %error, "extraction failed");
-                Ok(ExtractOutcome::Failed { provider, error })
+                Ok(ExtractOutcome::Failed {
+                    provider,
+                    error_message: error.to_string(),
+                    persistence: error.persistence(),
+                })
             }
         }
     }
@@ -339,6 +354,8 @@ enum ExtractOutcome {
     NoNotes,
     Failed {
         provider: String,
-        error: ExtractionError,
+        /// The error's text, as the job store records it.
+        error_message: String,
+        persistence: ErrorPersistence,
     },
 }

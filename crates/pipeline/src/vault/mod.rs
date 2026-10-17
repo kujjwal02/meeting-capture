@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use jiff::Zoned;
-use jobs::{LeasedRun, NoteOwnership};
+use jobs::{ExtractionAtWrite, LeasedRun, NoteOwnership};
 
 use crate::PipelineError;
 
@@ -31,8 +31,8 @@ impl Vault {
     }
 
     /// Writes `rendered` as the run's meeting note, spliced into the note on disk when the user
-    /// edited it, and records the write. A new note gets a path named from `started_at`, in the
-    /// user's time zone, and `title`. Returns the note's path.
+    /// edited it, and records the write with `extraction`. A new note gets a path named from
+    /// `started_at`, in the user's time zone, and `title`. Returns the note's path.
     ///
     /// # Errors
     ///
@@ -47,6 +47,7 @@ impl Vault {
         started_at: &Zoned,
         title: &str,
         rendered: &str,
+        extraction: ExtractionAtWrite<'_>,
     ) -> Result<PathBuf, PipelineError> {
         let ownership = &run.meeting().note;
         let note_path = match ownership.path() {
@@ -66,7 +67,7 @@ impl Vault {
             run.confirm_current_input()?;
             check_note_unchanged(&note_path, ownership, edited_sha256.as_deref())
         })?;
-        run.mark_written(&note_sha256, &section_sha256s)?;
+        run.mark_written(&note_sha256, &section_sha256s, extraction)?;
         Ok(note_path)
     }
 }

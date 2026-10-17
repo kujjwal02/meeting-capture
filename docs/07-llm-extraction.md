@@ -141,7 +141,9 @@ old keychain items.
 ## Retries
 
 A failed extraction never holds back the transcript. The note is written without notes and tagged
-`status/needs-extraction`. The job store then records the failure and the next try.
+`status/needs-extraction`. One job store update records the written note, the failure and the
+next try. A crash before that update leaves the step and the extraction as they were before the write,
+plus the pending note hash, so the sweep or a manual retry runs the meeting again.
 
 ```mermaid
 stateDiagram-v2
