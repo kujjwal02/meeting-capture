@@ -142,7 +142,8 @@ flowchart LR
 ```
 
 - All of this is the `pipeline` crate. It has no Tauri dependency, so `mc reprocess` runs it too.
-- Calendar match takes the event with the largest time overlap across both accounts.
+- Calendar match takes the event with the same Meet code, else the largest time overlap, across
+  both accounts.
 - If extraction fails, the note is still written with the transcript and the tag
   `status/needs-extraction`, and the job retries later.
 - `pipeline` also owns the settings file. The app and `mc` load settings through it, so both read
@@ -176,7 +177,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 |---|---|---|---|
 | caption-receiver | 1 | Accept TranscripTonic's webhook; fallback watches Downloads for its `.txt` | `axum` |
 | sources | 1 | Turn each input into the common transcript format | Captions, own stems, Meet REST API, dropped audio files |
-| pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction, vault write, settings file | `rig-core`, `schemars`, `garde`, `yup-oauth2`, `google-calendar3`, `keyring`, `minijinja`, `toml`, `directories` |
+| pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction, vault write, settings file | `rig-core`, `schemars`, `garde`, `oauth2`, `reqwest`, `keyring`, `minijinja`, `toml`, `directories` |
 | jobs | 1 | One row per meeting with a closed state enum and retry count | `rusqlite` |
 | cli | 1 | `mc`: rerun any job step or ingest a file, without Tauri | `clap` |
 | app | 1 | Tray, settings, permission prompts, review of extracted commitments | Tauri 2 |

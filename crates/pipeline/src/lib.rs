@@ -1,6 +1,7 @@
 //! Calendar match, LLM extraction and the vault write. No Tauri dependency.
 
 pub mod calendar;
+pub mod google;
 mod note;
 pub mod settings;
 
@@ -15,6 +16,8 @@ use jobs::{
 };
 use sources::Transcript;
 
+use crate::calendar::GoogleAccounts;
+use crate::google::{GoogleError, Keychain};
 use crate::note::NoteInput;
 use crate::settings::{AppDirs, Settings};
 
@@ -31,6 +34,8 @@ pub enum PipelineError {
     ParseTranscriptonic(#[from] sources::transcriptonic::ParseError),
     #[error("stored step output is not valid JSON: {0}")]
     StepOutput(#[from] serde_json::Error),
+    #[error("calendar match failed: {0}")]
+    Calendar(#[from] GoogleError),
     #[error("meeting {0} finished the calendar match but has no stored match")]
     MissingCalendarMatch(MeetingId),
     #[error("note template failed: {0}")]
@@ -68,21 +73,31 @@ pub struct Pipeline {
     app_dirs: AppDirs,
     settings: Settings,
     store: JobStore,
+    google: GoogleAccounts,
 }
 
 impl Pipeline {
     #[must_use]
     pub fn new(app_dirs: AppDirs, settings: Settings, store: JobStore) -> Self {
+        let google =
+            GoogleAccounts::new(Keychain::new(app_dirs.keychain_service()), &settings.google);
         Self {
             app_dirs,
             settings,
             store,
+            google,
         }
     }
 
     #[must_use]
     pub fn settings(&self) -> &Settings {
         &self.settings
+    }
+
+    /// The signed-in Google accounts. Changes from the settings window apply here at once.
+    #[must_use]
+    pub fn google(&self) -> &GoogleAccounts {
+        &self.google
     }
 
     #[must_use]
@@ -224,11 +239,11 @@ impl Pipeline {
 
         let calendar_match = if meeting.finished_step < Step::Matched {
             let _span = tracing::info_span!("pipeline.match", meeting.id = %id).entered();
-            let calendar_match = calendar::match_event(&transcript);
+            let calendar_match = self.google.match_event(&transcript)?;
             let title = calendar_match
                 .event
                 .as_ref()
-                .map(|event| event.title.as_str())
+                .and_then(|event| event.title.as_deref())
                 .or(transcript.title.as_deref());
             self.store.record_match(
                 lease,

@@ -6,6 +6,7 @@
 
 mod launch;
 mod meetings;
+mod settings_window;
 mod tray;
 
 use std::sync::{Arc, Mutex, PoisonError};
@@ -28,6 +29,9 @@ pub(crate) struct AppState {
     /// `None` when the settings or the job store failed to load. The listener then says why.
     pub pipeline: Option<Arc<Pipeline>>,
     pub listener: Mutex<Listener>,
+    /// Held across each read, edit and write of the settings file, so two edits never drop each
+    /// other's change.
+    pub settings_file_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -66,6 +70,13 @@ fn main() -> tauri::Result<()> {
             None,
         ))
         .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            settings_window::settings_load,
+            settings_window::settings_save,
+            settings_window::client_file_read,
+            settings_window::google_account_add,
+            settings_window::google_account_remove,
+        ])
         .setup(|app| {
             // Tauri panics on a setup error, and a login item has no terminal, so the log is the
             // only place the cause can show.
@@ -115,13 +126,26 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         app_dirs,
         pipeline: pipeline.as_ref().map(|(pipeline, _)| Arc::clone(pipeline)),
         listener: Mutex::new(listener.clone()),
+        settings_file_lock: Mutex::new(()),
     });
     tray::create(app.handle())?;
     match pipeline {
-        Some((pipeline, port)) => meetings::start(app.handle().clone(), pipeline, port),
+        Some((pipeline, port)) => {
+            check_google_accounts(app.handle().clone(), Arc::clone(&pipeline));
+            meetings::start(app.handle().clone(), pipeline, port);
+        }
         None => set_listener(app.handle(), listener),
     }
     Ok(())
+}
+
+/// Refreshes each account's token in the background and shows the outcome in the tray. At launch,
+/// a revoked account shows "sign in again" before the next call needs it.
+pub(crate) fn check_google_accounts(app: AppHandle, pipeline: Arc<Pipeline>) {
+    tauri::async_runtime::spawn_blocking(move || {
+        pipeline.google().check();
+        tray::refresh(&app);
+    });
 }
 
 pub(crate) const LOG_FILE_NAME: &str = "app.log";

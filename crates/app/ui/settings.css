@@ -1,0 +1,74 @@
+:root {
+  color-scheme: light dark;
+  font:
+    14px / 1.4 -apple-system,
+    "Segoe UI",
+    sans-serif;
+}
+
+body {
+  margin: 0;
+  padding: 0 24px 24px;
+}
+
+h1 {
+  font-size: 20px;
+}
+
+h2 {
+  font-size: 15px;
+  margin-bottom: 4px;
+}
+
+section {
+  border-bottom: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+  padding-bottom: 12px;
+}
+
+label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 10px 0;
+}
+
+input[type="text"],
+input[type="password"],
+input[type="number"] {
+  font: inherit;
+  padding: 4px 6px;
+}
+
+.hint {
+  color: color-mix(in srgb, currentColor 65%, transparent);
+  font-size: 12px;
+  margin: 4px 0;
+}
+
+#accounts {
+  list-style: none;
+  padding: 0;
+}
+
+#accounts li {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  justify-content: space-between;
+  padding: 4px 0;
+}
+
+.needs-sign-in {
+  color: #c0392b;
+}
+
+footer {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+#message.error {
+  color: #c0392b;
+}

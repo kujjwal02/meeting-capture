@@ -30,7 +30,7 @@ impl NoteInput<'_> {
         self.calendar_match
             .event
             .as_ref()
-            .map(|event| event.title.as_str())
+            .and_then(|event| event.title.as_deref())
             .or(self.transcript.title.as_deref())
             .unwrap_or(UNTITLED_CALL)
     }

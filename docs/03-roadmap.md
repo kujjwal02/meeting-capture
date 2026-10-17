@@ -45,8 +45,8 @@ Progress is tracked in the [checklist](05-checklist.md).
   code into `meeting_url` and drops the title.
 - The tray menu shows the listener state, each signed-in calendar account, and the last 5 meetings
   with their job state. It can retry failed jobs and open a note.
-- The settings window is plain HTML: Google accounts, LLM provider, its API key, vault path, port.
-  It arrives with Google sign-in in build step 4; until then the tray opens `settings.toml`.
+- The settings window is plain HTML: Google accounts and OAuth client, LLM provider, its API key,
+  vault path, port, your name, time zone. It writes `settings.toml`; secrets go to `keyring`.
 - LLM provider is a closed choice: `anthropic` (default, Claude Haiku 5.5) or `openai-compatible`
   (base URL and model). The endpoint must support JSON-schema structured output; a reply that
   fails to parse or validate marks the job `Failed` and names the provider.
@@ -65,9 +65,13 @@ Progress is tracked in the [checklist](05-checklist.md).
 - One OAuth client of type "Desktop app" in a personal Google Cloud project, consent screen
   "External" and published "In production". A consent screen in "Testing" expires refresh tokens
   after 7 days. Unverified apps show a warning at consent, which is fine for personal use.
-- One refresh token per account in `keyring`.
-- Calendar match queries both accounts and picks the event with the largest time overlap. On a tie,
-  it prefers an event with a Meet link, then the akaiketech.com account.
+- The client ID goes in the settings file. The client secret and one refresh token per account go
+  in `keyring`. The repo is public, so neither is in the code.
+- Calendar match reads each account's primary calendar. An event with the transcript's Meet code
+  wins. Else the largest time overlap wins; on a tie, an event with a Meet link, then the account
+  listed first. Sign in with akaiketech.com first, so it wins ties.
+- All-day events, declined events, focus time, out of office and working location never match.
+- A network or keychain failure fails the run, which keeps the calendar title once retried.
 - If no account matches or a token is revoked, the note is still written with the TranscripTonic
   title and no attendees, and the tray shows "sign in again".
 

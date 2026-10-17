@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use directories::{ProjectDirs, UserDirs};
 use jiff::tz::TimeZone;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum SettingsError {
@@ -22,6 +22,8 @@ pub enum SettingsError {
     },
     #[error("settings field vault_dir: {path} is not a folder")]
     VaultDirMissing { path: PathBuf },
+    #[error("settings field receiver_port: must be between 1 and 65535")]
+    ReceiverPortZero,
     #[error("settings field my_name: must not be blank")]
     BlankMyName,
     #[error(
@@ -32,12 +34,27 @@ pub enum SettingsError {
         "settings field time_zone: the device time zone is unknown ({reason}); set an IANA name such as \"Asia/Kolkata\""
     )]
     NoDeviceTimeZone { reason: String },
+    #[error(
+        "settings field google.client_id: {client_id:?} is not a Google OAuth client ID; it ends in \".apps.googleusercontent.com\""
+    )]
+    GoogleClientId { client_id: String },
+    #[error("settings field google.accounts: {email:?} is not an email address or is listed twice")]
+    GoogleAccount { email: String },
+    #[error("could not write settings file {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("could not write the settings: {0}")]
+    Serialize(String),
     #[error("could not create app folder {path}: {source}")]
     CreateDir {
         path: PathBuf,
         source: std::io::Error,
     },
 }
+
+const KEYCHAIN_SERVICE: &str = "com.ujjwalkumar.meetingcapture";
 
 /// Where the app keeps its own files. None of them go into the vault.
 #[derive(Debug, Clone)]
@@ -100,6 +117,16 @@ impl AppDirs {
         self.config_dir.join("note.md.j2")
     }
 
+    /// The OS keychain service that holds this install's secrets. A dev run under
+    /// `MEETING_CAPTURE_HOME` gets its own, so it never reads the real refresh tokens.
+    #[must_use]
+    pub fn keychain_service(&self) -> String {
+        match std::env::var_os("MEETING_CAPTURE_HOME") {
+            Some(home) => format!("{KEYCHAIN_SERVICE}.dev:{}", home.to_string_lossy()),
+            None => KEYCHAIN_SERVICE.to_owned(),
+        }
+    }
+
     #[must_use]
     pub fn job_store_file(&self) -> PathBuf {
         self.data_dir.join("jobs.sqlite")
@@ -132,36 +159,95 @@ pub struct Settings {
     pub receiver_port: u16,
     /// Note names, dates and the times the tray and `mc` show. Stored times stay UTC.
     pub time_zone: TimeZone,
+    pub google: GoogleSettings,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SettingsFile {
-    vault_dir: Option<PathBuf>,
-    my_name: Option<String>,
-    receiver_port: Option<u16>,
-    time_zone: Option<String>,
+pub struct GoogleSettings {
+    /// The "Desktop app" OAuth client. Its secret is in the OS keychain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// Signed-in accounts, in tie-break order: on an equal calendar match the first one wins.
+    #[serde(default)]
+    pub accounts: Vec<String>,
+}
+
+/// The settings file as written, before defaults fill the gaps. The settings window edits this.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsFile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vault_dir: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub my_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receiver_port: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+    #[serde(default)]
+    pub google: GoogleSettings,
 }
 
 const DEFAULT_RECEIVER_PORT: u16 = 47615;
+const GOOGLE_CLIENT_ID_SUFFIX: &str = ".apps.googleusercontent.com";
 
-/// Written when the user opens a settings file that does not exist yet.
-pub const SETTINGS_TEMPLATE: &str = "\
-# Meeting Capture settings. Quit and reopen the app after a change.
-# Uncomment a line to change it from the default.
+/// Heads the settings file whenever the app writes it.
+const SETTINGS_HEADER: &str = "\
+# Meeting Capture settings. The Settings window writes this file; quit and reopen the app after
+# a hand edit.
+#
+# vault_dir: the Obsidian vault. Notes go under areas/meetings. Default ~/knowledge.
+# my_name: replaces \"You\" in TranscripTonic transcripts.
+# receiver_port: the port in TranscripTonic's webhook URL. Default 47615.
+# time_zone: the IANA time zone for note names and shown times. Default: the device's.
+# [google] client_id: the Desktop app OAuth client. Its secret is in the OS keychain.
+# [google] accounts: signed-in accounts. On a tied calendar match the first one wins.
 
-# The Obsidian vault. Notes go under areas/meetings.
-# vault_dir = \"/Users/you/knowledge\"
-
-# Replaces \"You\" in TranscripTonic transcripts.
-# my_name = \"Your Name\"
-
-# The port in TranscripTonic's webhook URL, http://127.0.0.1:47615/transcriptonic.
-# receiver_port = 47615
-
-# The IANA time zone for note names and shown times. Defaults to the device's time zone.
-# time_zone = \"Asia/Kolkata\"
 ";
+
+impl SettingsFile {
+    /// Reads the settings file. A missing file reads as empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SettingsError` naming the file.
+    pub fn read(app_dirs: &AppDirs) -> Result<Self, SettingsError> {
+        let path = app_dirs.settings_file();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                toml::from_str(&text).map_err(|source| SettingsError::Parse { path, source })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(source) => Err(SettingsError::Read { path, source }),
+        }
+    }
+
+    /// Validates the settings, then replaces the file in one rename.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SettingsError` naming the invalid field or the file.
+    pub fn write(&self, app_dirs: &AppDirs) -> Result<(), SettingsError> {
+        Settings::resolve(self.clone())?;
+        let path = app_dirs.settings_file();
+        let write_error = |source| SettingsError::Write {
+            path: path.clone(),
+            source,
+        };
+        let body =
+            toml::to_string(self).map_err(|error| SettingsError::Serialize(error.to_string()))?;
+        let mut staged =
+            tempfile::NamedTempFile::new_in(&app_dirs.config_dir).map_err(write_error)?;
+        std::io::Write::write_all(&mut staged, format!("{SETTINGS_HEADER}{body}").as_bytes())
+            .map_err(write_error)?;
+        staged.as_file().sync_all().map_err(write_error)?;
+        staged
+            .persist(&path)
+            .map_err(|error| write_error(error.error))?;
+        Ok(())
+    }
+}
 
 impl Settings {
     /// Loads and validates the settings file. A missing file gives the defaults.
@@ -170,21 +256,15 @@ impl Settings {
     ///
     /// Returns `SettingsError` naming the file or the invalid field.
     pub fn load(app_dirs: &AppDirs) -> Result<Self, SettingsError> {
-        let path = app_dirs.settings_file();
-        let file = match std::fs::read_to_string(&path) {
-            Ok(text) => toml::from_str(&text).map_err(|source| SettingsError::Parse {
-                path: path.clone(),
-                source,
-            })?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => SettingsFile {
-                vault_dir: None,
-                my_name: None,
-                receiver_port: None,
-                time_zone: None,
-            },
-            Err(source) => return Err(SettingsError::Read { path, source }),
-        };
+        Self::resolve(SettingsFile::read(app_dirs)?)
+    }
 
+    /// Fills defaults into `file` and validates every field.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SettingsError` naming the invalid field.
+    pub fn resolve(file: SettingsFile) -> Result<Self, SettingsError> {
         let vault_dir = match file.vault_dir {
             Some(vault_dir) => vault_dir,
             None => UserDirs::new()
@@ -210,11 +290,29 @@ impl Settings {
                 reason: error.to_string(),
             })?,
         };
+        if file.receiver_port == Some(0) {
+            return Err(SettingsError::ReceiverPortZero);
+        }
+        if let Some(client_id) = &file.google.client_id
+            && !client_id.ends_with(GOOGLE_CLIENT_ID_SUFFIX)
+        {
+            return Err(SettingsError::GoogleClientId {
+                client_id: client_id.clone(),
+            });
+        }
+        for (index, email) in file.google.accounts.iter().enumerate() {
+            if !email.contains('@') || file.google.accounts[..index].contains(email) {
+                return Err(SettingsError::GoogleAccount {
+                    email: email.clone(),
+                });
+            }
+        }
         Ok(Self {
             vault_dir,
             my_name: file.my_name,
             receiver_port: file.receiver_port.unwrap_or(DEFAULT_RECEIVER_PORT),
             time_zone,
+            google: file.google,
         })
     }
 

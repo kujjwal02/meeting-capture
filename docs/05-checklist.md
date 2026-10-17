@@ -92,18 +92,22 @@ Done when:
 
 ### Step 4: Google sign-in and calendar match
 
-- [ ] Settings window (plain HTML) with the sign-in button, vault path, port and your name.
-  Until then the tray opens `settings.toml`.
-- [ ] OAuth client of type "Desktop app", consent screen "External" and "In production".
-- [ ] "Add Google account": authorization code flow with PKCE and a loopback redirect in the
-  default browser.
-- [ ] Scopes `calendar.events.readonly`, `openid`, `email`.
-- [ ] One refresh token per account in `keyring`; akaiketech.com and personal accounts.
-- [ ] Calendar match across both accounts by the largest time overlap. On a tie, prefer a Meet
-  link, then akaiketech.com.
-- [ ] No match or a revoked token: the note keeps the TranscripTonic title, and the tray shows
-  "sign in again".
-- [ ] Tray shows each signed-in account.
+- [x] Settings window (plain HTML) with the sign-in button, OAuth client fields and a client JSON
+  loader, vault path, port, your name and time zone. It replaces "Open settings file".
+- [x] OAuth client of type "Desktop app", consent screen "External" and "In production", in the
+  `ujjwalk-homelab` project. Steps in `docs/06-google-setup.md`.
+- [x] "Add Google account": authorization code flow with PKCE, a state check and a loopback
+  redirect in the default browser. Gives up after 5 minutes.
+- [x] Scopes `calendar.events.readonly`, `openid`, `email`.
+- [x] Client secret and one refresh token per account in `keyring`; a dev run under
+  `MEETING_CAPTURE_HOME` uses its own keychain service.
+- [x] Calendar match across every account: same Meet code, then the largest time overlap, then a
+  Meet link, then the account listed first.
+- [x] No match or a revoked token: the note keeps the TranscripTonic title, and the tray shows
+  "sign in again". A network failure fails the run instead.
+- [x] Tray shows each signed-in account. Accounts are checked at launch.
+- [x] Review by a subagent; findings fixed.
+- [ ] Sign in with akaiketech.com and the personal account, then match a real call.
 - [ ] Settle whether the akaiketech.com admin allows unverified apps to read calendars.
 
 ### Step 5: LLM extraction

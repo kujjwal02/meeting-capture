@@ -1,5 +1,5 @@
 //! Opens what the tray points at. Each target names the app that shows it, because the default
-//! app for `.md` or `.toml` can be anything, even a drawing app.
+//! app for `.md` can be anything, even a drawing app.
 
 use std::path::Path;
 
@@ -9,8 +9,6 @@ use tauri_plugin_opener::OpenerExt as _;
 pub(crate) enum LaunchTarget<'a> {
     /// A vault note: Obsidian, else the text editor.
     Note(&'a Path),
-    /// A file to edit by hand: the text editor.
-    TextFile(&'a Path),
     /// A file to find on disk: Finder or Explorer, with the file selected.
     RevealFile(&'a Path),
 }
@@ -18,7 +16,6 @@ pub(crate) enum LaunchTarget<'a> {
 pub(crate) fn launch(app: &AppHandle, target: &LaunchTarget<'_>) {
     let (path, launched) = match target {
         LaunchTarget::Note(path) => (path, open_in_obsidian(app, path)),
-        LaunchTarget::TextFile(path) => (path, open_in_text_editor(path)),
         LaunchTarget::RevealFile(path) => (
             path,
             app.opener()

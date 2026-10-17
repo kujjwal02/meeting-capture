@@ -3,8 +3,71 @@
   <head>
     <meta charset="utf-8">
     <title>Meeting Capture settings</title>
+    <link rel="stylesheet" href="settings.css">
+    <script src="settings.js" defer></script>
   </head>
   <body>
-    <h1>Settings</h1>
+    <form id="settings">
+      <h1>Settings</h1>
+
+      <section>
+        <h2>Google Calendar</h2>
+        <p class="hint">
+          Each call is matched to an event on these accounts. On a tie, the first account wins.
+        </p>
+        <ul id="accounts"></ul>
+        <button type="button" id="add-account">Add Google account</button>
+        <p id="sign-in-status" class="hint" hidden>
+          Finish signing in in the browser. This waits up to 5 minutes.
+        </p>
+      </section>
+
+      <section>
+        <h2>Google OAuth client</h2>
+        <p class="hint">
+          A "Desktop app" client from Google Cloud Console. Load its JSON file, or paste both
+          values.
+        </p>
+        <label>
+          Client JSON file
+          <input type="file" id="client-file" accept=".json,application/json">
+        </label>
+        <label>
+          Client ID
+          <input type="text" id="client-id" autocomplete="off" spellcheck="false">
+        </label>
+        <label>
+          Client secret
+          <input type="password" id="client-secret" autocomplete="off">
+        </label>
+      </section>
+
+      <section>
+        <h2>Notes</h2>
+        <label>
+          Vault folder
+          <input type="text" id="vault-dir" placeholder="~/knowledge" spellcheck="false">
+        </label>
+        <label>
+          Your name, in place of "You"
+          <input type="text" id="my-name">
+        </label>
+        <label>
+          Time zone
+          <input type="text" id="time-zone" placeholder="Device time zone" spellcheck="false">
+        </label>
+        <label>
+          Receiver port
+          <input type="number" id="receiver-port" min="1" max="65535" placeholder="47615">
+        </label>
+        <p class="hint">Vault, name, time zone and port apply after you quit and reopen the app.</p>
+      </section>
+
+      <footer>
+        <button type="submit" id="save">Save</button>
+        <p id="message" role="status"></p>
+      </footer>
+      <p class="hint">Settings file: <code id="settings-file"></code></p>
+    </form>
   </body>
 </html>

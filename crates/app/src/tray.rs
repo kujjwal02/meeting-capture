@@ -25,7 +25,7 @@ enum MenuAction {
     Retry(MeetingId),
     RetryFailed,
     StartAtLogin,
-    OpenSettingsFile,
+    OpenSettings,
     ShowLogFile,
     Quit,
 }
@@ -37,7 +37,7 @@ impl MenuAction {
             MenuAction::Retry(id) => format!("retry:{id}"),
             MenuAction::RetryFailed => "retry-failed".to_owned(),
             MenuAction::StartAtLogin => "start-at-login".to_owned(),
-            MenuAction::OpenSettingsFile => "open-settings-file".to_owned(),
+            MenuAction::OpenSettings => "open-settings".to_owned(),
             MenuAction::ShowLogFile => "show-log-file".to_owned(),
             MenuAction::Quit => "quit".to_owned(),
         }
@@ -54,7 +54,7 @@ impl MenuAction {
         [
             MenuAction::RetryFailed,
             MenuAction::StartAtLogin,
-            MenuAction::OpenSettingsFile,
+            MenuAction::OpenSettings,
             MenuAction::ShowLogFile,
             MenuAction::Quit,
         ]
@@ -110,6 +110,8 @@ fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     menu.append(&PredefinedMenuItem::separator(app)?)?;
 
     if let Some(pipeline) = &state.pipeline {
+        append_google_accounts(app, &menu, pipeline)?;
+        menu.append(&PredefinedMenuItem::separator(app)?)?;
         append_meetings(app, &menu, pipeline)?;
         menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
@@ -117,8 +119,8 @@ fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     menu.append(&start_at_login_entry(app)?)?;
     menu.append(&action_entry(
         app,
-        &MenuAction::OpenSettingsFile,
-        "Open settings file",
+        &MenuAction::OpenSettings,
+        "Settings…",
         true,
     )?)?;
     menu.append(&action_entry(
@@ -130,6 +132,32 @@ fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&action_entry(app, &MenuAction::Quit, "Quit", true)?)?;
     Ok(menu)
+}
+
+// A line per account. One that needs to sign in again opens the settings window.
+fn append_google_accounts(
+    app: &AppHandle,
+    menu: &Menu<Wry>,
+    pipeline: &Pipeline,
+) -> tauri::Result<()> {
+    let accounts = pipeline.google().statuses();
+    if accounts.is_empty() {
+        return menu.append(&action_entry(
+            app,
+            &MenuAction::OpenSettings,
+            "Calendar: no Google account; add one",
+            true,
+        )?);
+    }
+    for account in accounts {
+        if account.needs_sign_in {
+            let label = format!("Calendar: {} (sign in again)", account.email);
+            menu.append(&action_entry(app, &MenuAction::OpenSettings, &label, true)?)?;
+        } else {
+            menu.append(&label_entry(app, &format!("Calendar: {}", account.email))?)?;
+        }
+    }
+    Ok(())
 }
 
 fn append_meetings(app: &AppHandle, menu: &Menu<Wry>, pipeline: &Pipeline) -> tauri::Result<()> {
@@ -250,7 +278,7 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
             }
         }
         MenuAction::StartAtLogin => toggle_start_at_login(app),
-        MenuAction::OpenSettingsFile => open_settings_file(app, &state),
+        MenuAction::OpenSettings => crate::settings_window::open(app),
         MenuAction::ShowLogFile => launch(
             app,
             &LaunchTarget::RevealFile(&state.app_dirs.log_dir().join(crate::LOG_FILE_NAME)),
@@ -284,21 +312,6 @@ fn toggle_start_at_login(app: &AppHandle) {
         tracing::error!(exception.message = %error, "could not change the login item");
     }
     refresh(app);
-}
-
-fn open_settings_file(app: &AppHandle, state: &AppState) {
-    let settings_file = state.app_dirs.settings_file();
-    if !settings_file.exists()
-        && let Err(error) = std::fs::write(&settings_file, pipeline::settings::SETTINGS_TEMPLATE)
-    {
-        tracing::error!(
-            file.path = %settings_file.display(),
-            exception.message = %error,
-            "could not create the settings file"
-        );
-        return;
-    }
-    launch(app, &LaunchTarget::TextFile(&settings_file));
 }
 
 fn action_entry(
