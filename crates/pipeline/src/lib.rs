@@ -3,7 +3,6 @@
 pub mod calendar;
 pub mod extraction;
 pub mod google;
-pub mod keychain;
 pub mod llm;
 mod note;
 pub mod settings;
@@ -26,7 +25,6 @@ use sources::Transcript;
 use crate::calendar::{CalendarMatch, GoogleAccounts};
 use crate::extraction::{CheckedNotes, Prompt};
 use crate::google::GoogleError;
-use crate::keychain::Keychain;
 use crate::llm::{ExtractionError, Provider};
 use crate::note::NoteInput;
 use crate::settings::{AppDirs, LlmSettings, Settings};
@@ -94,7 +92,6 @@ pub struct Pipeline {
     settings: Settings,
     store: JobStore,
     google: GoogleAccounts,
-    keychain: Keychain,
     /// Replaced from the settings window, so a new provider applies to the next run.
     llm: RwLock<LlmSettings>,
 }
@@ -102,15 +99,13 @@ pub struct Pipeline {
 impl Pipeline {
     #[must_use]
     pub fn new(app_dirs: AppDirs, settings: Settings, store: JobStore) -> Self {
-        let keychain = Keychain::new(app_dirs.keychain_service());
-        let google = GoogleAccounts::new(keychain.clone(), &settings.google);
+        let google = GoogleAccounts::new(&settings.google);
         let llm = RwLock::new(settings.llm.clone());
         Self {
             app_dirs,
             settings,
             store,
             google,
-            keychain,
             llm,
         }
     }
@@ -510,7 +505,7 @@ impl Pipeline {
         let Some(label) = llm.label() else {
             return Ok(None);
         };
-        let provider = Provider::from_settings(&llm, &self.keychain, &self.app_dirs)
+        let provider = Provider::from_settings(&llm, &self.app_dirs)
             .map_err(|error| (label.clone(), error))?
             .expect("a provider is set, since the settings give a label");
         let notes = provider

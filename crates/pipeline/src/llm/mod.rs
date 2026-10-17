@@ -7,7 +7,6 @@ mod claude_code;
 pub use claude_code::{ClaudeCodeAuth, claude_code_auth};
 
 use crate::extraction::{self, CheckedNotes, MeetingNotes, Prompt};
-use crate::keychain::{Keychain, KeychainError};
 use crate::settings::{AppDirs, LlmSettings, ProviderKind};
 
 /// Why an extraction produced no notes. Each message names the provider and model.
@@ -30,10 +29,8 @@ pub enum ExtractionError {
     Transport { provider: String, detail: String },
     #[error("{provider} stopped at its output limit before the notes were complete")]
     Truncated { provider: String },
-    #[error("no API key for {provider} in the keychain; add it in Settings")]
+    #[error("no API key for {provider} in settings; add it in Settings")]
     NoApiKey { provider: &'static str },
-    #[error(transparent)]
-    Keychain(#[from] KeychainError),
 }
 
 impl ExtractionError {
@@ -48,8 +45,7 @@ impl ExtractionError {
             Self::RateLimited { .. }
             | Self::Timeout { .. }
             | Self::InvalidReply { .. }
-            | Self::Transport { .. }
-            | Self::Keychain(_) => false,
+            | Self::Transport { .. } => false,
         }
     }
 }
@@ -60,7 +56,7 @@ pub(crate) const SYSTEM_PROMPT: &str = "You are a meeting-notes extraction funct
 // Two turns fixed every bad reply in testing; more only burns plan usage.
 const MAX_REPAIRS: usize = 2;
 
-/// The configured LLM, built once from the settings and the keychain.
+/// The configured LLM, built once from the settings.
 #[derive(Debug, Clone)]
 pub struct Provider {
     label: String,
@@ -98,7 +94,6 @@ impl Provider {
     /// Returns `ExtractionError` when the provider cannot be set up: no API key, no `claude`.
     pub fn from_settings(
         llm: &LlmSettings,
-        keychain: &Keychain,
         app_dirs: &AppDirs,
     ) -> Result<Option<Self>, ExtractionError> {
         let (Some(kind), Some(label)) = (llm.provider, llm.label()) else {
@@ -113,7 +108,7 @@ impl Provider {
             ProviderKind::Anthropic => Backend::Api(Box::new(api::ApiClient::new(
                 api::Endpoint::Anthropic,
                 model,
-                keychain.llm_api_key(kind)?,
+                llm.api_key.clone(),
             )?)),
             ProviderKind::OpenaiCompatible => Backend::Api(Box::new(api::ApiClient::new(
                 api::Endpoint::OpenaiCompatible {
@@ -123,7 +118,7 @@ impl Provider {
                         .expect("settings validation requires llm.base_url for openai-compatible"),
                 },
                 model,
-                keychain.llm_api_key(kind)?,
+                llm.api_key.clone(),
             )?)),
             ProviderKind::ClaudeCode => {
                 Backend::ClaudeCode(claude_code::ClaudeCode::new(llm, model, app_dirs)?)

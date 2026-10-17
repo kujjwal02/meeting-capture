@@ -19,14 +19,23 @@ client stays out of it: you load it in the settings window.
 ## Load it in the app
 
 1. In the tray menu, open Settings.
-2. Under "Google OAuth client", load the JSON file, then press Save. The client ID goes in
-   `settings.toml` and the secret goes in the OS keychain.
+2. Under "Google OAuth client", load the JSON file, then press Save. The client ID and the
+   secret go in `settings.toml`.
 3. Press "Add Google account". Sign in with akaiketech.com first, so it wins tied matches.
 4. Google warns that the app is unverified. Press Advanced, then "Go to Meeting Capture".
    Tick the calendar box on the consent screen; without it the app refuses the sign-in.
 5. Press "Add Google account" again for the personal account.
 
 Delete the downloaded JSON file afterwards.
+
+Saving a new client ID removes the old secret and signs every account out, since Google ties
+both to the client. Enter the new secret and add the accounts again.
+
+## Upgrading from a keychain build
+
+Secrets live in `settings.toml`, and the app no longer reads the keychain. Enter the client
+secret and the API key again, then sign in to each account. Delete the old
+`com.ujjwalkumar.meetingcapture*` items in Keychain Access.
 
 ## Work account
 

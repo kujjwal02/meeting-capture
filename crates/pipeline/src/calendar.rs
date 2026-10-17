@@ -6,7 +6,7 @@ use std::sync::{Mutex, PoisonError};
 use serde::{Deserialize, Serialize};
 use sources::Transcript;
 
-use crate::google::{self, ApiEvent, GoogleError, Keychain, ResponseStatus};
+use crate::google::{self, ApiEvent, GoogleError, OAuthClient, ResponseStatus};
 use crate::settings::GoogleSettings;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,22 +34,20 @@ pub struct AccountStatus {
 /// The signed-in accounts and whether each still works. The tray shows them; the settings window
 /// changes them.
 pub struct GoogleAccounts {
-    keychain: Keychain,
     state: Mutex<AccountsState>,
 }
 
 struct AccountsState {
-    client_id: Option<String>,
+    settings: GoogleSettings,
     accounts: Vec<AccountStatus>,
 }
 
 impl GoogleAccounts {
     #[must_use]
-    pub fn new(keychain: Keychain, settings: &GoogleSettings) -> Self {
+    pub fn new(settings: &GoogleSettings) -> Self {
         let accounts = Self {
-            keychain,
             state: Mutex::new(AccountsState {
-                client_id: None,
+                settings: GoogleSettings::default(),
                 accounts: Vec::new(),
             }),
         };
@@ -57,13 +55,8 @@ impl GoogleAccounts {
         accounts
     }
 
-    #[must_use]
-    pub fn keychain(&self) -> &Keychain {
-        &self.keychain
-    }
-
-    /// Takes the client and account list from new settings. Accounts already known keep their
-    /// status.
+    /// Takes the client, the account list and the refresh tokens from new settings. Accounts
+    /// already known keep their status.
     pub fn replace(&self, settings: &GoogleSettings) {
         let mut state = self.lock();
         let accounts = settings
@@ -82,7 +75,7 @@ impl GoogleAccounts {
             })
             .collect();
         *state = AccountsState {
-            client_id: settings.client_id.clone(),
+            settings: settings.clone(),
             accounts,
         };
     }
@@ -99,15 +92,24 @@ impl GoogleAccounts {
 
     /// Refreshes each account's token, so the tray shows a revoked account before a call needs it.
     pub fn check(&self) {
-        let (client_id, accounts) = self.snapshot();
-        let Some(client_id) = client_id else {
-            return;
+        let (settings, accounts) = self.snapshot();
+        let client = match OAuthClient::from_settings(&settings) {
+            Ok(Some(client)) => client,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(exception.message = %error, "Google accounts need to sign in again");
+                for account in &accounts {
+                    self.set_needs_sign_in(&account.email, true);
+                }
+                return;
+            }
         };
         for account in accounts {
-            let checked = self
-                .keychain
-                .oauth_client(&client_id)
-                .and_then(|client| google::access_token(&self.keychain, &client, &account.email));
+            let refresh_token = settings
+                .refresh_tokens
+                .get(&account.email)
+                .map(String::as_str);
+            let checked = google::access_token(&client, &account.email, refresh_token);
             self.record_token_outcome(&account.email, checked.map(|_| ()));
         }
     }
@@ -117,18 +119,22 @@ impl GoogleAccounts {
     ///
     /// # Errors
     ///
-    /// Returns `GoogleError` when Google or the keychain cannot be reached, so the run can retry.
+    /// Returns `GoogleError` when Google cannot be reached, so the run can retry.
     pub(crate) fn match_event(
         &self,
         transcript: &Transcript,
     ) -> Result<CalendarMatch, GoogleError> {
-        let (client_id, accounts) = self.snapshot();
-        let Some(client_id) = client_id.filter(|_| !accounts.is_empty()) else {
+        let (settings, accounts) = self.snapshot();
+        if accounts.is_empty() {
             tracing::info!("no Google account is signed in");
             return Ok(CalendarMatch { event: None });
-        };
-        let client = match self.keychain.oauth_client(&client_id) {
-            Ok(client) => client,
+        }
+        let client = match OAuthClient::from_settings(&settings) {
+            Ok(Some(client)) => client,
+            Ok(None) => {
+                tracing::info!("no Google client ID is set");
+                return Ok(CalendarMatch { event: None });
+            }
             Err(GoogleError::NoClientSecret) => {
                 tracing::warn!("the Google client secret is missing");
                 for account in &accounts {
@@ -141,7 +147,11 @@ impl GoogleAccounts {
 
         let mut candidates = Vec::new();
         for (account_rank, account) in accounts.iter().enumerate() {
-            let events = google::access_token(&self.keychain, &client, &account.email).and_then(
+            let refresh_token = settings
+                .refresh_tokens
+                .get(&account.email)
+                .map(String::as_str);
+            let events = google::access_token(&client, &account.email, refresh_token).and_then(
                 |access_token| {
                     google::overlapping_events(
                         &access_token,
@@ -177,9 +187,9 @@ impl GoogleAccounts {
         })
     }
 
-    fn snapshot(&self) -> (Option<String>, Vec<AccountStatus>) {
+    fn snapshot(&self) -> (GoogleSettings, Vec<AccountStatus>) {
         let state = self.lock();
-        (state.client_id.clone(), state.accounts.clone())
+        (state.settings.clone(), state.accounts.clone())
     }
 
     fn record_token_outcome(&self, email: &str, outcome: Result<(), GoogleError>) {

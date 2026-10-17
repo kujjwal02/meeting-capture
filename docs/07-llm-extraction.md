@@ -79,7 +79,7 @@ stored before the field existed read it as an empty list.
 ```mermaid
 flowchart TB
     PIPE["pipeline<br/>Provider::from_settings"]
-    PIPE -->|rig prompt_typed| ANT["anthropic<br/>API key in keychain"]
+    PIPE -->|rig prompt_typed| ANT["anthropic<br/>API key in settings"]
     PIPE -->|rig prompt_typed| OAI["openai-compatible<br/>base URL, optional key"]
     PIPE -->|spawn claude -p| CC["claude-code<br/>user's Claude plan"]
 ```
@@ -110,12 +110,14 @@ is retried.
 - "Check Claude Code" in Settings runs `claude auth status` and says who is signed in and whether
   calls use the plan.
 
-API keys live in the OS keychain under the user `llm-api-key:<provider>`. The settings window and
-`mc set-api-key` write them. The settings file never holds a key.
+The API key lives in `settings.toml` as `[llm] api_key`, one key for the current provider. Edit
+the file or enter it in Settings. The settings window shows only whether a key is stored.
+A build that kept the key in the keychain needs it entered again; see the Google setup doc for the
+old keychain items.
 
 - `openai-compatible` takes an https base URL, or http on localhost, 127.0.0.1 or `[::1]`.
-- Changing the base URL in Settings without a new key removes the stored key, so it never goes to
-  the new host.
+- Changing the provider or the base URL in Settings without a new key removes the stored key, so
+  it never goes to the new host. `mc extract --provider` with another provider drops it too.
 - A refused key reports only the HTTP status. Some servers echo part of the key in the body.
 
 ### Errors
@@ -131,8 +133,7 @@ API keys live in the OS keychain under the user `llm-api-key:<provider>`. The se
 | `InvalidReply` | Still bad after 2 repair turns; lists the errors |
 | `Truncated` | The reply hit the output cap |
 | `Transport` | Network, process or provider error |
-| `NoApiKey` | No key in the keychain for `anthropic` |
-| `Keychain` | The keychain could not be read |
+| `NoApiKey` | No `[llm] api_key` in settings for `anthropic` |
 
 ## Retries
 
@@ -223,5 +224,4 @@ An edit saved during the run fails the run instead of being lost.
 | `mc extract <id> --provider X --model Y` | The same, with another provider or model |
 | `mc extract <id> --reply file.json` | Check a saved reply, with no LLM call |
 | `mc extract <id> --print-prompt` | Print the prompt |
-| `mc set-api-key <anthropic\|openai-compatible>` | Read a key from stdin into the keychain |
 | `mc sweep` | Run what the tray's sweep would: unfinished meetings and due retries |

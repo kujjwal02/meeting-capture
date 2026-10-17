@@ -99,8 +99,8 @@ Done when:
 - [x] "Add Google account": authorization code flow with PKCE, a state check and a loopback
   redirect in the default browser. Gives up after 5 minutes.
 - [x] Scopes `calendar.events.readonly`, `openid`, `email`.
-- [x] Client secret and one refresh token per account in `keyring`; a dev run under
-  `MEETING_CAPTURE_HOME` uses its own keychain service.
+- [x] Client secret and one refresh token per account in `settings.toml`; a dev run under
+  `MEETING_CAPTURE_HOME` uses its own settings file.
 - [x] Calendar match across every account: same Meet code, then the largest time overlap, then a
   Meet link, then the account listed first.
 - [x] No match or a revoked token: the note keeps the TranscripTonic title, and the tray shows
@@ -124,7 +124,7 @@ Done when:
   30 minutes and 2 hours, then `Failed`.
 - [x] Note sections between `%% mc:` markers, rewritten without losing the user's edits elsewhere
   in the note or their frontmatter keys and tags.
-- [x] Settings window: LLM provider, model, base URL, API key in the keychain, "Check Claude Code".
+- [x] Settings window: LLM provider, model, base URL, API key in the settings file, "Check Claude Code".
 - [x] A note-edited failure offers "Overwrite my edits" in the tray, so it can be cleared without
   `mc`.
 - [x] "Note written" notification.

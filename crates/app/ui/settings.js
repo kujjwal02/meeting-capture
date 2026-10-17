@@ -33,6 +33,14 @@ function renderAccounts(accounts) {
 }
 
 let llm = null;
+let savedClient = null;
+
+// The stored secret belongs to the saved client ID; saving another drops it.
+function showClientSecretState() {
+  const isSavedClient = field("client-id").value.trim() === (savedClient?.client_id ?? "");
+  field("client-secret").placeholder =
+    savedClient?.has_client_secret && isSavedClient ? "Saved in the settings file" : "";
+}
 
 // Shows the fields the chosen provider takes, with its default model and key state.
 function showProviderFields() {
@@ -45,12 +53,13 @@ function showProviderFields() {
     "claude-code": llm?.claude_code_default_model,
   };
   field("llm-model").placeholder = defaultModels[provider] ?? "Required";
-  const hasKey = {
-    anthropic: llm?.has_anthropic_key,
-    "openai-compatible": llm?.has_openai_compatible_key,
-  };
-  field("llm-api-key").placeholder = hasKey[provider]
-    ? "Saved in the keychain"
+  // The stored key belongs to the saved provider and base URL; saving another drops it.
+  const baseUrl =
+    provider === "openai-compatible" ? field("llm-base-url").value.trim() || null : null;
+  const hasKey =
+    llm?.has_api_key && provider === llm?.provider && baseUrl === (llm?.base_url ?? null);
+  field("llm-api-key").placeholder = hasKey
+    ? "Saved in the settings file"
     : provider === "openai-compatible"
       ? "Leave blank for a local server"
       : "";
@@ -81,7 +90,8 @@ async function load() {
     field("receiver-port").value = settings.receiver_port ?? "";
     field("client-id").value = settings.client_id ?? "";
     field("client-secret").value = "";
-    field("client-secret").placeholder = settings.has_client_secret ? "Saved in the keychain" : "";
+    savedClient = settings;
+    showClientSecretState();
     field("settings-file").textContent = settings.settings_file;
     llm = settings.llm;
     field("llm-provider").value = llm.provider ?? "";
@@ -127,6 +137,7 @@ async function readClientFile() {
     const client = await invoke("client_file_read", { json: await file.text() });
     field("client-id").value = client.client_id;
     field("client-secret").value = client.client_secret;
+    showClientSecretState();
     showMessage("Client loaded. Save to keep it.", false);
   } catch (error) {
     showMessage(String(error), true);
@@ -167,5 +178,7 @@ field("llm-provider").addEventListener("change", () => {
   field("llm-model").value = "";
   showProviderFields();
 });
+field("llm-base-url").addEventListener("input", showProviderFields);
+field("client-id").addEventListener("input", showClientSecretState);
 field("check-claude-code").addEventListener("click", checkClaudeCode);
 load();

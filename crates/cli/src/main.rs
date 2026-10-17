@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand};
 use jiff::tz::TimeZone;
 use jobs::{JobState, JobStore, Meeting, MeetingId};
 use pipeline::extraction::{self, CheckedNotes, Prompt};
-use pipeline::keychain::Keychain;
 use pipeline::llm::Provider;
 use pipeline::settings::{AppDirs, ProviderKind, Settings};
 use pipeline::{Pipeline, RunOutcome};
@@ -47,11 +46,6 @@ enum Command {
         /// Print the prompt instead of calling the LLM.
         #[arg(long, conflicts_with = "reply")]
         print_prompt: bool,
-    },
-    /// Save an LLM API key in the OS keychain, read from stdin so it stays out of shell history.
-    SetApiKey {
-        #[arg(value_enum)]
-        provider: ApiKeyProviderArg,
     },
     /// Run every meeting the tray's sweep would: unfinished ones and due extraction retries.
     Sweep,
@@ -110,30 +104,23 @@ fn main() -> anyhow::Result<()> {
             } else {
                 {
                     let mut llm = pipeline.settings().llm.clone();
-                    if let Some(provider) = provider {
-                        llm.provider = Some(provider.into());
+                    if let Some(provider) = provider.map(ProviderKind::from)
+                        && llm.provider != Some(provider)
+                    {
+                        llm.provider = Some(provider);
+                        // The stored key belongs to the settings' provider, not this one.
+                        llm.api_key = None;
                     }
                     if model.is_some() {
                         llm.model = model;
                     }
                     llm.validate()?;
-                    let keychain = Keychain::new(app_dirs.keychain_service());
-                    let provider = Provider::from_settings(&llm, &keychain, &app_dirs)?
+                    let provider = Provider::from_settings(&llm, &app_dirs)?
                         .context("no LLM provider is set; pass --provider or set llm.provider")?;
                     provider.extract(&prompt)?
                 }
             };
             println!("{}", serde_json::to_string_pretty(&checked)?);
-        }
-        Command::SetApiKey { provider } => {
-            let mut api_key = String::new();
-            std::io::stdin()
-                .read_line(&mut api_key)
-                .context("could not read the key from stdin")?;
-            let api_key = api_key.trim();
-            anyhow::ensure!(!api_key.is_empty(), "stdin held no key");
-            Keychain::new(app_dirs.keychain_service()).set_llm_api_key(provider.into(), api_key)?;
-            println!("saved");
         }
         Command::Sweep => {
             for meeting in pipeline.store().unfinished()? {
@@ -190,21 +177,6 @@ enum ProviderArg {
     Anthropic,
     OpenaiCompatible,
     ClaudeCode,
-}
-
-#[derive(Clone, Copy, clap::ValueEnum)]
-enum ApiKeyProviderArg {
-    Anthropic,
-    OpenaiCompatible,
-}
-
-impl From<ApiKeyProviderArg> for ProviderKind {
-    fn from(provider: ApiKeyProviderArg) -> Self {
-        match provider {
-            ApiKeyProviderArg::Anthropic => Self::Anthropic,
-            ApiKeyProviderArg::OpenaiCompatible => Self::OpenaiCompatible,
-        }
-    }
 }
 
 impl From<ProviderArg> for ProviderKind {

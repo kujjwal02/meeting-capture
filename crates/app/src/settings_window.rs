@@ -1,11 +1,12 @@
 //! The settings window: plain HTML in `ui/`, calling the commands here. It edits the settings
-//! file and the keychain. Google account and LLM changes apply at once; the rest after a restart.
+//! file. Google account and LLM changes apply at once; the rest after a restart.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{MutexGuard, PoisonError};
 
 use pipeline::calendar::AccountStatus;
-use pipeline::google::{self, Keychain, OAuthClient};
+use pipeline::google::{self, OAuthClient};
 use pipeline::llm::claude_code_auth;
 use pipeline::settings::{ProviderKind, SettingsFile};
 use serde::{Deserialize, Serialize};
@@ -52,8 +53,8 @@ pub(crate) struct LlmView {
     provider: Option<ProviderKind>,
     model: Option<String>,
     base_url: Option<String>,
-    has_anthropic_key: bool,
-    has_openai_compatible_key: bool,
+    /// The view never carries a secret, only whether one is stored.
+    has_api_key: bool,
     anthropic_default_model: Option<&'static str>,
     claude_code_default_model: Option<&'static str>,
 }
@@ -76,7 +77,7 @@ pub(crate) struct SettingsForm {
     llm_provider: Option<ProviderKind>,
     llm_model: String,
     llm_base_url: String,
-    /// Stored for `llm_provider`. Blank keeps the stored key.
+    /// For `llm_provider`. Blank keeps the stored key while the provider and base URL stay.
     llm_api_key: String,
 }
 
@@ -84,10 +85,6 @@ pub(crate) struct SettingsForm {
 pub(crate) struct ClientFields {
     client_id: String,
     client_secret: String,
-}
-
-fn keychain(state: &AppState) -> Keychain {
-    Keychain::new(state.app_dirs.keychain_service())
 }
 
 fn account_statuses(state: &AppState, file: &SettingsFile) -> Vec<AccountStatus> {
@@ -132,22 +129,11 @@ fn non_blank(text: &str) -> Option<String> {
 )]
 pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, String> {
     let file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
-    let has_client_secret = keychain(&state)
-        .has_client_secret()
-        .map_err(|error| error.to_string())?;
-    let keychain = keychain(&state);
-    let has_key = |provider| {
-        keychain
-            .llm_api_key(provider)
-            .map(|key| key.is_some())
-            .map_err(|error| error.to_string())
-    };
     let llm = LlmView {
         provider: file.llm.provider,
         model: file.llm.model.clone(),
         base_url: file.llm.base_url.clone(),
-        has_anthropic_key: has_key(ProviderKind::Anthropic)?,
-        has_openai_compatible_key: has_key(ProviderKind::OpenaiCompatible)?,
+        has_api_key: file.llm.api_key.is_some(),
         anthropic_default_model: ProviderKind::Anthropic.default_model(),
         claude_code_default_model: ProviderKind::ClaudeCode.default_model(),
     };
@@ -163,8 +149,8 @@ pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, 
         my_name: file.my_name,
         receiver_port: file.receiver_port,
         time_zone: file.time_zone,
+        has_client_secret: file.google.client_secret.is_some(),
         client_id: file.google.client_id,
-        has_client_secret,
         accounts,
         llm,
         settings_file: state.app_dirs.settings_file(),
@@ -183,12 +169,32 @@ pub(crate) fn settings_save(
 ) -> Result<String, String> {
     let settings_file_guard = lock_settings_file(&state);
     let mut file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
+    let old_provider = file.llm.provider;
     let old_base_url = file.llm.base_url.clone();
     file.vault_dir = non_blank(&form.vault_dir).map(PathBuf::from);
     file.my_name = non_blank(&form.my_name);
     file.receiver_port = form.receiver_port;
     file.time_zone = non_blank(&form.time_zone);
+    let old_client_id = file.google.client_id.take();
     file.google.client_id = non_blank(&form.client_id);
+    // Google issued the stored secret and grants to the old client, and they fail with a new one.
+    let is_new_client = file.google.client_id != old_client_id;
+    let had_client_secret = file.google.client_secret.is_some();
+    let has_new_secret = if let Some(client_secret) = non_blank(&form.client_secret) {
+        file.google.client_secret = Some(client_secret);
+        true
+    } else {
+        if is_new_client {
+            file.google.client_secret = None;
+        }
+        false
+    };
+    let is_secret_removed = is_new_client && had_client_secret && !has_new_secret;
+    let old_refresh_tokens = if is_new_client {
+        std::mem::take(&mut file.google.refresh_tokens)
+    } else {
+        BTreeMap::new()
+    };
     file.llm.provider = form.llm_provider;
     file.llm.model = non_blank(&form.llm_model);
     // The window shows the base URL only for openai-compatible, the one provider that takes it.
@@ -196,60 +202,61 @@ pub(crate) fn settings_save(
         Some(ProviderKind::OpenaiCompatible) => non_blank(&form.llm_base_url),
         Some(ProviderKind::Anthropic | ProviderKind::ClaudeCode) | None => None,
     };
-    file.llm.validate().map_err(|error| error.to_string())?;
-    let api_key = non_blank(&form.llm_api_key);
-    let key_provider = match form.llm_provider {
-        Some(provider @ (ProviderKind::Anthropic | ProviderKind::OpenaiCompatible)) => {
-            Some(provider)
-        }
-        Some(ProviderKind::ClaudeCode) | None => None,
+    let takes_api_key = match form.llm_provider {
+        Some(ProviderKind::Anthropic | ProviderKind::OpenaiCompatible) => true,
+        Some(ProviderKind::ClaudeCode) | None => false,
     };
-    if let (Some(api_key), Some(provider)) = (&api_key, key_provider) {
-        keychain(&state)
-            .set_llm_api_key(provider, api_key)
-            .map_err(|error| error.to_string())?;
-    }
     // The stored key was for the old endpoint; sending it to a new host would leak it.
-    let is_new_endpoint = form.llm_provider == Some(ProviderKind::OpenaiCompatible)
-        && old_base_url.is_some()
-        && old_base_url != file.llm.base_url;
-    let is_key_removed = is_new_endpoint && api_key.is_none();
-    if is_key_removed {
-        keychain(&state)
-            .delete_llm_api_key(ProviderKind::OpenaiCompatible)
-            .map_err(|error| error.to_string())?;
-    }
+    let is_new_endpoint = file.llm.provider != old_provider || file.llm.base_url != old_base_url;
+    let had_api_key = file.llm.api_key.is_some();
+    file.llm.api_key = match non_blank(&form.llm_api_key) {
+        Some(api_key) if takes_api_key => Some(api_key),
+        None if takes_api_key && !is_new_endpoint => file.llm.api_key.take(),
+        Some(_) | None => None,
+    };
+    let is_key_removed = takes_api_key && had_api_key && file.llm.api_key.is_none();
+    file.llm.validate().map_err(|error| error.to_string())?;
     file.write(&state.app_dirs)
         .map_err(|error| error.to_string())?;
-    drop(settings_file_guard);
-    let has_new_secret = match non_blank(&form.client_secret) {
-        Some(client_secret) => {
-            keychain(&state)
-                .set_client_secret(&client_secret)
-                .map_err(|error| error.to_string())?;
-            true
-        }
-        None => false,
-    };
-    tracing::info!("settings saved");
+    // Applied under the lock, so a sign-in or removal that writes next is never overwritten here.
     apply_google(&app, &file);
+    drop(settings_file_guard);
+    tracing::info!("settings saved");
+    if !old_refresh_tokens.is_empty() {
+        // The revokes are network calls; a failed one is logged and the token is gone anyway.
+        std::thread::spawn(move || {
+            for (email, refresh_token) in &old_refresh_tokens {
+                google::revoke(email, refresh_token);
+            }
+        });
+    }
+    let mut saved = "Saved.".to_owned();
+    if is_key_removed {
+        saved.push_str(" The API key for the old provider or base URL was removed; enter one for the new one if it needs one.");
+    }
+    if is_secret_removed {
+        saved.push_str(
+            " The client secret for the old Google client ID was removed; enter the new one.",
+        );
+    }
+    if is_new_client && !file.google.accounts.is_empty() {
+        saved
+            .push_str(" The Google client ID changed, so every Google account must sign in again.");
+    }
     let Some(pipeline) = &state.pipeline else {
-        return Ok("Saved. The app is not running the pipeline; see the tray.".to_owned());
+        return Ok(format!(
+            "{saved} The app is not running the pipeline; see the tray."
+        ));
     };
-    // A new secret can clear "sign in again" on every account.
-    if has_new_secret {
+    // A new secret can clear "sign in again" on every account, and a new client sets it.
+    if has_new_secret || is_new_client {
         crate::check_google_accounts(app.clone(), std::sync::Arc::clone(pipeline));
     }
     let queued = pipeline
         .replace_llm(file.llm.clone())
         .map_err(|error| error.to_string())?;
-    let saved = if is_key_removed {
-        "Saved. The API key for the old base URL was removed; enter one for the new URL if it needs one."
-    } else {
-        "Saved."
-    };
     if queued == 0 {
-        return Ok(saved.to_owned());
+        return Ok(saved);
     }
     crate::meetings::run_unfinished(&app, pipeline);
     crate::tray::refresh(&app);
@@ -306,16 +313,10 @@ pub(crate) async fn google_account_add(app: AppHandle) -> Result<String, String>
 fn add_account(app: &AppHandle) -> Result<String, String> {
     let state = app.state::<AppState>();
     let file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
-    let client_id = file
-        .google
-        .client_id
-        .clone()
+    let client = OAuthClient::from_settings(&file.google)
+        .map_err(|error| error.to_string())?
         .ok_or("save a Google client ID first")?;
-    let keychain = keychain(&state);
-    let client = keychain
-        .oauth_client(&client_id)
-        .map_err(|error| error.to_string())?;
-    let email = google::sign_in(&keychain, &client, |auth_url| {
+    let signed_in = google::sign_in(&client, |auth_url| {
         app.opener()
             .open_url(auth_url, None::<&str>)
             .map_err(|error| error.to_string())
@@ -328,11 +329,15 @@ fn add_account(app: &AppHandle) -> Result<String, String> {
     // Read again: the file may have changed during the minutes in the browser.
     let _settings_file = lock_settings_file(&state);
     let mut file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
+    let email = signed_in.email;
     if !file.google.accounts.contains(&email) {
         file.google.accounts.push(email.clone());
-        file.write(&state.app_dirs)
-            .map_err(|error| error.to_string())?;
     }
+    file.google
+        .refresh_tokens
+        .insert(email.clone(), signed_in.refresh_token);
+    file.write(&state.app_dirs)
+        .map_err(|error| error.to_string())?;
     if let Some(pipeline) = &state.pipeline {
         pipeline.google().replace(&file.google);
         pipeline.google().signed_in(&email);
@@ -351,18 +356,19 @@ pub(crate) async fn google_account_remove(app: AppHandle, email: String) -> Resu
 
 fn remove_account(app: &AppHandle, email: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let file = {
-        let _settings_file = lock_settings_file(&state);
-        let mut file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
-        file.google.accounts.retain(|account| account != email);
-        file.write(&state.app_dirs)
-            .map_err(|error| error.to_string())?;
-        file
-    };
-    keychain(&state)
-        .forget_account(email)
+    let file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
+    if let Some(refresh_token) = file.google.refresh_tokens.get(email) {
+        google::revoke(email, refresh_token);
+    }
+    // Read again: the file may have changed during the revoke.
+    let _settings_file = lock_settings_file(&state);
+    let mut file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
+    file.google.accounts.retain(|account| account != email);
+    file.google.refresh_tokens.remove(email);
+    file.write(&state.app_dirs)
         .map_err(|error| error.to_string())?;
-    tracing::info!(user.email = email, "Google account removed");
+    // Applied under the lock, so a sign-in or save that writes next is never overwritten here.
     apply_google(app, &file);
+    tracing::info!(user.email = email, "Google account removed");
     Ok(())
 }

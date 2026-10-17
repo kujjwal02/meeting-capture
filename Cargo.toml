@@ -21,7 +21,6 @@ tauri-plugin-single-instance = "2.5"
 anyhow = "1.0"
 axum = "0.8"
 jiff = { version = "0.2", features = ["serde"] }
-keyring = "4.2"
 oauth2 = { version = "5.0", default-features = false, features = [
   "native-tls",
   "reqwest-blocking",

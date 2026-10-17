@@ -1,5 +1,6 @@
 //! The settings file and the app's folders. The tray app and `mc` both load settings here.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use directories::{ProjectDirs, UserDirs};
@@ -15,10 +16,14 @@ pub enum SettingsError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("settings file {path} is not valid: {source}")]
+    /// Holds only the parser's message and position. The toml error's Display quotes the
+    /// source line, which can hold the API key or client secret.
+    #[error("settings file {path} is not valid at line {line}, column {column}: {message}")]
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        line: usize,
+        column: usize,
+        message: String,
     },
     #[error("settings field vault_dir: {path} is not a folder")]
     VaultDirMissing { path: PathBuf },
@@ -75,8 +80,6 @@ pub enum SettingsError {
         source: std::io::Error,
     },
 }
-
-const KEYCHAIN_SERVICE: &str = "com.ujjwalkumar.meetingcapture";
 
 /// Where the app keeps its own files. None of them go into the vault.
 #[derive(Debug, Clone)]
@@ -139,16 +142,6 @@ impl AppDirs {
         self.config_dir.join("note.md.j2")
     }
 
-    /// The OS keychain service that holds this install's secrets. A dev run under
-    /// `MEETING_CAPTURE_HOME` gets its own, so it never reads the real refresh tokens.
-    #[must_use]
-    pub fn keychain_service(&self) -> String {
-        match std::env::var_os("MEETING_CAPTURE_HOME") {
-            Some(home) => format!("{KEYCHAIN_SERVICE}.dev:{}", home.to_string_lossy()),
-            None => KEYCHAIN_SERVICE.to_owned(),
-        }
-    }
-
     #[must_use]
     pub fn job_store_file(&self) -> PathBuf {
         self.data_dir.join("jobs.sqlite")
@@ -192,7 +185,7 @@ pub struct Settings {
 }
 
 /// The LLM that writes the notes. Validated once on load.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LlmSettings {
     /// No provider: extraction is off and notes carry only the transcript.
@@ -213,12 +206,35 @@ pub struct LlmSettings {
     /// `claude-code` only: the `claude` binary, when it is not in a standard install folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claude_path: Option<PathBuf>,
+    /// The key for `provider`, `anthropic` or `openai-compatible` only. A local server needs none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+// A stray `{:?}` in a log line must not print a secret.
+fn secret_marker(secret: Option<&String>) -> Option<&'static str> {
+    secret.map(|_| "<set>")
+}
+
+impl std::fmt::Debug for LlmSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LlmSettings")
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("base_url", &self.base_url)
+            .field("effort", &self.effort)
+            .field("glossary", &self.glossary)
+            .field("claude_path", &self.claude_path)
+            .field("api_key", &secret_marker(self.api_key.as_ref()))
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
-    /// The Anthropic API, with a key from the keychain.
+    /// The Anthropic API, with a key from the settings file.
     Anthropic,
     /// Any endpoint that speaks the `OpenAI` Chat Completions API, such as `OpenRouter` or Ollama.
     OpenaiCompatible,
@@ -266,15 +282,39 @@ impl Effort {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GoogleSettings {
-    /// The "Desktop app" OAuth client. Its secret is in the OS keychain.
+    /// The "Desktop app" OAuth client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
     /// Signed-in accounts, in tie-break order: on an equal calendar match the first one wins.
     #[serde(default)]
     pub accounts: Vec<String>,
+    /// One refresh token per signed-in account, by email.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub refresh_tokens: BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for GoogleSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GoogleSettings")
+            .field("client_id", &self.client_id)
+            .field("client_secret", &secret_marker(self.client_secret.as_ref()))
+            .field("accounts", &self.accounts)
+            .field(
+                "refresh_tokens",
+                &self
+                    .refresh_tokens
+                    .keys()
+                    .map(|email| (email, "<set>"))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .finish()
+    }
 }
 
 /// The settings file as written, before defaults fill the gaps. The settings window edits this.
@@ -301,22 +341,37 @@ const GOOGLE_CLIENT_ID_SUFFIX: &str = ".apps.googleusercontent.com";
 /// Heads the settings file whenever the app writes it.
 const SETTINGS_HEADER: &str = "\
 # Meeting Capture settings. The Settings window writes this file; quit and reopen the app after
-# a hand edit.
+# a hand edit. This file holds secrets: keep it out of the vault and out of git.
 #
 # vault_dir: the Obsidian vault. Notes go under areas/meetings. Default ~/knowledge.
 # my_name: replaces \"You\" in TranscripTonic transcripts.
 # receiver_port: the port in TranscripTonic's webhook URL. Default 47615.
 # time_zone: the IANA time zone for note names and shown times. Default: the device's.
-# [google] client_id: the Desktop app OAuth client. Its secret is in the OS keychain.
+# [google] client_id, client_secret: the Desktop app OAuth client.
 # [google] accounts: signed-in accounts. On a tied calendar match the first one wins.
+# [google] refresh_tokens: one per account, written by sign-in. Removing one signs it out.
 # [llm] provider: anthropic, openai-compatible or claude-code. Absent: notes carry no summary.
 # [llm] model: defaults to claude-haiku-5-5 (anthropic) or sonnet (claude-code).
-# [llm] base_url: the openai-compatible endpoint. API keys are in the OS keychain.
+# [llm] base_url: the openai-compatible endpoint.
+# [llm] api_key: the key for the provider, anthropic or openai-compatible.
 # [llm] effort: low, medium or high, claude-code only.
 # [llm] glossary: names and terms the captions often mishear.
 # [llm] claude_path: the claude binary, when it is not in a standard install folder.
 
 ";
+
+// Line and column are 1-based, the column in characters, as editors count them.
+fn parse_error(path: PathBuf, text: &str, error: &toml::de::Error) -> SettingsError {
+    let offset = error.span().map_or(0, |span| span.start.min(text.len()));
+    let before = text.get(..offset).unwrap_or_default();
+    let line_start = before.rfind('\n').map_or(0, |index| index + 1);
+    SettingsError::Parse {
+        path,
+        line: before.matches('\n').count() + 1,
+        column: before[line_start..].chars().count() + 1,
+        message: error.message().trim_end().to_owned(),
+    }
+}
 
 impl SettingsFile {
     /// Reads the settings file. A missing file reads as empty.
@@ -327,9 +382,7 @@ impl SettingsFile {
     pub fn read(app_dirs: &AppDirs) -> Result<Self, SettingsError> {
         let path = app_dirs.settings_file();
         match std::fs::read_to_string(&path) {
-            Ok(text) => {
-                toml::from_str(&text).map_err(|source| SettingsError::Parse { path, source })
-            }
+            Ok(text) => toml::from_str(&text).map_err(|error| parse_error(path, &text, &error)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(source) => Err(SettingsError::Read { path, source }),
         }
@@ -354,6 +407,7 @@ impl SettingsFile {
         std::io::Write::write_all(&mut staged, format!("{SETTINGS_HEADER}{body}").as_bytes())
             .map_err(write_error)?;
         staged.as_file().sync_all().map_err(write_error)?;
+        // The file holds secrets. On unix tempfile creates it as 0600 and the rename keeps that.
         staged
             .persist(&path)
             .map_err(|error| write_error(error.error))?;
@@ -488,6 +542,9 @@ impl LlmSettings {
                 }
             }
             ProviderKind::ClaudeCode => {
+                if llm.api_key.is_some() {
+                    return Err(unused("api_key"));
+                }
                 if let Some(path) = &llm.claude_path {
                     if !path.is_file() {
                         return Err(SettingsError::ClaudePath {

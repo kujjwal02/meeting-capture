@@ -46,7 +46,7 @@ Progress is tracked in the [checklist](05-checklist.md).
 - The tray menu shows the listener state, each signed-in calendar account, and the last 5 meetings
   with their job state. It can retry failed jobs and open a note.
 - The settings window is plain HTML: Google accounts and OAuth client, LLM provider, its API key,
-  vault path, port, your name, time zone. It writes `settings.toml`; secrets go to `keyring`.
+  vault path, port, your name, time zone. It writes `settings.toml`, secrets included.
 - LLM provider is a closed choice: `claude-code` (the signed-in Claude plan, Sonnet by default),
   `anthropic` (Claude Haiku 5.5 by default) or `openai-compatible` (base URL and model). With no
   provider, extraction is off and notes carry the transcript only. The endpoint must support
@@ -67,13 +67,13 @@ Progress is tracked in the [checklist](05-checklist.md).
 - One OAuth client of type "Desktop app" in a personal Google Cloud project, consent screen
   "External" and published "In production". A consent screen in "Testing" expires refresh tokens
   after 7 days. Unverified apps show a warning at consent, which is fine for personal use.
-- The client ID goes in the settings file. The client secret and one refresh token per account go
-  in `keyring`. The repo is public, so neither is in the code.
+- The client ID, the client secret and one refresh token per account go in the settings file. The
+  repo is public, so none of them is in the code.
 - Calendar match reads each account's primary calendar. An event with the transcript's Meet code
   wins. Else the largest time overlap wins; on a tie, an event with a Meet link, then the account
   listed first. Sign in with akaiketech.com first, so it wins ties.
 - All-day events, declined events, focus time, out of office and working location never match.
-- A network or keychain failure fails the run, which keeps the calendar title once retried.
+- A network failure fails the run, which keeps the calendar title once retried.
 - If no account matches or a token is revoked, the note is still written with the TranscripTonic
   title and no attendees, and the tray shows "sign in again".
 

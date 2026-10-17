@@ -191,7 +191,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 |---|---|---|---|
 | caption-receiver | 1 | Accept TranscripTonic's webhook; fallback watches Downloads for its `.txt` | `axum` |
 | sources | 1 | Turn each input into the common transcript format | Captions, own stems, Meet REST API, dropped audio files |
-| pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `keyring`, `minijinja`, `toml`, `directories` |
+| pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `minijinja`, `toml`, `directories` |
 | jobs | 1 | One row per meeting with a closed state enum, its run lease and the extraction retry schedule | `rusqlite` |
 | cli | 1 | `mc`: rerun any job step or ingest a file, without Tauri | `clap` |
 | app | 1 | Tray, settings, "Note written" notifications, permission prompts, review of extracted commitments | Tauri 2, plugin `notification` 2 |
@@ -210,7 +210,8 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 - Media never goes into the vault.
 - Transcript text and model output are data. The note escapes both, so neither can add Markdown
   structure, wikilinks or section markers.
-- Secrets live in the OS keychain: Google refresh tokens, the OAuth client secret, LLM API keys.
+- Secrets live in `settings.toml`: Google refresh tokens, the OAuth client secret, the LLM API key.
+  The file is owner-only and stays out of the vault and git.
 - Stored times are UTC.
 
 ## Common transcript format

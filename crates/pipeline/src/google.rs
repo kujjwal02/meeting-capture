@@ -1,5 +1,5 @@
-//! Google sign-in and the Calendar API. The client ID and the account list live in the settings
-//! file; the client secret and one refresh token per account live in the OS keychain.
+//! Google sign-in and the Calendar API. The OAuth client, the account list and one refresh token
+//! per account live in the settings file.
 
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -15,7 +15,7 @@ use oauth2::{
 };
 use serde::Deserialize;
 
-pub use crate::keychain::{Keychain, KeychainError};
+use crate::settings::GoogleSettings;
 
 const AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -24,7 +24,6 @@ const USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 const EVENTS_URL: &str = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
 const CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar.events.readonly";
 const SCOPES: [&str; 3] = [CALENDAR_SCOPE, "openid", "email"];
-const CLIENT_SECRET_USER: &str = "google-client-secret";
 const SIGN_IN_TIMEOUT: Duration = Duration::from_mins(5);
 // Long enough for a browser on the same machine to send its request line and headers.
 const REDIRECT_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -34,8 +33,6 @@ const MAX_EVENTS: &str = "250";
 
 #[derive(Debug, thiserror::Error)]
 pub enum GoogleError {
-    #[error(transparent)]
-    Keychain(#[from] KeychainError),
     #[error("Google account {email} needs to sign in again")]
     SignInAgain { email: String },
     #[error("the Google client secret is not set; add it in Settings")]
@@ -143,66 +140,43 @@ impl OAuthClient {
     }
 }
 
-impl Keychain {
-    /// # Errors
-    ///
-    /// Returns `GoogleError::Keychain` when the keychain refuses the read.
-    pub fn has_client_secret(&self) -> Result<bool, GoogleError> {
-        Ok(self.read(CLIENT_SECRET_USER)?.is_some())
-    }
-
-    /// # Errors
-    ///
-    /// Returns `GoogleError::Keychain` when the keychain refuses the write.
-    pub fn set_client_secret(&self, client_secret: &str) -> Result<(), GoogleError> {
-        Ok(self.write(CLIENT_SECRET_USER, client_secret)?)
-    }
-
-    /// The OAuth client for `client_id`, with its secret from the keychain.
+impl OAuthClient {
+    /// The client the settings name, or `None` when they name no client ID.
     ///
     /// # Errors
     ///
-    /// Returns `GoogleError::NoClientSecret` when no secret is stored.
-    pub fn oauth_client(&self, client_id: &str) -> Result<OAuthClient, GoogleError> {
-        let client_secret = self
-            .read(CLIENT_SECRET_USER)?
+    /// Returns `GoogleError::NoClientSecret` when the settings hold a client ID but no secret.
+    pub fn from_settings(settings: &GoogleSettings) -> Result<Option<Self>, GoogleError> {
+        let Some(client_id) = &settings.client_id else {
+            return Ok(None);
+        };
+        let client_secret = settings
+            .client_secret
+            .clone()
             .ok_or(GoogleError::NoClientSecret)?;
-        Ok(OAuthClient {
-            client_id: client_id.to_owned(),
+        Ok(Some(Self {
+            client_id: client_id.clone(),
             client_secret,
-        })
-    }
-
-    /// Revokes the account's grant at Google, then deletes its refresh token. A failed revoke is
-    /// logged only: the token is deleted either way, and the user can still remove the app at
-    /// myaccount.google.com/connections.
-    ///
-    /// # Errors
-    ///
-    /// Returns `GoogleError::Keychain` when the keychain refuses the delete.
-    pub fn forget_account(&self, email: &str) -> Result<(), GoogleError> {
-        let user = refresh_token_user(email);
-        if let Some(refresh_token) = self.read(&user)? {
-            let revoked = http_client().and_then(|http| {
-                http.post(REVOKE_URL)
-                    .form(&[("token", refresh_token.as_str())])
-                    .send()
-                    .and_then(reqwest::blocking::Response::error_for_status)
-                    .map_err(|source| GoogleError::Http {
-                        action: "revoke",
-                        source,
-                    })
-            });
-            if let Err(error) = revoked {
-                tracing::warn!(user.email = email, exception.message = %error, "could not revoke the Google grant");
-            }
-        }
-        Ok(self.delete(&user)?)
+        }))
     }
 }
 
-fn refresh_token_user(email: &str) -> String {
-    format!("google-refresh-token:{email}")
+/// Revokes a refresh token at Google. A failure is logged only: the caller drops the token either
+/// way, and the user can still remove the app at myaccount.google.com/connections.
+pub fn revoke(email: &str, refresh_token: &str) {
+    let revoked = http_client().and_then(|http| {
+        http.post(REVOKE_URL)
+            .form(&[("token", refresh_token)])
+            .send()
+            .and_then(reqwest::blocking::Response::error_for_status)
+            .map_err(|source| GoogleError::Http {
+                action: "revoke",
+                source,
+            })
+    });
+    if let Err(error) = revoked {
+        tracing::warn!(user.email = email, exception.message = %error, "could not revoke the Google grant");
+    }
 }
 
 fn http_client() -> Result<reqwest::blocking::Client, GoogleError> {
@@ -217,17 +191,31 @@ fn http_client() -> Result<reqwest::blocking::Client, GoogleError> {
         })
 }
 
+/// A finished sign-in. The caller stores the refresh token.
+pub struct SignedIn {
+    pub email: String,
+    pub refresh_token: String,
+}
+
+impl std::fmt::Debug for SignedIn {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SignedIn")
+            .field("email", &self.email)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Signs an account in through the default browser: authorization code with PKCE and a loopback
-/// redirect. Stores the refresh token and returns the account's email. Blocks for up to 5 minutes.
+/// redirect. Blocks for up to 5 minutes.
 ///
 /// # Errors
 ///
 /// Returns `GoogleError` when the user refuses, the time runs out, or a request fails.
 pub fn sign_in(
-    keychain: &Keychain,
     client: &OAuthClient,
     open_browser: impl FnOnce(&str) -> Result<(), String>,
-) -> Result<String, GoogleError> {
+) -> Result<SignedIn, GoogleError> {
     let _span = tracing::info_span!("google.sign_in").entered();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(GoogleError::Redirect)?;
     let port = listener.local_addr().map_err(GoogleError::Redirect)?.port();
@@ -266,9 +254,11 @@ pub fn sign_in(
         .secret()
         .clone();
     let email = account_email(&http, token.access_token().secret())?;
-    keychain.write(&refresh_token_user(&email), &refresh_token)?;
     tracing::info!(user.email = %email, "Google account signed in");
-    Ok(email)
+    Ok(SignedIn {
+        email,
+        refresh_token,
+    })
 }
 
 #[derive(Deserialize)]
@@ -446,23 +436,21 @@ fn token_error_message<E: std::error::Error>(
     }
 }
 
-/// A fresh access token for `email`. A revoked or expired refresh token gives
+/// A fresh access token for `email`. A missing, revoked or expired refresh token gives
 /// `GoogleError::SignInAgain`; it never opens a browser.
 ///
 /// # Errors
 ///
 /// Returns `GoogleError` when the account must sign in again or the request fails.
 pub fn access_token(
-    keychain: &Keychain,
     client: &OAuthClient,
     email: &str,
+    refresh_token: Option<&str>,
 ) -> Result<String, GoogleError> {
     let sign_in_again = || GoogleError::SignInAgain {
         email: email.to_owned(),
     };
-    let refresh_token = keychain
-        .read(&refresh_token_user(email))?
-        .ok_or_else(sign_in_again)?;
+    let refresh_token = refresh_token.ok_or_else(sign_in_again)?.to_owned();
     let token = client
         .oauth(None)
         .exchange_refresh_token(&RefreshToken::new(refresh_token))
