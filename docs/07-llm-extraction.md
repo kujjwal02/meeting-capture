@@ -157,6 +157,9 @@ stateDiagram-v2
 
 - Migration 2 adds `extraction_provider`, `extraction_attempts`, `extraction_error` and
   `next_extraction_at_ms` to `meetings`.
+- Migration 4 adds `failure_kind`, `step` or `extraction`. It tells a note whose extraction
+  failed for good from a failed step. A row with `failure` set and `failure_kind` NULL, written
+  by an older binary, reads with the backfill rule and logs a warning.
 - `unfinished()` returns written meetings whose next try is due, so the 5-minute sweep runs them.
 - A manual retry of a failed meeting starts the count again at 1.
 - `CliMissing`, `NotSignedIn`, `NoApiKey` and `Truncated` fail the meeting at once. A retry

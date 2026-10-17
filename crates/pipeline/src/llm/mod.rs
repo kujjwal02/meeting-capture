@@ -5,6 +5,7 @@ mod api;
 mod claude_code;
 
 pub use claude_code::{ClaudeCodeAuth, claude_code_auth};
+use jobs::ErrorPersistence;
 
 use crate::extraction::{CheckedNotes, Prompt, Reply, Turn, Verdict};
 use crate::settings::{AppDirs, LlmSettings, ProviderKind};
@@ -36,16 +37,16 @@ pub enum ExtractionError {
 impl ExtractionError {
     /// Whether trying again without a change from the user would fail the same way.
     #[must_use]
-    pub fn is_lasting(&self) -> bool {
+    pub fn persistence(&self) -> ErrorPersistence {
         match self {
             Self::CliMissing { .. }
             | Self::NotSignedIn { .. }
             | Self::NoApiKey { .. }
-            | Self::Truncated { .. } => true,
+            | Self::Truncated { .. } => ErrorPersistence::Lasting,
             Self::RateLimited { .. }
             | Self::Timeout { .. }
             | Self::InvalidReply { .. }
-            | Self::Transport { .. } => false,
+            | Self::Transport { .. } => ErrorPersistence::Passing,
         }
     }
 }

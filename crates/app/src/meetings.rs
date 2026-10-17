@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use caption_receiver::ReceivedCaptions;
-use jobs::{InputKind, JobState, Meeting, MeetingId, RunOutcome};
+use jobs::{FailureCause, FailureKind, InputKind, JobState, Meeting, MeetingId, RunOutcome};
 use pipeline::{Pipeline, PipelineError};
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt as _;
@@ -112,38 +112,38 @@ pub(crate) fn overwrite_edits(app: &AppHandle, pipeline: &Pipeline, id: MeetingI
 fn notify_outcome(app: &AppHandle, pipeline: &Pipeline, meeting: &Meeting) {
     let title = meeting.title.as_deref().unwrap_or("Untitled call");
     let (heading, body) = match meeting.state() {
-        JobState::Written if meeting.extraction_json.is_some() => {
-            ("Note written", format!("{title}, with notes"))
+        JobState::Written { has_notes: true } => ("Note written", format!("{title}, with notes")),
+        JobState::Written { has_notes: false } => {
+            ("Note written", format!("{title}, transcript only"))
         }
-        JobState::Written => ("Note written", format!("{title}, transcript only")),
-        JobState::ExtractionPending if meeting.extraction_attempts == 1 => {
-            let retry_at = meeting
-                .next_extraction_at
-                .map_or_else(String::new, |retry_at| {
-                    let time_zone = pipeline.settings().time_zone.clone();
-                    format!(
-                        "; next try at {}",
-                        retry_at.to_zoned(time_zone).strftime("%H:%M %Z")
-                    )
-                });
+        JobState::ExtractionPending { retry: Some(retry) } if retry.number() == 1 => {
+            let retry_at = retry.clock_time(&pipeline.settings().time_zone);
             (
                 "Note written",
-                format!("{title}, transcript only: the notes failed{retry_at}"),
+                format!("{title}, transcript only: the notes failed; next try at {retry_at}"),
             )
         }
-        JobState::Failed
-            if meeting.failure.is_some() && meeting.failure == meeting.extraction_error =>
-        {
-            (
-                "Notes failed",
-                format!("{title} keeps the transcript only. The tray shows why."),
-            )
-        }
+        JobState::Failed {
+            cause:
+                FailureCause {
+                    kind: FailureKind::Extraction,
+                    ..
+                },
+        } => (
+            "Notes failed",
+            format!("{title} keeps the transcript only. The tray shows why."),
+        ),
         JobState::Captured
         | JobState::Matched
         | JobState::Extracted
-        | JobState::ExtractionPending
-        | JobState::Failed => return,
+        | JobState::ExtractionPending { .. }
+        | JobState::Failed {
+            cause:
+                FailureCause {
+                    kind: FailureKind::Step,
+                    ..
+                },
+        } => return,
     };
     let shown = app
         .notification()

@@ -11,6 +11,9 @@
 //! `StoreError::Superseded`, and the run starts over on the new input.
 
 mod lease;
+mod retry_schedule;
+mod schema;
+mod state;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -19,10 +22,13 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use jiff::Timestamp;
-use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
-use rusqlite_migration::{M, Migrations};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite_migration::Migrations;
 
 pub use crate::lease::{LeasedRun, RunOutcome, StepError};
+pub use crate::retry_schedule::ErrorPersistence;
+use crate::schema::{MEETING_COLUMNS, MIGRATIONS, read_meeting};
+pub use crate::state::{ExtractionRetry, FailureCause, FailureKind, JobState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MeetingId(i64);
@@ -72,32 +78,6 @@ impl Step {
     }
 }
 
-/// What the tray shows for a meeting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JobState {
-    Captured,
-    Matched,
-    Extracted,
-    Written,
-    /// Written without notes; an extraction retry is scheduled.
-    ExtractionPending,
-    Failed,
-}
-
-impl JobState {
-    #[must_use]
-    pub fn label(self) -> &'static str {
-        match self {
-            JobState::Captured => "Captured",
-            JobState::Matched => "Matched",
-            JobState::Extracted => "Extracted",
-            JobState::Written => "Written",
-            JobState::ExtractionPending => "Extraction pending",
-            JobState::Failed => "Failed",
-        }
-    }
-}
-
 /// The stored input a meeting's transcript is parsed from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKind {
@@ -129,43 +109,24 @@ pub struct Meeting {
     /// The calendar event title once matched, else the title the call app showed.
     pub title: Option<String>,
     pub finished_step: Step,
-    /// Set when the last attempt failed; names the step and the cause. Cleared when a step
-    /// next succeeds.
-    pub failure: Option<String>,
+    // Set when the last attempt failed. Cleared when a step next succeeds.
+    failure: Option<FailureCause>,
     pub retry_count: u32,
     pub calendar_match_json: Option<String>,
     pub extraction_json: Option<String>,
     /// `<provider>/<model>` of the last extraction tried.
     pub extraction_provider: Option<String>,
-    /// Failed extraction attempts since the last success or manual retry.
-    pub extraction_attempts: u32,
-    /// The last extraction failure. The note was written without notes.
-    pub extraction_error: Option<String>,
-    /// When set, an extraction is owed and the sweep runs it from this time.
-    pub next_extraction_at: Option<Timestamp>,
+    // Failed extraction attempts since the last success or manual retry.
+    extraction_attempts: u32,
+    // The last extraction failure. The note was written without notes.
+    extraction_error: Option<String>,
+    // When set, an extraction is owed and the sweep runs it from this time.
+    next_extraction_at: Option<Timestamp>,
     /// The note in the vault and the hashes that tell the pipeline's writes from the user's
     /// edits.
     pub note: NoteOwnership,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
-}
-
-impl Meeting {
-    #[must_use]
-    pub fn state(&self) -> JobState {
-        if self.failure.is_some() {
-            return JobState::Failed;
-        }
-        if self.next_extraction_at.is_some() {
-            return JobState::ExtractionPending;
-        }
-        match self.finished_step {
-            Step::Captured => JobState::Captured,
-            Step::Matched => JobState::Matched,
-            Step::Extracted => JobState::Extracted,
-            Step::Written => JobState::Written,
-        }
-    }
 }
 
 /// The meeting's note in the vault, and what the pipeline knows it wrote there.
@@ -229,15 +190,13 @@ pub struct Extraction<'a> {
     pub provider: &'a str,
 }
 
+/// A failed extraction, as recorded once the note is written without notes.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtractionFailure<'a> {
     /// `<provider>/<model>`, or the provider alone when it could not be set up.
     pub provider: &'a str,
     pub error: &'a str,
-    /// Failed attempts so far, this one included.
-    pub attempts: u32,
-    /// `None` gives up: the meeting fails.
-    pub retry_at: Option<Timestamp>,
+    pub persistence: ErrorPersistence,
 }
 
 /// What a note path claim found.
@@ -277,49 +236,6 @@ pub enum StoreError {
 }
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
-
-const MIGRATIONS: &[M<'static>] = &[
-    M::up(
-        "CREATE TABLE meetings (
-        id INTEGER PRIMARY KEY,
-        input_kind TEXT NOT NULL,
-        input_path TEXT NOT NULL,
-        input_revision INTEGER NOT NULL DEFAULT 1,
-        started_at TEXT NOT NULL,
-        title TEXT,
-        finished_step TEXT NOT NULL,
-        failure TEXT,
-        retry_count INTEGER NOT NULL DEFAULT 0,
-        calendar_match_json TEXT,
-        extraction_json TEXT,
-        note_path TEXT,
-        note_sha256 TEXT,
-        pending_note_sha256s TEXT,
-        run_token TEXT,
-        run_renewed_at_ms INTEGER,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-    );
-    CREATE UNIQUE INDEX meetings_input_started_at ON meetings (input_kind, started_at);
-    CREATE INDEX meetings_started_at ON meetings (started_at);
-    CREATE UNIQUE INDEX meetings_note_path ON meetings (note_path);",
-    ),
-    // Existing rows read as "no extraction tried yet". Times are UTC milliseconds, which sort as
-    // numbers; RFC 3339 text with varying fractions does not.
-    M::up(
-        "ALTER TABLE meetings ADD COLUMN extraction_provider TEXT;
-    ALTER TABLE meetings ADD COLUMN extraction_attempts INTEGER NOT NULL DEFAULT 0;
-    ALTER TABLE meetings ADD COLUMN extraction_error TEXT;
-    ALTER TABLE meetings ADD COLUMN next_extraction_at_ms INTEGER;",
-    ),
-    // One "<section> <sha256>" line per marked section of the note.
-    M::up("ALTER TABLE meetings ADD COLUMN note_section_sha256s TEXT;"),
-];
-
-const MEETING_COLUMNS: &str = "id, input_kind, input_path, input_revision, started_at, title, \
-    finished_step, failure, retry_count, calendar_match_json, extraction_json, \
-    extraction_provider, extraction_attempts, extraction_error, next_extraction_at_ms, note_path, \
-    note_sha256, pending_note_sha256s, note_section_sha256s, created_at, updated_at";
 
 /// The job store. Safe to share between threads; each call holds the connection briefly.
 pub struct JobStore {
@@ -384,7 +300,7 @@ impl JobStore {
                 input_revision = input_revision + 1,
                 title = excluded.title,
                 finished_step = excluded.finished_step,
-                failure = NULL,
+                failure = NULL, failure_kind = NULL,
                 calendar_match_json = NULL,
                 extraction_json = NULL,
                 extraction_provider = NULL,
@@ -492,7 +408,8 @@ impl JobStore {
     pub fn rewind(&self, id: MeetingId, discard_note_edits: bool) -> Result<(), StoreError> {
         let updated = self.connection().execute(
             "UPDATE meetings SET finished_step = ?2, input_revision = input_revision + 1,
-                failure = NULL, calendar_match_json = NULL, extraction_json = NULL,
+                failure = NULL, failure_kind = NULL, calendar_match_json = NULL,
+                extraction_json = NULL,
                 extraction_provider = NULL, extraction_attempts = 0, extraction_error = NULL,
                 next_extraction_at_ms = NULL,
                 note_sha256 = CASE WHEN ?3 THEN NULL ELSE note_sha256 END,
@@ -554,7 +471,8 @@ impl LeasedRun<'_> {
         calendar_match_json: &str,
     ) -> Result<(), StoreError> {
         self.update(
-            "finished_step = ?6, title = ?7, calendar_match_json = ?8, failure = NULL",
+            "finished_step = ?6, title = ?7, calendar_match_json = ?8, failure = NULL,
+                failure_kind = NULL",
             &[&Step::Matched.as_str(), &title, &calendar_match_json],
         )
     }
@@ -573,13 +491,14 @@ impl LeasedRun<'_> {
         self.update(
             "finished_step = ?6, extraction_json = ?7, extraction_provider = ?8,
                 extraction_attempts = 0, extraction_error = NULL, next_extraction_at_ms = NULL,
-                failure = NULL",
+                failure = NULL, failure_kind = NULL",
             &[&Step::Extracted.as_str(), &extraction_json, &provider],
         )
     }
 
-    /// Records a failed extraction once the note is written without notes. With `retry_at`, the
-    /// sweep tries again from then; without, the meeting fails with `error`.
+    /// Records a failed extraction once the note is written without notes. The retry schedule
+    /// sets the next try, and the sweep runs it. After the last retry, or at once for a lasting
+    /// error, the meeting fails with the error.
     ///
     /// # Errors
     ///
@@ -588,16 +507,24 @@ impl LeasedRun<'_> {
         &self,
         failure: ExtractionFailure<'_>,
     ) -> Result<(), StoreError> {
-        let retry_at_ms = failure.retry_at.map(Timestamp::as_millisecond);
+        let ExtractionFailure {
+            provider,
+            error,
+            persistence,
+        } = failure;
+        let next = retry_schedule::after_failure(self.meeting(), persistence);
+        let retry_at_ms = next.retry_at.map(Timestamp::as_millisecond);
         self.update(
             "extraction_provider = ?6, extraction_attempts = ?7, extraction_error = ?8,
                 next_extraction_at_ms = ?9,
-                failure = CASE WHEN ?9 IS NULL THEN ?8 ELSE NULL END",
+                failure = CASE WHEN ?9 IS NULL THEN ?8 ELSE NULL END,
+                failure_kind = CASE WHEN ?9 IS NULL THEN ?10 ELSE NULL END",
             &[
-                &failure.provider,
-                &failure.attempts,
-                &failure.error,
+                &provider,
+                &next.attempts,
+                &error,
                 &retry_at_ms,
+                &FailureKind::Extraction.as_str(),
             ],
         )
     }
@@ -663,6 +590,7 @@ impl LeasedRun<'_> {
             .collect();
         self.update(
             "finished_step = ?6, note_sha256 = ?7, pending_note_sha256s = NULL, failure = NULL,
+                failure_kind = NULL,
                 note_section_sha256s = ?8",
             &[
                 &Step::Written.as_str(),
@@ -671,149 +599,4 @@ impl LeasedRun<'_> {
             ],
         )
     }
-}
-
-/// Each `<section> <sha256>` line, or the first line that is not one.
-fn read_section_sha256s(lines: &str) -> Result<BTreeMap<String, String>, String> {
-    lines
-        .lines()
-        .map(|line| {
-            line.rsplit_once(' ')
-                .map(|(section, sha256)| (section.to_owned(), sha256.to_owned()))
-                .ok_or_else(|| line.to_owned())
-        })
-        .collect()
-}
-
-// The outer Result carries SQLite read errors; the inner one carries invalid stored values.
-fn read_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting, StoreError>> {
-    let id: i64 = row.get("id")?;
-    let invalid = |column: &'static str, value: String, valid: &str| StoreError::InvalidColumn {
-        id,
-        column,
-        value,
-        valid: valid.to_owned(),
-    };
-    let timestamp = |column: &'static str, value: String| {
-        value
-            .parse::<Timestamp>()
-            .map_err(|_| invalid(column, value, "RFC 3339 timestamps in UTC"))
-    };
-    let input_kind_text: String = row.get("input_kind")?;
-    let finished_step_text: String = row.get("finished_step")?;
-    let retry_count: i64 = row.get("retry_count")?;
-    let started_at: String = row.get("started_at")?;
-    let created_at: String = row.get("created_at")?;
-    let updated_at: String = row.get("updated_at")?;
-    let input_path: String = row.get("input_path")?;
-    let input_revision: i64 = row.get("input_revision")?;
-    let title: Option<String> = row.get("title")?;
-    let failure: Option<String> = row.get("failure")?;
-    let calendar_match_json: Option<String> = row.get("calendar_match_json")?;
-    let extraction_json: Option<String> = row.get("extraction_json")?;
-    let extraction_provider: Option<String> = row.get("extraction_provider")?;
-    let extraction_attempts: i64 = row.get("extraction_attempts")?;
-    let extraction_error: Option<String> = row.get("extraction_error")?;
-    let next_extraction_at_ms: Option<i64> = row.get("next_extraction_at_ms")?;
-    let note = read_note_ownership(row, &invalid)?;
-
-    Ok((|| {
-        let input_kind = InputKind::ALL
-            .into_iter()
-            .find(|kind| kind.as_str() == input_kind_text)
-            .ok_or_else(|| {
-                let valid = InputKind::ALL.map(InputKind::as_str).join(", ");
-                invalid("input_kind", input_kind_text.clone(), &valid)
-            })?;
-        let finished_step = Step::ALL
-            .into_iter()
-            .find(|step| step.as_str() == finished_step_text)
-            .ok_or_else(|| {
-                let valid = Step::ALL.map(Step::as_str).join(", ");
-                invalid("finished_step", finished_step_text.clone(), &valid)
-            })?;
-        Ok(Meeting {
-            id: MeetingId(id),
-            input_kind,
-            input_path: input_path.into(),
-            input_revision,
-            started_at: timestamp("started_at", started_at)?,
-            title,
-            finished_step,
-            failure,
-            retry_count: u32::try_from(retry_count)
-                .map_err(|_| invalid("retry_count", retry_count.to_string(), "0 to 4294967295"))?,
-            calendar_match_json,
-            extraction_json,
-            extraction_provider,
-            extraction_attempts: u32::try_from(extraction_attempts).map_err(|_| {
-                invalid(
-                    "extraction_attempts",
-                    extraction_attempts.to_string(),
-                    "0 to 4294967295",
-                )
-            })?,
-            extraction_error,
-            next_extraction_at: next_extraction_at_ms
-                .map(|ms| {
-                    Timestamp::from_millisecond(ms).map_err(|_| {
-                        invalid(
-                            "next_extraction_at_ms",
-                            ms.to_string(),
-                            "UTC milliseconds since 1970",
-                        )
-                    })
-                })
-                .transpose()?,
-            note: note?,
-            created_at: timestamp("created_at", created_at)?,
-            updated_at: timestamp("updated_at", updated_at)?,
-        })
-    })())
-}
-
-fn read_note_ownership(
-    row: &Row<'_>,
-    invalid: &impl Fn(&'static str, String, &str) -> StoreError,
-) -> rusqlite::Result<Result<NoteOwnership, StoreError>> {
-    let note_path: Option<String> = row.get("note_path")?;
-    let note_sha256: Option<String> = row.get("note_sha256")?;
-    let pending_note_sha256s: Option<String> = row.get("pending_note_sha256s")?;
-    let note_section_sha256s: Option<String> = row.get("note_section_sha256s")?;
-
-    let Some(note_path) = note_path else {
-        let hash_without_path = [
-            ("note_sha256", note_sha256),
-            ("pending_note_sha256s", pending_note_sha256s),
-            ("note_section_sha256s", note_section_sha256s),
-        ]
-        .into_iter()
-        .find_map(|(column, value)| value.map(|value| (column, value)));
-        return Ok(match hash_without_path {
-            Some((column, value)) => Err(invalid(column, value, "NULL while note_path is NULL")),
-            None => Ok(NoteOwnership { claimed: None }),
-        });
-    };
-    let section_sha256s = match note_section_sha256s.as_deref().map(read_section_sha256s) {
-        Some(Ok(section_sha256s)) => section_sha256s,
-        Some(Err(line)) => {
-            return Ok(Err(invalid(
-                "note_section_sha256s",
-                line,
-                "<section> <sha256>",
-            )));
-        }
-        None => BTreeMap::new(),
-    };
-    Ok(Ok(NoteOwnership {
-        claimed: Some(ClaimedNote {
-            path: note_path.into(),
-            written_sha256: note_sha256,
-            pending_sha256s: pending_note_sha256s
-                .iter()
-                .flat_map(|hashes| hashes.split(' ').map(str::to_owned))
-                .collect(),
-            section_sha256s,
-        }),
-    }))
 }

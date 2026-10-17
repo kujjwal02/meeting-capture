@@ -209,26 +209,26 @@ fn print_meeting(meeting: &Meeting, time_zone: &TimeZone) {
         .started_at
         .to_zoned(time_zone.clone())
         .strftime("%Y-%m-%d %H:%M %Z");
+    let job_state = meeting.state();
     println!(
         "{:>4}  {}  {:<9}  {}",
         meeting.id,
         started_at,
-        meeting.state().label(),
+        job_state.label(),
         meeting.title.as_deref().unwrap_or("(no title)"),
     );
-    if let Some(failure) = &meeting.failure {
-        println!("      failed: {failure}");
-    }
-    if let (JobState::ExtractionPending, Some(retry_at), Some(error)) = (
-        meeting.state(),
-        meeting.next_extraction_at,
-        &meeting.extraction_error,
-    ) {
-        let retry_at = retry_at.to_zoned(time_zone.clone()).strftime("%H:%M %Z");
-        println!(
-            "      extraction failed {} times, next try at {retry_at}: {error}",
-            meeting.extraction_attempts
-        );
+    match &job_state {
+        JobState::Failed { cause } => println!("      failed: {}", cause.message),
+        JobState::ExtractionPending { retry: Some(retry) } => println!(
+            "      extraction failed, {}: {}",
+            retry.describe(time_zone),
+            retry.last_error()
+        ),
+        JobState::Captured
+        | JobState::Matched
+        | JobState::Extracted
+        | JobState::Written { .. }
+        | JobState::ExtractionPending { retry: None } => {}
     }
     if let Some(note_path) = meeting.note.path() {
         println!("      note: {}", note_path.display());

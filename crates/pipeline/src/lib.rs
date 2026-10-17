@@ -15,9 +15,7 @@ pub use vault::has_user_edits;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
 
-use jiff::Timestamp;
 use jobs::{
     Extraction, ExtractionFailure, JobStore, LeasedRun, MeetingId, RunOutcome, Step, StepError,
     StoreError,
@@ -78,16 +76,6 @@ impl StepError for PipelineError {
         PipelineError::Panicked(message)
     }
 }
-
-// After each failed extraction, the next try waits this long. A failure after the last one fails
-// the meeting. Spaced to outlast a rate-limit window or a laptop that went offline.
-/// How many times a failed extraction is tried again before the meeting fails.
-pub const EXTRACTION_RETRIES: u32 = 3;
-const EXTRACTION_RETRY_DELAYS: [Duration; EXTRACTION_RETRIES as usize] = [
-    Duration::from_mins(5),
-    Duration::from_mins(30),
-    Duration::from_hours(2),
-];
 
 pub struct Pipeline {
     app_dirs: AppDirs,
@@ -228,11 +216,7 @@ impl Pipeline {
             serde_json::from_str(stored)?
         };
 
-        // A written meeting is extracted again when a retry is due, or on a manual retry after
-        // extraction failed for good.
-        let needs_extraction = meeting.finished_step < Step::Extracted
-            || meeting.next_extraction_at.is_some()
-            || (meeting.failure.is_some() && meeting.extraction_error.is_some());
+        let needs_extraction = meeting.is_extraction_owed();
         let extraction = if needs_extraction {
             self.extract_step(run, &transcript, &calendar_match)?
         } else {
@@ -268,7 +252,11 @@ impl Pipeline {
         }
 
         if let ExtractOutcome::Failed { provider, error } = &extraction {
-            schedule_extraction_retry(run, provider, error)?;
+            run.record_extraction_failure(ExtractionFailure {
+                provider,
+                error: &error.to_string(),
+                persistence: error.persistence(),
+            })?;
         }
         Ok(())
     }
@@ -353,43 +341,4 @@ enum ExtractOutcome {
         provider: String,
         error: ExtractionError,
     },
-}
-
-fn schedule_extraction_retry(
-    run: &LeasedRun<'_>,
-    provider: &str,
-    error: &ExtractionError,
-) -> Result<(), PipelineError> {
-    let meeting = run.meeting();
-    // A manual retry after the last failure starts the count again.
-    let attempts = match meeting.failure {
-        Some(_) => 1,
-        None => meeting.extraction_attempts + 1,
-    };
-    // A missing key or CLI, a refused sign-in or a reply over the output cap fails the
-    // same way every time, so it fails the meeting at once and the tray says why.
-    let retry_at = if error.is_lasting() {
-        None
-    } else {
-        extraction_retry_delay(attempts).map(|delay| Timestamp::now() + delay)
-    };
-    run.record_extraction_failure(ExtractionFailure {
-        provider,
-        error: &error.to_string(),
-        attempts,
-        retry_at,
-    })?;
-    Ok(())
-}
-
-// `MEETING_CAPTURE_RETRY_DELAY_S` replaces every delay, so a dev run sees the whole schedule in
-// minutes.
-fn extraction_retry_delay(attempts: u32) -> Option<Duration> {
-    let index = usize::try_from(attempts).ok()?.checked_sub(1)?;
-    let delay = *EXTRACTION_RETRY_DELAYS.get(index)?;
-    let dev_delay = std::env::var("MEETING_CAPTURE_RETRY_DELAY_S")
-        .ok()
-        .and_then(|seconds| seconds.parse().ok())
-        .map(Duration::from_secs);
-    Some(dev_delay.unwrap_or(delay))
 }

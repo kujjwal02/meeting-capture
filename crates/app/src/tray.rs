@@ -6,7 +6,7 @@ use std::sync::Arc;
 use huddle_captions::HuddleHealth;
 use jobs::{JobState, Meeting, MeetingId};
 use pipeline::settings::SettingsStore;
-use pipeline::{EXTRACTION_RETRIES, Pipeline, has_user_edits};
+use pipeline::{Pipeline, has_user_edits};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
@@ -257,22 +257,25 @@ fn meeting_submenu(
         format!("{started_at}  {title}  ({})", job_state.label()),
         true,
     )?;
-    if let Some(failure) = &meeting.failure {
-        submenu.append(&label_entry(app, &shorten(failure, MAX_FAILURE_CHARS))?)?;
-    }
-    if let (JobState::ExtractionPending, Some(retry_at), Some(error)) = (
-        job_state,
-        meeting.next_extraction_at,
-        &meeting.extraction_error,
-    ) {
-        let retry_at = retry_at.to_zoned(time_zone.clone()).strftime("%H:%M %Z");
-        let label = format!(
-            "Extraction pending, retry {} of {EXTRACTION_RETRIES} at {retry_at}",
-            meeting.extraction_attempts
-        );
-        submenu.append(&label_entry(app, &label)?)?;
-        submenu.append(&label_entry(app, &shorten(error, MAX_FAILURE_CHARS))?)?;
-    }
+    let is_failed = match &job_state {
+        JobState::Failed { cause } => {
+            let message = shorten(&cause.message, MAX_FAILURE_CHARS);
+            submenu.append(&label_entry(app, &message)?)?;
+            true
+        }
+        JobState::ExtractionPending { retry: Some(retry) } => {
+            let label = format!("Extraction pending, {}", retry.describe(time_zone));
+            submenu.append(&label_entry(app, &label)?)?;
+            let last_error = shorten(retry.last_error(), MAX_FAILURE_CHARS);
+            submenu.append(&label_entry(app, &last_error)?)?;
+            false
+        }
+        JobState::Captured
+        | JobState::Matched
+        | JobState::Extracted
+        | JobState::Written { .. }
+        | JobState::ExtractionPending { retry: None } => false,
+    };
     submenu.append(&action_entry(
         app,
         &MenuAction::OpenNote(meeting.id),
@@ -283,10 +286,10 @@ fn meeting_submenu(
         app,
         &MenuAction::Retry(meeting.id),
         "Retry",
-        job_state == JobState::Failed,
+        is_failed,
     )?)?;
     // A rerun splices into an edited note; this is for a note whose markers it cannot place.
-    if job_state == JobState::Failed && has_user_edits(&meeting.note) {
+    if is_failed && has_user_edits(&meeting.note) {
         submenu.append(&action_entry(
             app,
             &MenuAction::OverwriteEdits(meeting.id),

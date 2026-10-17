@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use jiff::Timestamp;
 use rusqlite::{OptionalExtension, ToSql, params};
 
+use crate::state::FailureKind;
 use crate::{JobStore, Meeting, MeetingId, StoreError};
 
 // A lease not renewed for this long belongs to a process that died mid-run. Every step update
@@ -107,7 +108,10 @@ impl LeasedRun<'_> {
     // Records a failed run and gives the lease back, in one step, so a capture that arrives in
     // between is never left without a run.
     fn fail(&self, failure: &str) -> Result<LeaseRelease, StoreError> {
-        self.release_leased("failure = ?6", &[&failure])
+        self.release_leased(
+            "failure = ?6, failure_kind = ?7",
+            &[&failure, &FailureKind::Step.as_str()],
+        )
     }
 
     fn release_leased(
