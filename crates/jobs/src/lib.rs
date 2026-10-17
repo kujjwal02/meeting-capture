@@ -4,21 +4,25 @@
 //! not read them.
 //!
 //! The tray app and `mc` are separate processes on one database. A run holds a lease on its
-//! meeting, so only one run per meeting is active. Every step update requires the lease and
-//! renews it. A new capture of the same meeting bumps its input revision; step updates from a run
-//! on an older revision change nothing and report `StoreError::Superseded`, and the run starts
-//! over on the new input.
+//! meeting, so only one run per meeting is active. `JobStore::run` holds the lease while its
+//! steps run, and each step updates the meeting through the `LeasedRun` it is given. Every step
+//! update requires the lease and renews it. A new capture of the same meeting bumps its input
+//! revision; step updates from a run on an older revision change nothing and report
+//! `StoreError::Superseded`, and the run starts over on the new input.
+
+mod lease;
 
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use jiff::Timestamp;
-use rusqlite::{Connection, OptionalExtension, Row, ToSql, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 use rusqlite_migration::{M, Migrations};
+
+pub use crate::lease::{LeasedRun, RunOutcome, StepError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MeetingId(i64);
@@ -191,29 +195,6 @@ pub struct ExtractionFailure<'a> {
     pub retry_at: Option<Timestamp>,
 }
 
-/// Proof that this process runs the pipeline for one meeting. A clone lets a second thread keep
-/// the lease alive.
-#[derive(Debug, Clone)]
-pub struct RunLease {
-    id: MeetingId,
-    token: String,
-}
-
-impl RunLease {
-    #[must_use]
-    pub fn meeting_id(&self) -> MeetingId {
-        self.id
-    }
-}
-
-/// How giving back a lease went.
-#[derive(Debug, PartialEq, Eq)]
-pub enum LeaseRelease {
-    Released,
-    /// A new capture arrived during the run. The lease is still held; run again.
-    Superseded,
-}
-
 /// What a note path claim found.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NotePathClaim {
@@ -249,13 +230,6 @@ pub enum StoreError {
         valid: String,
     },
 }
-
-/// A lease not renewed for this long belongs to a process that died mid-run. Every step update
-/// renews it, and a running pipeline calls `JobStore::renew_lease` well within this time.
-pub const LEASE_EXPIRY: Duration = Duration::from_mins(2);
-
-#[expect(clippy::cast_possible_truncation, reason = "two minutes fits in i64")]
-const LEASE_EXPIRY_MS: i64 = LEASE_EXPIRY.as_millis() as i64;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -464,91 +438,6 @@ impl JobStore {
         rows.map(|row| row?).collect()
     }
 
-    /// Takes the run lease for a meeting. Returns `None` while another run holds it. An attempt
-    /// after a failure counts as a retry; the failure stays visible until a step succeeds.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::NotFound` for an unknown id.
-    pub fn lease_run(&self, id: MeetingId) -> Result<Option<RunLease>, StoreError> {
-        static LEASE_COUNTER: AtomicU64 = AtomicU64::new(0);
-        let now_ms = Timestamp::now().as_millisecond();
-        let token = format!(
-            "{}-{now_ms}-{}",
-            std::process::id(),
-            LEASE_COUNTER.fetch_add(1, Ordering::Relaxed)
-        );
-        let leased = self.connection().execute(
-            "UPDATE meetings SET run_token = ?2, run_renewed_at_ms = ?3,
-                retry_count = retry_count + (failure IS NOT NULL)
-             WHERE id = ?1 AND (run_token IS NULL OR run_renewed_at_ms < ?4)",
-            params![id.0, token, now_ms, now_ms - LEASE_EXPIRY_MS],
-        )?;
-        if leased == 0 {
-            self.get(id)?;
-            return Ok(None);
-        }
-        Ok(Some(RunLease { id, token }))
-    }
-
-    /// Keeps the lease alive during a long step.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::LeaseLost` when another run took the meeting.
-    pub fn renew_lease(&self, lease: &RunLease) -> Result<(), StoreError> {
-        let renewed = self.connection().execute(
-            "UPDATE meetings SET run_renewed_at_ms = ?3 WHERE id = ?1 AND run_token = ?2",
-            params![lease.id.0, lease.token, Timestamp::now().as_millisecond()],
-        )?;
-        match renewed {
-            0 => Err(StoreError::LeaseLost(lease.id)),
-            _ => Ok(()),
-        }
-    }
-
-    /// Gives the lease back if the meeting is still on `input_revision`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::LeaseLost` when another run took the meeting.
-    pub fn release_run(
-        &self,
-        lease: &RunLease,
-        input_revision: i64,
-    ) -> Result<LeaseRelease, StoreError> {
-        self.release_leased(lease, input_revision, "failure = failure", &[])
-    }
-
-    /// Records a failed run and gives the lease back, in one step, so a capture that arrives in
-    /// between is never left without a run.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::LeaseLost` when another run took the meeting.
-    pub fn fail_run(
-        &self,
-        lease: &RunLease,
-        input_revision: i64,
-        failure: &str,
-    ) -> Result<LeaseRelease, StoreError> {
-        self.release_leased(lease, input_revision, "failure = ?6", &[&failure])
-    }
-
-    /// Gives the lease back whatever the revision, when a run stops on a store error or a panic.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError` when the write fails.
-    pub fn abandon_run(&self, lease: &RunLease) -> Result<(), StoreError> {
-        self.connection().execute(
-            "UPDATE meetings SET run_token = NULL, run_renewed_at_ms = NULL
-             WHERE id = ?1 AND run_token = ?2",
-            params![lease.id.0, lease.token],
-        )?;
-        Ok(())
-    }
-
     /// Sends a meeting back to `Captured` so every step runs again. Keeps the note path. With
     /// `discard_note_edits`, the next write overwrites a note the user edited.
     ///
@@ -579,80 +468,6 @@ impl JobStore {
         }
     }
 
-    /// `title` is the calendar event title, else the title the call app showed.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
-    pub fn record_match(
-        &self,
-        lease: &RunLease,
-        input_revision: i64,
-        title: Option<&str>,
-        calendar_match_json: &str,
-    ) -> Result<(), StoreError> {
-        self.update_leased(
-            lease,
-            input_revision,
-            "finished_step = ?6, title = ?7, calendar_match_json = ?8, failure = NULL",
-            &[&Step::Matched.as_str(), &title, &calendar_match_json],
-        )
-    }
-
-    /// Records the extraction step as done. With `extraction` as `None`, no provider is set and
-    /// the note carries only the transcript; nothing is retried.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
-    pub fn record_extraction(
-        &self,
-        lease: &RunLease,
-        input_revision: i64,
-        extraction: Option<Extraction<'_>>,
-    ) -> Result<(), StoreError> {
-        let (extraction_json, provider) = match extraction {
-            Some(extraction) => (Some(extraction.notes_json), Some(extraction.provider)),
-            None => (None, None),
-        };
-        self.update_leased(
-            lease,
-            input_revision,
-            "finished_step = ?6, extraction_json = ?7, extraction_provider = ?8,
-                extraction_attempts = 0, extraction_error = NULL, next_extraction_at_ms = NULL,
-                failure = NULL",
-            &[&Step::Extracted.as_str(), &extraction_json, &provider],
-        )
-    }
-
-    /// Records a failed extraction once the note is written without notes. With `retry_at`, the
-    /// sweep tries again from then; without, the meeting fails with `error`.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
-    pub fn record_extraction_failure(
-        &self,
-        lease: &RunLease,
-        input_revision: i64,
-        failure: ExtractionFailure<'_>,
-    ) -> Result<(), StoreError> {
-        let retry_at_ms = failure.retry_at.map(Timestamp::as_millisecond);
-        self.update_leased(
-            lease,
-            input_revision,
-            "extraction_provider = ?6, extraction_attempts = ?7, extraction_error = ?8,
-                next_extraction_at_ms = ?9,
-                failure = CASE WHEN ?9 IS NULL THEN ?8 ELSE NULL END",
-            &[
-                &failure.provider,
-                &failure.attempts,
-                &failure.error,
-                &retry_at_ms,
-            ],
-        )
-    }
-
     /// Schedules an extraction now for every written meeting that has none and no failure, such
     /// as notes written while no provider was set. Returns how many were scheduled.
     ///
@@ -674,6 +489,74 @@ impl JobStore {
         )?)
     }
 
+    fn connection(&self) -> MutexGuard<'_, Connection> {
+        // A panic mid-query leaves no half-applied state: each call is one SQLite statement.
+        self.connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl LeasedRun<'_> {
+    /// `title` is the calendar event title, else the title the call app showed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
+    pub fn record_match(
+        &self,
+        title: Option<&str>,
+        calendar_match_json: &str,
+    ) -> Result<(), StoreError> {
+        self.update(
+            "finished_step = ?6, title = ?7, calendar_match_json = ?8, failure = NULL",
+            &[&Step::Matched.as_str(), &title, &calendar_match_json],
+        )
+    }
+
+    /// Records the extraction step as done. With `extraction` as `None`, no provider is set and
+    /// the note carries only the transcript; nothing is retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
+    pub fn record_extraction(&self, extraction: Option<Extraction<'_>>) -> Result<(), StoreError> {
+        let (extraction_json, provider) = match extraction {
+            Some(extraction) => (Some(extraction.notes_json), Some(extraction.provider)),
+            None => (None, None),
+        };
+        self.update(
+            "finished_step = ?6, extraction_json = ?7, extraction_provider = ?8,
+                extraction_attempts = 0, extraction_error = NULL, next_extraction_at_ms = NULL,
+                failure = NULL",
+            &[&Step::Extracted.as_str(), &extraction_json, &provider],
+        )
+    }
+
+    /// Records a failed extraction once the note is written without notes. With `retry_at`, the
+    /// sweep tries again from then; without, the meeting fails with `error`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
+    pub fn record_extraction_failure(
+        &self,
+        failure: ExtractionFailure<'_>,
+    ) -> Result<(), StoreError> {
+        let retry_at_ms = failure.retry_at.map(Timestamp::as_millisecond);
+        self.update(
+            "extraction_provider = ?6, extraction_attempts = ?7, extraction_error = ?8,
+                next_extraction_at_ms = ?9,
+                failure = CASE WHEN ?9 IS NULL THEN ?8 ELSE NULL END",
+            &[
+                &failure.provider,
+                &failure.attempts,
+                &failure.error,
+                &retry_at_ms,
+            ],
+        )
+    }
+
     /// Gives `note_path` to the meeting. The unique index makes the check and the claim one step,
     /// so two meetings never share a note.
     ///
@@ -681,16 +564,9 @@ impl JobStore {
     ///
     /// Returns `StoreError::NotePathAlreadySet` when the meeting already has a path, and
     /// `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
-    pub fn claim_note_path(
-        &self,
-        lease: &RunLease,
-        input_revision: i64,
-        note_path: &Path,
-    ) -> Result<NotePathClaim, StoreError> {
+    pub fn claim_note_path(&self, note_path: &Path) -> Result<NotePathClaim, StoreError> {
         let note_path = note_path.to_string_lossy();
-        let claim = self.update_leased(
-            lease,
-            input_revision,
+        let claim = self.update(
             "note_path = CASE WHEN note_path IS NULL THEN ?6 ELSE note_path END",
             &[&note_path],
         );
@@ -703,14 +579,14 @@ impl JobStore {
             }
             Err(error) => return Err(error),
         }
-        let stored: Option<String> = self.connection().query_row(
+        let stored: Option<String> = self.store.connection().query_row(
             "SELECT note_path FROM meetings WHERE id = ?1",
-            [lease.id.0],
+            [self.meeting().id.0],
             |row| row.get(0),
         )?;
         match stored {
             Some(stored) if stored == note_path => Ok(NotePathClaim::Claimed),
-            Some(_) | None => Err(StoreError::NotePathAlreadySet(lease.id)),
+            Some(_) | None => Err(StoreError::NotePathAlreadySet(self.meeting().id)),
         }
     }
 
@@ -720,15 +596,8 @@ impl JobStore {
     /// # Errors
     ///
     /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
-    pub fn record_pending_note(
-        &self,
-        lease: &RunLease,
-        input_revision: i64,
-        note_sha256: &str,
-    ) -> Result<(), StoreError> {
-        self.update_leased(
-            lease,
-            input_revision,
+    pub fn record_pending_note(&self, note_sha256: &str) -> Result<(), StoreError> {
+        self.update(
             "pending_note_sha256s = CASE WHEN pending_note_sha256s IS NULL THEN ?6
                 ELSE pending_note_sha256s || ' ' || ?6 END",
             &[&note_sha256],
@@ -740,8 +609,6 @@ impl JobStore {
     /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
     pub fn mark_written(
         &self,
-        lease: &RunLease,
-        input_revision: i64,
         note_sha256: &str,
         section_sha256s: &BTreeMap<String, String>,
     ) -> Result<(), StoreError> {
@@ -749,9 +616,7 @@ impl JobStore {
             .iter()
             .map(|(section, sha256)| format!("{section} {sha256}"))
             .collect();
-        self.update_leased(
-            lease,
-            input_revision,
+        self.update(
             "finished_step = ?6, note_sha256 = ?7, pending_note_sha256s = NULL, failure = NULL,
                 note_section_sha256s = ?8",
             &[
@@ -760,92 +625,6 @@ impl JobStore {
                 &section_lines.join("\n"),
             ],
         )
-    }
-
-    // Runs `UPDATE meetings SET <set_clause>` for the lease holder on `input_revision`, and renews
-    // the lease. Positions ?1 to ?5 are taken; `extra` binds from ?6.
-    fn update_leased(
-        &self,
-        lease: &RunLease,
-        input_revision: i64,
-        set_clause: &str,
-        extra: &[&dyn ToSql],
-    ) -> Result<(), StoreError> {
-        let sql = format!(
-            "UPDATE meetings SET {set_clause}, run_renewed_at_ms = ?4, updated_at = ?5
-             WHERE id = ?1 AND run_token = ?2 AND input_revision = ?3"
-        );
-        match self.execute_leased(lease, input_revision, &sql, extra)? {
-            0 => Err(self.why_unchanged(lease)?),
-            _ => Ok(()),
-        }
-    }
-
-    fn release_leased(
-        &self,
-        lease: &RunLease,
-        input_revision: i64,
-        set_clause: &str,
-        extra: &[&dyn ToSql],
-    ) -> Result<LeaseRelease, StoreError> {
-        let sql = format!(
-            "UPDATE meetings SET {set_clause}, run_token = NULL, run_renewed_at_ms = NULL,
-                updated_at = ?5
-             WHERE id = ?1 AND run_token = ?2 AND input_revision = ?3 AND ?4 IS NOT NULL"
-        );
-        if self.execute_leased(lease, input_revision, &sql, extra)? > 0 {
-            return Ok(LeaseRelease::Released);
-        }
-        match self.why_unchanged(lease)? {
-            StoreError::Superseded(_) => Ok(LeaseRelease::Superseded),
-            lease_lost => Err(lease_lost),
-        }
-    }
-
-    fn execute_leased(
-        &self,
-        lease: &RunLease,
-        input_revision: i64,
-        sql: &str,
-        extra: &[&dyn ToSql],
-    ) -> Result<usize, StoreError> {
-        let now = Timestamp::now();
-        let now_ms = now.as_millisecond();
-        let now_text = now.to_string();
-        let mut bound: Vec<&dyn ToSql> = vec![
-            &lease.id.0,
-            &lease.token,
-            &input_revision,
-            &now_ms,
-            &now_text,
-        ];
-        bound.extend_from_slice(extra);
-        Ok(self.connection().execute(sql, bound.as_slice())?)
-    }
-
-    // Called after a leased update changed no row: either another run holds the meeting or a
-    // new capture bumped its revision.
-    fn why_unchanged(&self, lease: &RunLease) -> Result<StoreError, StoreError> {
-        let run_token: Option<String> = self
-            .connection()
-            .query_row(
-                "SELECT run_token FROM meetings WHERE id = ?1",
-                [lease.id.0],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound(lease.id))?;
-        Ok(match run_token {
-            Some(run_token) if run_token == lease.token => StoreError::Superseded(lease.id),
-            Some(_) | None => StoreError::LeaseLost(lease.id),
-        })
-    }
-
-    fn connection(&self) -> MutexGuard<'_, Connection> {
-        // A panic mid-query leaves no half-applied state: each call is one SQLite statement.
-        self.connection
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 

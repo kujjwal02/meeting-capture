@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use caption_receiver::ReceivedCaptions;
-use jobs::{InputKind, JobState, Meeting, MeetingId};
-use pipeline::{Pipeline, RunOutcome};
+use jobs::{InputKind, JobState, Meeting, MeetingId, RunOutcome};
+use pipeline::Pipeline;
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt as _;
 use tokio::net::TcpListener;
@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use crate::{Listener, set_listener};
 
 // Picks up meetings a crash, a quit or a store error left unfinished. A dead process's lease
-// expires after `jobs::LEASE_EXPIRY`, so a sweep soon after launch can still find one held.
+// expires after the jobs lease expiry, so a sweep soon after launch can still find one held.
 const SWEEP_INTERVAL: Duration = Duration::from_mins(5);
 // Two, so one slow run does not hold up the rest, and few enough LLM calls for a rate limit.
 const SWEEP_WORKERS: usize = 2;

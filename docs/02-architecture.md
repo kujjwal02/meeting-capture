@@ -213,7 +213,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 | huddle-captions | 1 | Read Slack huddle captions from the Slack desktop app, write the huddle log, report health | Mac: accessibility API via `objc2-application-services` |
 | sources | 1 | Turn each input into the common transcript format | Captions, own stems, Meet REST API, dropped audio files |
 | pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `minijinja`, `toml`, `directories` |
-| jobs | 1 | One row per meeting with a closed state enum, its run lease and the extraction retry schedule | `rusqlite` |
+| jobs | 1 | One row per meeting with a closed state enum and the extraction retry schedule. Runs a meeting's steps under its lease: one run per meeting across processes, renewed from a second thread, given back however the run ends | `rusqlite`, `tracing` |
 | cli | 1 | `mc`: rerun any job step or ingest a file, without Tauri | `clap` |
 | app | 1 | Tray, settings, "Note written" notifications, permission prompts, review of extracted commitments | Tauri 2, plugin `notification` 2 |
 | detect | 2 | Emit "call started" and "call ended" when an app takes or releases the mic | Vendored from Anarlog `crates/detect` (MIT) |

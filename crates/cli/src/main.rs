@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use jiff::tz::TimeZone;
-use jobs::{InputKind, JobState, JobStore, Meeting, MeetingId};
+use jobs::{InputKind, JobState, JobStore, Meeting, MeetingId, RunOutcome};
+use pipeline::Pipeline;
 use pipeline::extraction::{self, CheckedNotes, Prompt, Turn, Verdict};
 use pipeline::llm::Provider;
 use pipeline::settings::{AppDirs, ProviderKind, Settings};
-use pipeline::{Pipeline, RunOutcome};
 
 #[derive(Parser)]
 #[command(name = "mc", version, about = "Rerun meeting-capture pipeline steps")]
