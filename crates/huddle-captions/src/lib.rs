@@ -2,10 +2,21 @@
 //! writes one log per huddle. The log is the huddle's raw input; `sources::slack_huddle` parses
 //! it. macOS only for now; on other OSes `spawn` starts nothing.
 
+// Only the macOS reader writes huddle logs and feeds the tracker. Neither needs macOS, so a
+// Windows reader can use both.
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "only the macOS reader writes huddle logs")
+)]
 mod log;
 #[cfg(target_os = "macos")]
 mod mac;
 pub mod profile;
+#[cfg_attr(
+    not(target_os = "macos"),
+    expect(dead_code, reason = "only the macOS reader feeds the tracker")
+)]
+mod tracker;
 
 use std::path::{Path, PathBuf};
 
