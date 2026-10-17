@@ -9,6 +9,7 @@
 //! on an older revision change nothing and report `StoreError::Superseded`, and the run starts
 //! over on the new input.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -143,6 +144,9 @@ pub struct Meeting {
     /// SHA-256 of each note write that started but was not recorded, after a crash or a re-post
     /// mid-write. The pipeline still owns a note with any of these contents.
     pub pending_note_sha256s: Vec<String>,
+    /// SHA-256 of each marked note section as last written, by section name. A section whose
+    /// contents differ was edited by the user, and a rerun leaves it alone.
+    pub note_section_sha256s: BTreeMap<String, String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -286,12 +290,14 @@ const MIGRATIONS: &[M<'static>] = &[
     ALTER TABLE meetings ADD COLUMN extraction_error TEXT;
     ALTER TABLE meetings ADD COLUMN next_extraction_at_ms INTEGER;",
     ),
+    // One "<section> <sha256>" line per marked section of the note.
+    M::up("ALTER TABLE meetings ADD COLUMN note_section_sha256s TEXT;"),
 ];
 
 const MEETING_COLUMNS: &str = "id, input_kind, input_path, input_revision, started_at, title, \
     finished_step, failure, retry_count, calendar_match_json, extraction_json, \
     extraction_provider, extraction_attempts, extraction_error, next_extraction_at_ms, note_path, \
-    note_sha256, pending_note_sha256s, created_at, updated_at";
+    note_sha256, pending_note_sha256s, note_section_sha256s, created_at, updated_at";
 
 /// The job store. Safe to share between threads; each call holds the connection briefly.
 pub struct JobStore {
@@ -541,6 +547,7 @@ impl JobStore {
                 next_extraction_at_ms = NULL,
                 note_sha256 = CASE WHEN ?3 THEN NULL ELSE note_sha256 END,
                 pending_note_sha256s = CASE WHEN ?3 THEN NULL ELSE pending_note_sha256s END,
+                note_section_sha256s = CASE WHEN ?3 THEN NULL ELSE note_section_sha256s END,
                 updated_at = ?4
              WHERE id = ?1",
             params![
@@ -720,12 +727,22 @@ impl JobStore {
         lease: &RunLease,
         input_revision: i64,
         note_sha256: &str,
+        section_sha256s: &BTreeMap<String, String>,
     ) -> Result<(), StoreError> {
+        let section_lines: Vec<String> = section_sha256s
+            .iter()
+            .map(|(section, sha256)| format!("{section} {sha256}"))
+            .collect();
         self.update_leased(
             lease,
             input_revision,
-            "finished_step = ?6, note_sha256 = ?7, pending_note_sha256s = NULL, failure = NULL",
-            &[&Step::Written.as_str(), &note_sha256],
+            "finished_step = ?6, note_sha256 = ?7, pending_note_sha256s = NULL, failure = NULL,
+                note_section_sha256s = ?8",
+            &[
+                &Step::Written.as_str(),
+                &note_sha256,
+                &section_lines.join("\n"),
+            ],
         )
     }
 
@@ -817,6 +834,18 @@ impl JobStore {
 }
 
 // The outer Result carries SQLite read errors; the inner one carries invalid stored values.
+/// Each `<section> <sha256>` line, or the first line that is not one.
+fn read_section_sha256s(lines: &str) -> Result<BTreeMap<String, String>, String> {
+    lines
+        .lines()
+        .map(|line| {
+            line.rsplit_once(' ')
+                .map(|(section, sha256)| (section.to_owned(), sha256.to_owned()))
+                .ok_or_else(|| line.to_owned())
+        })
+        .collect()
+}
+
 fn read_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting, StoreError>> {
     let id: i64 = row.get("id")?;
     let invalid = |column: &'static str, value: String, valid: &str| StoreError::InvalidColumn {
@@ -849,6 +878,7 @@ fn read_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting, StoreError>> 
     let note_path: Option<String> = row.get("note_path")?;
     let note_sha256: Option<String> = row.get("note_sha256")?;
     let pending_note_sha256s: Option<String> = row.get("pending_note_sha256s")?;
+    let note_section_sha256s: Option<String> = row.get("note_section_sha256s")?;
 
     Ok((|| {
         let input_kind = InputKind::ALL
@@ -904,6 +934,12 @@ fn read_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting, StoreError>> 
                 .iter()
                 .flat_map(|hashes| hashes.split(' ').map(str::to_owned))
                 .collect(),
+            note_section_sha256s: note_section_sha256s
+                .as_deref()
+                .map(read_section_sha256s)
+                .transpose()
+                .map_err(|line| invalid("note_section_sha256s", line, "<section> <sha256>"))?
+                .unwrap_or_default(),
             created_at: timestamp("created_at", created_at)?,
             updated_at: timestamp("updated_at", updated_at)?,
         })

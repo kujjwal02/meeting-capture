@@ -11,7 +11,7 @@ use sources::{SpeakerNaming, Transcript};
 
 use crate::PipelineError;
 use crate::calendar::CalendarMatch;
-use crate::extraction::CheckedNotes;
+use crate::extraction::{CheckedCitation, CheckedNotes, CommitmentStrength};
 
 const BUILT_IN_TEMPLATE: &str = include_str!("note.md.j2");
 const UNTITLED_CALL: &str = "Untitled call";
@@ -23,6 +23,8 @@ pub(crate) struct NoteInput<'a> {
     pub calendar_match: &'a CalendarMatch,
     /// `None` when no notes were extracted; the note then carries only the transcript.
     pub notes: Option<&'a CheckedNotes>,
+    /// `<provider>/<model>` that wrote `notes`.
+    pub extraction_provider: Option<&'a str>,
     pub my_name: Option<&'a str>,
     pub time_zone: &'a TimeZone,
 }
@@ -50,10 +52,35 @@ struct Frontmatter<'a> {
     meeting_url: Option<&'a str>,
     meeting_id: i64,
     attendees: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extraction: Option<&'a str>,
 }
+
+// The frontmatter keys the app writes. On a rerun these are rewritten; any other key stays.
+pub(crate) const APP_KEYS: [&str; 10] = [
+    "title",
+    "date",
+    "created",
+    "updated",
+    "tags",
+    "source",
+    "meeting_url",
+    "meeting_id",
+    "attendees",
+    "extraction",
+];
+// Tags the app adds or removes. Other tags in `tags` are the user's and stay.
+pub(crate) const APP_TAGS: [&str; 4] = [
+    "area/meetings",
+    "topic/transcript",
+    "status/active",
+    NEEDS_EXTRACTION_TAG,
+];
 
 #[derive(Serialize)]
 struct SegmentView<'a> {
+    /// The block id suffix, `^s<id>`, that citations link to.
+    id: usize,
     at: String,
     speaker: &'a str,
     text: String,
@@ -109,7 +136,9 @@ pub(crate) fn render(
         .segments
         .iter()
         .zip(&speakers)
-        .map(|(segment, speaker)| SegmentView {
+        .enumerate()
+        .map(|(index, (segment, speaker))| SegmentView {
+            id: index + 1,
             at: offset_label(segment.start_s),
             speaker,
             text: inline_markdown(&segment.text),
@@ -131,6 +160,8 @@ pub(crate) fn render(
         })
         .collect();
 
+    let notes = note.notes.map(notes_view);
+
     let mut environment = minijinja::Environment::new();
     environment.set_syntax(
         minijinja::syntax::SyntaxConfig::builder()
@@ -149,6 +180,7 @@ pub(crate) fn render(
             meeting_url => transcript.meeting_url.as_deref(),
             attendees => attendees.iter().map(|attendee| inline_markdown(attendee)).collect::<Vec<_>>(),
             segments => minijinja::value::Serde(&segments),
+            notes => minijinja::value::Serde(&notes),
             chat_messages => minijinja::value::Serde(&chat_messages),
         })?;
     Ok(rendered)
@@ -201,9 +233,96 @@ fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String
         meeting_url: transcript.meeting_url.as_deref(),
         meeting_id: note.meeting_id.as_i64(),
         attendees: attendees.to_vec(),
+        extraction: note.notes.and(note.extraction_provider),
     };
     serde_saphyr::to_string(&frontmatter)
         .map_err(|error| PipelineError::Frontmatter(error.to_string()))
+}
+
+#[derive(Serialize)]
+struct NotesView {
+    summary: String,
+    decisions: Vec<ItemView>,
+    action_items: Vec<ItemView>,
+    open_questions: Vec<ItemView>,
+    my_commitments: Vec<ItemView>,
+}
+
+#[derive(Serialize)]
+struct ItemView {
+    text: String,
+    /// Citation links, each `[[#^s<id>|<time>]]`, space separated.
+    links: String,
+    owner: Option<String>,
+    recipient: Option<String>,
+    due: Option<String>,
+    strength: Option<&'static str>,
+}
+
+impl ItemView {
+    fn new(text: &str, citations: &[CheckedCitation]) -> Self {
+        let mut linked: Vec<u32> = Vec::new();
+        let mut links = Vec::new();
+        for citation in citations {
+            if !linked.contains(&citation.segment_id) {
+                linked.push(citation.segment_id);
+                links.push(format!(
+                    "[[#^s{}|{}]]",
+                    citation.segment_id,
+                    offset_label(citation.start_s)
+                ));
+            }
+        }
+        Self {
+            text: inline_markdown(text),
+            links: links.join(" "),
+            owner: None,
+            recipient: None,
+            due: None,
+            strength: None,
+        }
+    }
+}
+
+// What the model wrote is escaped like transcript text: it quotes the call, and the call is data.
+fn notes_view(notes: &CheckedNotes) -> NotesView {
+    let escaped = |text: &Option<String>| text.as_deref().map(inline_markdown);
+    NotesView {
+        summary: inline_markdown(&notes.summary),
+        decisions: notes
+            .decisions
+            .iter()
+            .map(|item| ItemView::new(&item.decision, &item.citations))
+            .collect(),
+        action_items: notes
+            .action_items
+            .iter()
+            .map(|item| ItemView {
+                owner: escaped(&item.owner),
+                due: escaped(&item.due),
+                ..ItemView::new(&item.task, &item.citations)
+            })
+            .collect(),
+        open_questions: notes
+            .open_questions
+            .iter()
+            .map(|item| ItemView::new(&item.question, &item.citations))
+            .collect(),
+        my_commitments: notes
+            .my_commitments
+            .iter()
+            .map(|item| ItemView {
+                recipient: escaped(&item.recipient),
+                due: escaped(&item.due),
+                strength: Some(match item.strength {
+                    CommitmentStrength::Committed => "committed",
+                    CommitmentStrength::Hedged => "hedged",
+                    CommitmentStrength::Aspirational => "aspirational",
+                }),
+                ..ItemView::new(&item.task, &item.citations)
+            })
+            .collect(),
+    }
 }
 
 /// Note paths to try for a new meeting, in order: `YYYY/MM/yyyy-mm-dd-hhmm-<title-slug>.md`
@@ -337,7 +456,8 @@ fn inline_markdown(text: &str) -> String {
             escaped.push(' ');
         }
         for character in word.chars() {
-            if "\\`*_[]<>#%$|~=!".contains(character) {
+            // `^` too: a trailing ` ^s12` would be a second block id that citations jump to.
+            if "\\`*_[]<>#%$|~=!^".contains(character) {
                 escaped.push('\\');
             }
             escaped.push(character);

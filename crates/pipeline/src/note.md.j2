@@ -1,6 +1,12 @@
 ---
 {{ frontmatter }}---
 
+{#
+  The app owns what sits between each "%% mc:begin NAME %%" and its "%% mc:end NAME %%" line. A
+  rerun replaces those blocks and keeps everything outside them. A custom template must keep the
+  markers, one per line, or a rerun on an edited note cannot place its blocks.
+#}
+%% mc:begin details %%
 # {{ title }}
 
 - **When:** {{ when }}
@@ -15,11 +21,61 @@
 - {{ attendee }}
 {% endfor %}
 {% endif %}
+%% mc:end details %%
 
+%% mc:begin summary %%
+{% if notes %}
+## Summary
+
+{{ notes.summary }}
+{% endif %}
+%% mc:end summary %%
+
+%% mc:begin decisions %%
+{% if notes and notes.decisions %}
+## Decisions
+
+{% for decision in notes.decisions %}
+- {{ decision.text }} {{ decision.links }}
+{% endfor %}
+{% endif %}
+%% mc:end decisions %%
+
+%% mc:begin action-items %%
+{% if notes and notes.action_items %}
+## Action items
+
+{% for item in notes.action_items %}
+- {% if item.owner %}**{{ item.owner }}:** {% endif %}{{ item.text }}{% if item.due %} (due {{ item.due }}){% endif %} {{ item.links }}
+{% endfor %}
+{% endif %}
+%% mc:end action-items %%
+
+%% mc:begin open-questions %%
+{% if notes and notes.open_questions %}
+## Open questions
+
+{% for question in notes.open_questions %}
+- {{ question.text }} {{ question.links }}
+{% endfor %}
+{% endif %}
+%% mc:end open-questions %%
+
+%% mc:begin my-commitments %%
+{% if notes and notes.my_commitments %}
+## My commitments
+
+{% for commitment in notes.my_commitments %}
+- [ ] {% if commitment.strength != "committed" %}({{ commitment.strength }}) {% endif %}{{ commitment.text }}{% if commitment.recipient %}, for {{ commitment.recipient }}{% endif %}{% if commitment.due %}, by {{ commitment.due }}{% endif %} {{ commitment.links }}
+{% endfor %}
+{% endif %}
+%% mc:end my-commitments %%
+
+%% mc:begin transcript %%
 ## Transcript
 
 {% for segment in segments %}
-**[{{ segment.at }}] {{ segment.speaker }}:** {{ segment.text }}
+**[{{ segment.at }}] {{ segment.speaker }}:** {{ segment.text }} ^s{{ segment.id }}
 
 {% endfor %}
 {% if chat_messages %}
@@ -30,3 +86,4 @@
 
 {% endfor %}
 {% endif %}
+%% mc:end transcript %%
