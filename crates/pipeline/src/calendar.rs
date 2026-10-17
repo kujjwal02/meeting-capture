@@ -33,31 +33,21 @@ pub struct AccountStatus {
 
 /// The signed-in accounts and whether each still works. The tray shows them; the settings window
 /// changes them.
+#[derive(Default)]
 pub struct GoogleAccounts {
     state: Mutex<AccountsState>,
 }
 
+#[derive(Default)]
 struct AccountsState {
     settings: GoogleSettings,
     accounts: Vec<AccountStatus>,
 }
 
 impl GoogleAccounts {
-    #[must_use]
-    pub fn new(settings: &GoogleSettings) -> Self {
-        let accounts = Self {
-            state: Mutex::new(AccountsState {
-                settings: GoogleSettings::default(),
-                accounts: Vec::new(),
-            }),
-        };
-        accounts.replace(settings);
-        accounts
-    }
-
     /// Takes the client, the account list and the refresh tokens from new settings. Accounts
     /// already known keep their status.
-    pub fn replace(&self, settings: &GoogleSettings) {
+    pub(crate) fn replace(&self, settings: &GoogleSettings) {
         let mut state = self.lock();
         let accounts = settings
             .accounts

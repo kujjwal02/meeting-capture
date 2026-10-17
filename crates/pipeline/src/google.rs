@@ -147,7 +147,7 @@ impl OAuthClient {
     ///
     /// Returns `GoogleError::NoClientSecret` when the settings hold a client ID but no secret.
     pub fn from_settings(settings: &GoogleSettings) -> Result<Option<Self>, GoogleError> {
-        let Some(client_id) = &settings.client_id else {
+        let Some(client_id) = settings.client_id() else {
             return Ok(None);
         };
         let client_secret = settings
@@ -155,7 +155,7 @@ impl OAuthClient {
             .clone()
             .ok_or(GoogleError::NoClientSecret)?;
         Ok(Some(Self {
-            client_id: client_id.clone(),
+            client_id: client_id.to_owned(),
             client_secret,
         }))
     }

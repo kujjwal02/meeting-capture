@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use huddle_captions::HuddleHealth;
 use jobs::{JobState, Meeting, MeetingId};
+use pipeline::settings::SettingsStore;
 use pipeline::{EXTRACTION_RETRIES, Pipeline, has_user_edits};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
@@ -122,7 +123,7 @@ fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     menu.append(&PredefinedMenuItem::separator(app)?)?;
 
     if let Some(pipeline) = &state.pipeline {
-        append_google_accounts(app, &menu, pipeline)?;
+        append_google_accounts(app, &menu, &state.settings)?;
         menu.append(&PredefinedMenuItem::separator(app)?)?;
         append_meetings(app, &menu, pipeline)?;
         menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -183,9 +184,9 @@ fn append_huddle_status(app: &AppHandle, menu: &Menu<Wry>, state: &AppState) -> 
 fn append_google_accounts(
     app: &AppHandle,
     menu: &Menu<Wry>,
-    pipeline: &Pipeline,
+    settings: &SettingsStore,
 ) -> tauri::Result<()> {
-    let accounts = pipeline.google().statuses();
+    let accounts = settings.google().statuses();
     if accounts.is_empty() {
         return menu.append(&action_entry(
             app,
@@ -360,7 +361,13 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
         MenuAction::OpenSettings => crate::settings_window::open(app),
         MenuAction::ShowLogFile => launch(
             app,
-            &LaunchTarget::RevealFile(&state.app_dirs.log_dir().join(crate::LOG_FILE_NAME)),
+            &LaunchTarget::RevealFile(
+                &state
+                    .settings
+                    .app_dirs()
+                    .log_dir()
+                    .join(crate::LOG_FILE_NAME),
+            ),
         ),
         MenuAction::Quit => app.exit(0),
     }

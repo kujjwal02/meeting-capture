@@ -1,15 +1,16 @@
 //! `mc`: reruns pipeline steps without the tray app.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use jiff::tz::TimeZone;
-use jobs::{InputKind, JobState, JobStore, Meeting, MeetingId, RunOutcome};
+use jobs::{InputKind, JobState, Meeting, MeetingId, RunOutcome};
 use pipeline::Pipeline;
 use pipeline::extraction::{self, CheckedNotes, Prompt, Turn, Verdict};
 use pipeline::llm::Provider;
-use pipeline::settings::{AppDirs, ProviderKind, Settings};
+use pipeline::settings::{AppDirs, ProviderKind, SettingsStore};
 
 #[derive(Parser)]
 #[command(name = "mc", version, about = "Rerun meeting-capture pipeline steps")]
@@ -70,9 +71,8 @@ fn main() -> anyhow::Result<()> {
 
     let app_dirs = AppDirs::locate()?;
     app_dirs.create()?;
-    let settings = Settings::load(&app_dirs)?;
-    let store = JobStore::open(&app_dirs.job_store_file())?;
-    let pipeline = Pipeline::new(app_dirs.clone(), settings, store);
+    let settings_store = Arc::new(SettingsStore::new(app_dirs.clone()));
+    let pipeline = Pipeline::open(Arc::clone(&settings_store))?;
 
     let time_zone = pipeline.settings().time_zone.clone();
     match cli.command {
@@ -107,23 +107,18 @@ fn main() -> anyhow::Result<()> {
             let checked = if let Some(reply_file) = reply {
                 check_saved_reply(&prompt, &reply_file)?
             } else {
-                {
-                    let mut llm = pipeline.settings().llm.clone();
-                    if let Some(provider) = provider.map(ProviderKind::from)
-                        && llm.provider != Some(provider)
-                    {
-                        llm.provider = Some(provider);
-                        // The stored key belongs to the settings' provider, not this one.
-                        llm.api_key = None;
-                    }
-                    if model.is_some() {
-                        llm.model = model;
-                    }
-                    llm.validate()?;
-                    let provider = Provider::from_settings(&llm, &app_dirs)?
-                        .context("no LLM provider is set; pass --provider or set llm.provider")?;
-                    provider.extract(&prompt)?
+                let mut llm = settings_store.llm();
+                if let Some(provider) = provider.map(ProviderKind::from) {
+                    let base_url = llm.base_url().map(str::to_owned);
+                    llm.set_endpoint(Some(provider), base_url);
                 }
+                if model.is_some() {
+                    llm.model = model;
+                }
+                llm.validate()?;
+                let provider = Provider::from_settings(&llm, &app_dirs)?
+                    .context("no LLM provider is set; pass --provider or set llm.provider")?;
+                provider.extract(&prompt)?
             };
             println!("{}", serde_json::to_string_pretty(&checked)?);
         }

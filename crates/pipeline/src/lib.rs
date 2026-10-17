@@ -12,7 +12,7 @@ mod vault;
 pub use vault::has_user_edits;
 
 use std::path::PathBuf;
-use std::sync::{PoisonError, RwLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -22,19 +22,21 @@ use jobs::{
 };
 use sources::Transcript;
 
-use crate::calendar::{CalendarMatch, GoogleAccounts};
+use crate::calendar::CalendarMatch;
 use crate::extraction::{CheckedNotes, Prompt};
 use crate::google::GoogleError;
 use crate::intake::read_transcript;
 use crate::llm::{ExtractionError, Provider};
 use crate::render::NoteInput;
-use crate::settings::{AppDirs, LlmSettings, Settings};
+use crate::settings::{AppDirs, LlmSettings, Settings, SettingsError, SettingsStore};
 use crate::vault::Vault;
 
 pub use crate::intake::{InputError, Intake, IntakeError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
+    #[error(transparent)]
+    Settings(#[from] SettingsError),
     #[error(transparent)]
     Store(#[from] StoreError),
     #[error("could not read {path}: {source}")]
@@ -88,48 +90,47 @@ const EXTRACTION_RETRY_DELAYS: [Duration; EXTRACTION_RETRIES as usize] = [
 pub struct Pipeline {
     app_dirs: AppDirs,
     settings: Settings,
+    /// The LLM and Google settings, which the settings window changes while the app runs.
+    settings_store: Arc<SettingsStore>,
     store: JobStore,
-    google: GoogleAccounts,
-    /// Replaced from the settings window, so a new provider applies to the next run.
-    llm: RwLock<LlmSettings>,
     vault: Vault,
 }
 
 impl Pipeline {
-    #[must_use]
-    pub fn new(app_dirs: AppDirs, settings: Settings, store: JobStore) -> Self {
-        let google = GoogleAccounts::new(&settings.google);
-        let llm = RwLock::new(settings.llm.clone());
+    /// Loads the settings into `settings_store`, then opens the job store and the vault. A new
+    /// vault folder applies after a restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineError::Settings` naming the file or the invalid field, or
+    /// `PipelineError::Store` when the job store cannot be opened.
+    pub fn open(settings_store: Arc<SettingsStore>) -> Result<Self, PipelineError> {
+        let settings = settings_store.load()?;
+        let app_dirs = settings_store.app_dirs().clone();
+        let store = JobStore::open(&app_dirs.job_store_file())?;
         let vault = Vault::new(settings.meetings_dir(), app_dirs.note_staging_dir());
-        Self {
+        Ok(Self {
             app_dirs,
             settings,
+            settings_store,
             store,
-            google,
-            llm,
             vault,
-        }
+        })
     }
 
     /// The LLM settings the next run uses.
-    #[must_use]
-    pub fn llm(&self) -> LlmSettings {
-        self.llm
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
+    fn llm(&self) -> LlmSettings {
+        self.settings_store.llm()
     }
 
-    /// Applies new LLM settings to the next run. When a provider is set, notes written without
-    /// notes are queued for extraction, and the count is returned.
+    /// After an LLM settings edit: when a provider is set, notes written without notes are
+    /// queued for extraction, and the count is returned.
     ///
     /// # Errors
     ///
     /// Returns `PipelineError::Store` when the meetings cannot be queued.
-    pub fn replace_llm(&self, llm: LlmSettings) -> Result<usize, PipelineError> {
-        let has_provider = llm.provider.is_some();
-        *self.llm.write().unwrap_or_else(PoisonError::into_inner) = llm;
-        if !has_provider {
+    pub fn queue_missing_extractions(&self) -> Result<usize, PipelineError> {
+        if self.llm().provider().is_none() {
             return Ok(0);
         }
         let queued = self.store.schedule_missing_extractions()?;
@@ -137,15 +138,10 @@ impl Pipeline {
         Ok(queued)
     }
 
+    /// The settings that apply at launch.
     #[must_use]
     pub fn settings(&self) -> &Settings {
         &self.settings
-    }
-
-    /// The signed-in Google accounts. Changes from the settings window apply here at once.
-    #[must_use]
-    pub fn google(&self) -> &GoogleAccounts {
-        &self.google
     }
 
     #[must_use]
@@ -165,7 +161,7 @@ impl Pipeline {
             Some(stored) => serde_json::from_str(stored)?,
             None => CalendarMatch { event: None },
         };
-        Ok(self.prompt(&transcript, &calendar_match))
+        Ok(self.prompt(&transcript, &calendar_match, &self.llm()))
     }
 
     /// Runs every step after the meeting's last finished one. On failure the job is marked
@@ -202,7 +198,7 @@ impl Pipeline {
 
         let calendar_match = if meeting.finished_step < Step::Matched {
             let _span = tracing::info_span!("pipeline.match", meeting.id = %id).entered();
-            let calendar_match = self.google.match_event(&transcript)?;
+            let calendar_match = self.settings_store.google().match_event(&transcript)?;
             let title = calendar_match
                 .event
                 .as_ref()
@@ -277,8 +273,10 @@ impl Pipeline {
     ) -> Result<ExtractOutcome, PipelineError> {
         let _span =
             tracing::info_span!("pipeline.extract", meeting.id = %run.meeting().id).entered();
-        let prompt = self.prompt(transcript, calendar_match);
-        match self.extract(&prompt) {
+        // One read, so the prompt and the provider come from the same settings edit.
+        let llm = self.llm();
+        let prompt = self.prompt(transcript, calendar_match, &llm);
+        match self.extract(&llm, &prompt) {
             Ok(Some((notes, provider))) => {
                 let notes_json = serde_json::to_string(&notes)?;
                 run.record_extraction(Some(Extraction {
@@ -300,12 +298,17 @@ impl Pipeline {
         }
     }
 
-    fn prompt(&self, transcript: &Transcript, calendar_match: &CalendarMatch) -> Prompt {
+    fn prompt(
+        &self,
+        transcript: &Transcript,
+        calendar_match: &CalendarMatch,
+        llm: &LlmSettings,
+    ) -> Prompt {
         Prompt::new(
             transcript,
             self.settings.my_name.as_deref(),
             &render::attendees(transcript, calendar_match),
-            &self.llm().glossary,
+            &llm.glossary,
         )
     }
 
@@ -313,13 +316,13 @@ impl Pipeline {
     /// provider is set. The provider is built per run, so a new API key applies at once.
     fn extract(
         &self,
+        llm: &LlmSettings,
         prompt: &Prompt,
     ) -> Result<Option<(CheckedNotes, String)>, (String, ExtractionError)> {
-        let llm = self.llm();
         let Some(label) = llm.label() else {
             return Ok(None);
         };
-        let provider = Provider::from_settings(&llm, &self.app_dirs)
+        let provider = Provider::from_settings(llm, &self.app_dirs)
             .map_err(|error| (label.clone(), error))?
             .expect("a provider is set, since the settings give a label");
         let notes = provider

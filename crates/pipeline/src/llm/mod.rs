@@ -89,7 +89,7 @@ impl Provider {
         llm: &LlmSettings,
         app_dirs: &AppDirs,
     ) -> Result<Option<Self>, ExtractionError> {
-        let (Some(kind), Some(label)) = (llm.provider, llm.label()) else {
+        let (Some(kind), Some(label)) = (llm.provider(), llm.label()) else {
             return Ok(None);
         };
         let model = llm
@@ -106,8 +106,8 @@ impl Provider {
             ProviderKind::OpenaiCompatible => Backend::Api(Box::new(api::ApiClient::new(
                 api::Endpoint::OpenaiCompatible {
                     base_url: llm
-                        .base_url
-                        .clone()
+                        .base_url()
+                        .map(str::to_owned)
                         .expect("settings validation requires llm.base_url for openai-compatible"),
                 },
                 model,

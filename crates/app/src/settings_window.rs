@@ -1,14 +1,14 @@
 //! The settings window: plain HTML in `ui/`, calling the commands here. It edits the settings
-//! file. Google account and LLM changes apply at once; the rest after a restart.
+//! file through `SettingsStore`. Google account, LLM and Slack changes apply at once; the rest
+//! after a restart.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{MutexGuard, PoisonError};
 
 use pipeline::calendar::AccountStatus;
 use pipeline::google::{self, OAuthClient};
 use pipeline::llm::claude_code_auth;
-use pipeline::settings::{ProviderKind, SettingsFile, SlackSettings};
+use pipeline::settings::{ProviderKind, SettingsError, SettingsFile, SlackSettings};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt as _;
@@ -91,38 +91,46 @@ pub(crate) struct ClientFields {
 }
 
 fn account_statuses(state: &AppState, file: &SettingsFile) -> Vec<AccountStatus> {
-    match &state.pipeline {
-        Some(pipeline) => pipeline.google().statuses(),
-        // Without a running pipeline nothing has checked the accounts.
-        None => file
-            .google
-            .accounts
-            .iter()
-            .map(|email| AccountStatus {
-                email: email.clone(),
-                needs_sign_in: false,
-            })
-            .collect(),
+    if state.pipeline.is_some() {
+        return state.settings.google().statuses();
     }
-}
-
-// The window and the tray read the new account list at once; other fields wait for a restart.
-fn apply_google(app: &AppHandle, file: &SettingsFile) {
-    if let Some(pipeline) = &app.state::<AppState>().pipeline {
-        pipeline.google().replace(&file.google);
-    }
-    crate::tray::refresh(app);
-}
-
-fn lock_settings_file(state: &AppState) -> MutexGuard<'_, ()> {
-    state
-        .settings_file_lock
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+    // Without a running pipeline nothing has checked the accounts, and after a failed load the
+    // store holds none of them.
+    file.google
+        .accounts
+        .iter()
+        .map(|email| AccountStatus {
+            email: email.clone(),
+            needs_sign_in: false,
+        })
+        .collect()
 }
 
 fn non_blank(text: &str) -> Option<String> {
     Some(text.trim().to_owned()).filter(|text| !text.is_empty())
+}
+
+impl SettingsForm {
+    fn apply_to(&self, file: &mut SettingsFile) {
+        file.vault_dir = non_blank(&self.vault_dir).map(PathBuf::from);
+        file.my_name = non_blank(&self.my_name);
+        file.receiver_port = self.receiver_port;
+        file.time_zone = non_blank(&self.time_zone);
+        file.google.set_client_id(non_blank(&self.client_id));
+        if let Some(client_secret) = non_blank(&self.client_secret) {
+            file.google.client_secret = Some(client_secret);
+        }
+        file.llm
+            .set_endpoint(self.llm_provider, non_blank(&self.llm_base_url));
+        file.llm.model = non_blank(&self.llm_model);
+        if self.llm_provider.is_some_and(ProviderKind::takes_api_key)
+            && let Some(api_key) = non_blank(&self.llm_api_key)
+        {
+            file.llm.api_key = Some(api_key);
+        }
+        file.slack.read_captions = self.slack_read_captions;
+        file.slack.auto_start_captions = self.slack_auto_start_captions;
+    }
 }
 
 #[tauri::command]
@@ -131,11 +139,11 @@ fn non_blank(text: &str) -> Option<String> {
     reason = "Tauri passes command arguments by value"
 )]
 pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, String> {
-    let file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
+    let file = state.settings.read().map_err(|error| error.to_string())?;
     let llm = LlmView {
-        provider: file.llm.provider,
+        provider: file.llm.provider(),
         model: file.llm.model.clone(),
-        base_url: file.llm.base_url.clone(),
+        base_url: file.llm.base_url().map(str::to_owned),
         has_api_key: file.llm.api_key.is_some(),
         anthropic_default_model: ProviderKind::Anthropic.default_model(),
         claude_code_default_model: ProviderKind::ClaudeCode.default_model(),
@@ -153,11 +161,11 @@ pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, 
         receiver_port: file.receiver_port,
         time_zone: file.time_zone,
         has_client_secret: file.google.client_secret.is_some(),
-        client_id: file.google.client_id,
+        client_id: file.google.client_id().map(str::to_owned),
         accounts,
         llm,
         slack: file.slack,
-        settings_file: state.app_dirs.settings_file(),
+        settings_file: state.settings.app_dirs().settings_file(),
     })
 }
 
@@ -171,82 +179,29 @@ pub(crate) fn settings_save(
     state: State<'_, AppState>,
     form: SettingsForm,
 ) -> Result<String, String> {
-    let settings_file_guard = lock_settings_file(&state);
-    let mut file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
-    let old_provider = file.llm.provider;
-    let old_base_url = file.llm.base_url.clone();
-    file.vault_dir = non_blank(&form.vault_dir).map(PathBuf::from);
-    file.my_name = non_blank(&form.my_name);
-    file.receiver_port = form.receiver_port;
-    file.time_zone = non_blank(&form.time_zone);
-    let old_client_id = file.google.client_id.take();
-    file.google.client_id = non_blank(&form.client_id);
-    // Google issued the stored secret and grants to the old client, and they fail with a new one.
-    let is_new_client = file.google.client_id != old_client_id;
-    let had_client_secret = file.google.client_secret.is_some();
-    let has_new_secret = if let Some(client_secret) = non_blank(&form.client_secret) {
-        file.google.client_secret = Some(client_secret);
-        true
-    } else {
-        if is_new_client {
-            file.google.client_secret = None;
-        }
-        false
-    };
-    let is_secret_removed = is_new_client && had_client_secret && !has_new_secret;
-    let old_refresh_tokens = if is_new_client {
-        std::mem::take(&mut file.google.refresh_tokens)
-    } else {
-        BTreeMap::new()
-    };
-    file.llm.provider = form.llm_provider;
-    file.llm.model = non_blank(&form.llm_model);
-    // The window shows the base URL only for openai-compatible, the one provider that takes it.
-    file.llm.base_url = match form.llm_provider {
-        Some(ProviderKind::OpenaiCompatible) => non_blank(&form.llm_base_url),
-        Some(ProviderKind::Anthropic | ProviderKind::ClaudeCode) | None => None,
-    };
-    let takes_api_key = match form.llm_provider {
-        Some(ProviderKind::Anthropic | ProviderKind::OpenaiCompatible) => true,
-        Some(ProviderKind::ClaudeCode) | None => false,
-    };
-    // The stored key was for the old endpoint; sending it to a new host would leak it.
-    let is_new_endpoint = file.llm.provider != old_provider || file.llm.base_url != old_base_url;
-    let had_api_key = file.llm.api_key.is_some();
-    file.llm.api_key = match non_blank(&form.llm_api_key) {
-        Some(api_key) if takes_api_key => Some(api_key),
-        None if takes_api_key && !is_new_endpoint => file.llm.api_key.take(),
-        Some(_) | None => None,
-    };
-    let is_key_removed = takes_api_key && had_api_key && file.llm.api_key.is_none();
-    file.slack.read_captions = form.slack_read_captions;
-    file.slack.auto_start_captions = form.slack_auto_start_captions;
-    file.llm.validate().map_err(|error| error.to_string())?;
-    file.write(&state.app_dirs)
+    let mut has_google_accounts = false;
+    let change = state
+        .settings
+        .edit(|file| {
+            form.apply_to(file);
+            has_google_accounts = !file.google.accounts.is_empty();
+            Ok(())
+        })
         .map_err(|error| error.to_string())?;
-    // Applied under the lock, so a sign-in or removal that writes next is never overwritten here.
-    apply_google(&app, &file);
-    state.set_slack(file.slack);
-    drop(settings_file_guard);
     tracing::info!("settings saved");
-    if !old_refresh_tokens.is_empty() {
-        // The revokes are network calls; a failed one is logged and the token is gone anyway.
-        std::thread::spawn(move || {
-            for (email, refresh_token) in &old_refresh_tokens {
-                google::revoke(email, refresh_token);
-            }
-        });
-    }
+    crate::tray::refresh(&app);
+    revoke_in_background(change.tokens_to_revoke);
     let mut saved = "Saved.".to_owned();
-    if is_key_removed {
+    if change.has_dropped_llm_api_key && form.llm_provider.is_some_and(ProviderKind::takes_api_key)
+    {
         saved.push_str(" The API key for the old provider or base URL was removed; enter one for the new one if it needs one.");
     }
-    if is_secret_removed {
+    if change.has_dropped_google_client_secret {
         saved.push_str(
             " The client secret for the old Google client ID was removed; enter the new one.",
         );
     }
-    if is_new_client && !file.google.accounts.is_empty() {
+    if change.has_new_google_client && has_google_accounts {
         saved
             .push_str(" The Google client ID changed, so every Google account must sign in again.");
     }
@@ -255,12 +210,12 @@ pub(crate) fn settings_save(
             "{saved} The app is not running the pipeline; see the tray."
         ));
     };
-    // A new secret can clear "sign in again" on every account, and a new client sets it.
-    if has_new_secret || is_new_client {
-        crate::check_google_accounts(app.clone(), std::sync::Arc::clone(pipeline));
+    // A typed secret can clear "sign in again" on every account, and a new client sets it.
+    if change.has_new_google_client || non_blank(&form.client_secret).is_some() {
+        crate::check_google_accounts(app.clone());
     }
     let queued = pipeline
-        .replace_llm(file.llm.clone())
+        .queue_missing_extractions()
         .map_err(|error| error.to_string())?;
     if queued == 0 {
         return Ok(saved);
@@ -273,13 +228,25 @@ pub(crate) fn settings_save(
     ))
 }
 
+// The revokes are network calls; a failed one is logged and the token is gone anyway.
+fn revoke_in_background(tokens_to_revoke: BTreeMap<String, String>) {
+    if tokens_to_revoke.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        for (email, refresh_token) in &tokens_to_revoke {
+            google::revoke(email, refresh_token);
+        }
+    });
+}
+
 /// Who Claude Code is signed in as, and what its calls bill.
 #[tauri::command]
 pub(crate) async fn claude_code_check(app: AppHandle) -> Result<String, String> {
     // The CLI can take seconds to start.
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
+        let file = state.settings.read().map_err(|error| error.to_string())?;
         let auth =
             claude_code_auth(file.llm.claude_path.as_deref()).map_err(|error| error.to_string())?;
         let account = auth.email.as_deref().unwrap_or("an unknown account");
@@ -319,7 +286,7 @@ pub(crate) async fn google_account_add(app: AppHandle) -> Result<String, String>
 
 fn add_account(app: &AppHandle) -> Result<String, String> {
     let state = app.state::<AppState>();
-    let file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
+    let file = state.settings.read().map_err(|error| error.to_string())?;
     let client = OAuthClient::from_settings(&file.google)
         .map_err(|error| error.to_string())?
         .ok_or("save a Google client ID first")?;
@@ -333,22 +300,34 @@ fn add_account(app: &AppHandle) -> Result<String, String> {
         error.to_string()
     })?;
 
-    // Read again: the file may have changed during the minutes in the browser.
-    let _settings_file = lock_settings_file(&state);
-    let mut file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
+    // The edit reads the file again: it may have changed during the minutes in the browser.
     let email = signed_in.email;
-    if !file.google.accounts.contains(&email) {
-        file.google.accounts.push(email.clone());
+    let refresh_token = signed_in.refresh_token;
+    let edited = state.settings.edit(|file| {
+        // The token belongs to the client that signed in, and fails with any other.
+        if file.google.client_id() != Some(client.client_id.as_str()) {
+            return Err(SettingsError::GoogleClientChangedDuringSignIn);
+        }
+        if !file.google.accounts.contains(&email) {
+            file.google.accounts.push(email.clone());
+        }
+        file.google
+            .refresh_tokens
+            .insert(email.clone(), refresh_token.clone());
+        Ok(())
+    });
+    match edited {
+        // A sign-in adds a token and drops none, so nothing needs a revoke.
+        Ok(_sign_in_change) => {}
+        Err(error) => {
+            // No stored token shares the grant: the client change dropped them all.
+            if let SettingsError::GoogleClientChangedDuringSignIn = error {
+                google::revoke(&email, &refresh_token);
+            }
+            return Err(error.to_string());
+        }
     }
-    file.google
-        .refresh_tokens
-        .insert(email.clone(), signed_in.refresh_token);
-    file.write(&state.app_dirs)
-        .map_err(|error| error.to_string())?;
-    if let Some(pipeline) = &state.pipeline {
-        pipeline.google().replace(&file.google);
-        pipeline.google().signed_in(&email);
-    }
+    state.settings.google().signed_in(&email);
     crate::tray::refresh(app);
     Ok(email)
 }
@@ -363,19 +342,18 @@ pub(crate) async fn google_account_remove(app: AppHandle, email: String) -> Resu
 
 fn remove_account(app: &AppHandle, email: &str) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
-    if let Some(refresh_token) = file.google.refresh_tokens.get(email) {
+    let change = state
+        .settings
+        .edit(|file| {
+            file.google.accounts.retain(|account| account != email);
+            file.google.refresh_tokens.remove(email);
+            Ok(())
+        })
+        .map_err(|error| error.to_string())?;
+    crate::tray::refresh(app);
+    tracing::info!(user.email = email, "Google account removed");
+    for (email, refresh_token) in &change.tokens_to_revoke {
         google::revoke(email, refresh_token);
     }
-    // Read again: the file may have changed during the revoke.
-    let _settings_file = lock_settings_file(&state);
-    let mut file = SettingsFile::read(&state.app_dirs).map_err(|error| error.to_string())?;
-    file.google.accounts.retain(|account| account != email);
-    file.google.refresh_tokens.remove(email);
-    file.write(&state.app_dirs)
-        .map_err(|error| error.to_string())?;
-    // Applied under the lock, so a sign-in or save that writes next is never overwritten here.
-    apply_google(app, &file);
-    tracing::info!(user.email = email, "Google account removed");
     Ok(())
 }

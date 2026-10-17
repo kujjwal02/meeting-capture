@@ -57,7 +57,10 @@ async fn receive(app: AppHandle, pipeline: Arc<Pipeline>, port: u16) {
 
 fn payload_dir(app: &AppHandle) -> std::path::PathBuf {
     use tauri::Manager as _;
-    app.state::<crate::AppState>().app_dirs.payload_dir()
+    app.state::<crate::AppState>()
+        .settings
+        .app_dirs()
+        .payload_dir()
 }
 
 fn record_and_run(app: &AppHandle, pipeline: &Pipeline, captions: ReceivedCaptions) {

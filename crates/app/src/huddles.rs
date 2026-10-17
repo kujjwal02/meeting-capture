@@ -26,8 +26,8 @@ pub(crate) enum HuddleStatus {
 pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
     let state = app.state::<AppState>();
     let paths = WatchPaths {
-        log_dir: state.app_dirs.huddle_log_dir(),
-        layout_override_dir: state.app_dirs.slack_layout_dir(),
+        log_dir: state.settings.app_dirs().huddle_log_dir(),
+        layout_override_dir: state.settings.app_dirs().slack_layout_dir(),
     };
     // Before the watcher starts, so it cannot touch a log the watcher is writing.
     match huddle_captions::finish_open_logs(&paths.log_dir) {
@@ -41,7 +41,7 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
     }
     let settings_app = app.clone();
     let settings = move || {
-        let slack = settings_app.state::<AppState>().slack();
+        let slack = settings_app.state::<AppState>().settings.slack();
         WatchSettings {
             read_captions: slack.read_captions,
             auto_start_captions: slack.auto_start_captions,
@@ -139,7 +139,7 @@ impl Reporter {
 fn record_and_run(app: &AppHandle, pipeline: &Pipeline, log_path: &Path) {
     let _span = tracing::info_span!("huddle.record", file.path = %log_path.display()).entered();
     // Read for each huddle, so a new setting applies to the next one without a restart.
-    let min_huddle_seconds = app.state::<AppState>().slack().min_huddle_seconds;
+    let min_huddle_seconds = app.state::<AppState>().settings.slack().min_huddle_seconds;
     let taken_in = pipeline.take_in_huddle_log_unless_short(log_path, min_huddle_seconds);
     match taken_in {
         Ok(Intake::Recorded(id)) => {
