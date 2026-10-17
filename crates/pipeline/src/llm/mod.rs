@@ -90,7 +90,7 @@ impl Provider {
     ///
     /// # Panics
     ///
-    /// Panics when `llm` skipped settings validation and lacks a model or base URL the provider
+    /// Panics when `llm` skipped settings validation and lacks the base URL `openai-compatible`
     /// needs.
     ///
     /// # Errors
@@ -101,15 +101,14 @@ impl Provider {
         keychain: &Keychain,
         app_dirs: &AppDirs,
     ) -> Result<Option<Self>, ExtractionError> {
-        let Some(kind) = llm.provider else {
+        let (Some(kind), Some(label)) = (llm.provider, llm.label()) else {
             return Ok(None);
         };
         let model = llm
             .model
             .clone()
             .or_else(|| kind.default_model().map(str::to_owned))
-            .expect("settings validation requires a model when the provider has no default");
-        let label = format!("{}/{model}", kind.as_str());
+            .unwrap_or_default();
         let backend = match kind {
             ProviderKind::Anthropic => Backend::Api(Box::new(api::ApiClient::new(
                 api::Endpoint::Anthropic,

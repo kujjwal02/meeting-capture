@@ -13,15 +13,18 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
+use jiff::Timestamp;
 use jobs::{
-    InputKind, JobStore, LeaseRelease, Meeting, MeetingId, NotePathClaim, RunLease, Step,
-    StoreError,
+    Extraction, ExtractionFailure, InputKind, JobStore, LeaseRelease, Meeting, MeetingId,
+    NotePathClaim, RunLease, Step, StoreError,
 };
 use sources::Transcript;
 
 use crate::calendar::{CalendarMatch, GoogleAccounts};
-use crate::extraction::Prompt;
-use crate::google::{GoogleError, Keychain};
+use crate::extraction::{CheckedNotes, Prompt};
+use crate::google::GoogleError;
+use crate::keychain::Keychain;
+use crate::llm::{ExtractionError, Provider};
 use crate::note::NoteInput;
 use crate::settings::{AppDirs, Settings};
 
@@ -73,23 +76,33 @@ pub enum RunOutcome {
 // Longer than any step should take, LLM call included.
 const MAX_RUN_TIME: Duration = Duration::from_mins(15);
 
+// After each failed extraction, the next try waits this long. A failure after the last one fails
+// the meeting. Spaced to outlast a rate-limit window or a laptop that went offline.
+const EXTRACTION_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_mins(5),
+    Duration::from_mins(30),
+    Duration::from_hours(2),
+];
+
 pub struct Pipeline {
     app_dirs: AppDirs,
     settings: Settings,
     store: JobStore,
     google: GoogleAccounts,
+    keychain: Keychain,
 }
 
 impl Pipeline {
     #[must_use]
     pub fn new(app_dirs: AppDirs, settings: Settings, store: JobStore) -> Self {
-        let google =
-            GoogleAccounts::new(Keychain::new(app_dirs.keychain_service()), &settings.google);
+        let keychain = Keychain::new(app_dirs.keychain_service());
+        let google = GoogleAccounts::new(keychain.clone(), &settings.google);
         Self {
             app_dirs,
             settings,
             store,
             google,
+            keychain,
         }
     }
 
@@ -117,21 +130,11 @@ impl Pipeline {
     pub fn extraction_prompt(&self, id: MeetingId) -> Result<Prompt, PipelineError> {
         let meeting = self.store.get(id)?;
         let transcript = load_transcript(&meeting)?;
-        let calendar_match: Option<CalendarMatch> = meeting
-            .calendar_match_json
-            .as_deref()
-            .map(serde_json::from_str)
-            .transpose()?;
-        let attendees = calendar_match
-            .and_then(|calendar_match| calendar_match.event)
-            .map(|event| event.attendees)
-            .unwrap_or_default();
-        Ok(Prompt::new(
-            &transcript,
-            self.settings.my_name.as_deref(),
-            &attendees,
-            &self.settings.llm.glossary,
-        ))
+        let calendar_match: CalendarMatch = match meeting.calendar_match_json.as_deref() {
+            Some(stored) => serde_json::from_str(stored)?,
+            None => CalendarMatch { event: None },
+        };
+        Ok(self.prompt(&transcript, &calendar_match))
     }
 
     /// Records a TranscripTonic payload that is already saved at `payload_path`. A re-post of a
@@ -293,24 +296,31 @@ impl Pipeline {
             serde_json::from_str(stored)?
         };
 
-        let is_extracted = if meeting.finished_step < Step::Extracted {
-            let _span = tracing::info_span!("pipeline.extract", meeting.id = %id).entered();
-            // LLM extraction arrives in build step 5. The note goes out tagged
-            // status/needs-extraction meanwhile.
-            self.store.record_extraction(lease, revision, None)?;
-            tracing::info!(is_extracted = false, "extraction skipped");
-            false
+        // A written meeting is extracted again when a retry is due, or on a manual retry after
+        // extraction failed for good.
+        let needs_extraction = meeting.finished_step < Step::Extracted
+            || meeting.next_extraction_at.is_some()
+            || (meeting.failure.is_some() && meeting.extraction_error.is_some());
+        let extraction = if needs_extraction {
+            self.extract_step(lease, revision, &transcript, &calendar_match)?
         } else {
-            meeting.extraction_json.is_some()
+            match meeting.extraction_json.as_deref() {
+                Some(stored) => ExtractOutcome::Notes(serde_json::from_str(stored)?),
+                None => ExtractOutcome::NoNotes,
+            }
+        };
+        let notes = match &extraction {
+            ExtractOutcome::Notes(notes) => Some(notes),
+            ExtractOutcome::NoNotes | ExtractOutcome::Failed { .. } => None,
         };
 
-        if meeting.finished_step < Step::Written {
+        if meeting.finished_step < Step::Written || needs_extraction {
             let _span = tracing::info_span!("pipeline.write", meeting.id = %id).entered();
             let note = NoteInput {
                 meeting_id: id,
                 transcript: &transcript,
                 calendar_match: &calendar_match,
-                is_extracted,
+                notes,
                 my_name: self.settings.my_name.as_deref(),
                 time_zone: &self.settings.time_zone,
             };
@@ -336,7 +346,113 @@ impl Pipeline {
             self.store.mark_written(lease, revision, &note_sha256)?;
             tracing::info!(file.path = %note_path.display(), "note written");
         }
+
+        if let ExtractOutcome::Failed { provider, error } = &extraction {
+            self.schedule_extraction_retry(lease, meeting, provider, error)?;
+        }
         Ok(())
+    }
+
+    // Runs the LLM and records the notes. A failure is returned, not recorded: the note is
+    // written first, so the transcript reaches the vault either way.
+    fn extract_step(
+        &self,
+        lease: &RunLease,
+        revision: i64,
+        transcript: &Transcript,
+        calendar_match: &CalendarMatch,
+    ) -> Result<ExtractOutcome, PipelineError> {
+        let _span =
+            tracing::info_span!("pipeline.extract", meeting.id = %lease.meeting_id()).entered();
+        let prompt = self.prompt(transcript, calendar_match);
+        match self.extract(&prompt) {
+            Ok(Some((notes, provider))) => {
+                let notes_json = serde_json::to_string(&notes)?;
+                self.store.record_extraction(
+                    lease,
+                    revision,
+                    Some(Extraction {
+                        notes_json: &notes_json,
+                        provider: &provider,
+                    }),
+                )?;
+                tracing::info!(gen_ai.request.model = %provider, "extraction done");
+                Ok(ExtractOutcome::Notes(notes))
+            }
+            Ok(None) => {
+                self.store.record_extraction(lease, revision, None)?;
+                tracing::info!("no LLM provider is set; the note gets the transcript only");
+                Ok(ExtractOutcome::NoNotes)
+            }
+            Err((provider, error)) => {
+                tracing::warn!(exception.message = %error, "extraction failed");
+                Ok(ExtractOutcome::Failed { provider, error })
+            }
+        }
+    }
+
+    fn schedule_extraction_retry(
+        &self,
+        lease: &RunLease,
+        meeting: &Meeting,
+        provider: &str,
+        error: &ExtractionError,
+    ) -> Result<(), PipelineError> {
+        // A manual retry after the last failure starts the count again.
+        let attempts = match meeting.failure {
+            Some(_) => 1,
+            None => meeting.extraction_attempts + 1,
+        };
+        // A missing key or CLI, a refused sign-in or a reply over the output cap fails the
+        // same way every time, so it fails the meeting at once and the tray says why.
+        let retry_at = if error.is_lasting() {
+            None
+        } else {
+            extraction_retry_delay(attempts).map(|delay| Timestamp::now() + delay)
+        };
+        self.store.record_extraction_failure(
+            lease,
+            meeting.input_revision,
+            ExtractionFailure {
+                provider,
+                error: &error.to_string(),
+                attempts,
+                retry_at,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn prompt(&self, transcript: &Transcript, calendar_match: &CalendarMatch) -> Prompt {
+        let attendees = calendar_match
+            .event
+            .as_ref()
+            .map(|event| event.attendees.as_slice())
+            .unwrap_or_default();
+        Prompt::new(
+            transcript,
+            self.settings.my_name.as_deref(),
+            attendees,
+            &self.settings.llm.glossary,
+        )
+    }
+
+    /// The checked notes and the `<provider>/<model>` that wrote them, or `None` when no
+    /// provider is set. The provider is built per run, so a new API key applies at once.
+    fn extract(
+        &self,
+        prompt: &Prompt,
+    ) -> Result<Option<(CheckedNotes, String)>, (String, ExtractionError)> {
+        let Some(label) = self.settings.llm.label() else {
+            return Ok(None);
+        };
+        let provider = Provider::from_settings(&self.settings.llm, &self.keychain, &self.app_dirs)
+            .map_err(|error| (label.clone(), error))?
+            .expect("a provider is set, since the settings give a label");
+        let notes = provider
+            .extract(prompt)
+            .map_err(|error| (label.clone(), error))?;
+        Ok(Some((notes, label)))
     }
 
     // Claimed before the write, so a crash between the write and mark_written rewrites this note
@@ -359,6 +475,16 @@ impl Pipeline {
         }
         Err(PipelineError::NoteNameTaken)
     }
+}
+
+enum ExtractOutcome {
+    Notes(CheckedNotes),
+    /// No provider is set, or a stored run had none.
+    NoNotes,
+    Failed {
+        provider: String,
+        error: ExtractionError,
+    },
 }
 
 // Gives the lease back however the run ends, a panic included, so a tray thread that dies does
@@ -432,4 +558,16 @@ fn load_transcript(meeting: &Meeting) -> Result<Transcript, PipelineError> {
     match meeting.input_kind {
         InputKind::TranscriptonicPayload => Ok(sources::transcriptonic::parse(&input)?),
     }
+}
+
+// `MEETING_CAPTURE_RETRY_DELAY_S` replaces every delay, so a dev run sees the whole schedule in
+// minutes.
+fn extraction_retry_delay(attempts: u32) -> Option<Duration> {
+    let index = usize::try_from(attempts).ok()?.checked_sub(1)?;
+    let delay = *EXTRACTION_RETRY_DELAYS.get(index)?;
+    let dev_delay = std::env::var("MEETING_CAPTURE_RETRY_DELAY_S")
+        .ok()
+        .and_then(|seconds| seconds.parse().ok())
+        .map(Duration::from_secs);
+    Some(dev_delay.unwrap_or(delay))
 }

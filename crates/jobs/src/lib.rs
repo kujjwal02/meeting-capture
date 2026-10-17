@@ -74,6 +74,8 @@ pub enum JobState {
     Matched,
     Extracted,
     Written,
+    /// Written without notes; an extraction retry is scheduled.
+    ExtractionPending,
     Failed,
 }
 
@@ -85,6 +87,7 @@ impl JobState {
             JobState::Matched => "Matched",
             JobState::Extracted => "Extracted",
             JobState::Written => "Written",
+            JobState::ExtractionPending => "Extraction pending",
             JobState::Failed => "Failed",
         }
     }
@@ -124,6 +127,14 @@ pub struct Meeting {
     pub retry_count: u32,
     pub calendar_match_json: Option<String>,
     pub extraction_json: Option<String>,
+    /// `<provider>/<model>` of the last extraction tried.
+    pub extraction_provider: Option<String>,
+    /// Failed extraction attempts since the last success or manual retry.
+    pub extraction_attempts: u32,
+    /// The last extraction failure. The note was written without notes.
+    pub extraction_error: Option<String>,
+    /// When set, an extraction is owed and the sweep runs it from this time.
+    pub next_extraction_at: Option<Timestamp>,
     /// Chosen before the first write, so a rerun after a crash rewrites the same note.
     pub note_path: Option<PathBuf>,
     /// SHA-256 of the note as the pipeline last wrote it. Other contents on disk mean the user
@@ -142,6 +153,9 @@ impl Meeting {
         if self.failure.is_some() {
             return JobState::Failed;
         }
+        if self.next_extraction_at.is_some() {
+            return JobState::ExtractionPending;
+        }
         match self.finished_step {
             Step::Captured => JobState::Captured,
             Step::Matched => JobState::Matched,
@@ -149,6 +163,25 @@ impl Meeting {
             Step::Written => JobState::Written,
         }
     }
+}
+
+/// A successful extraction, as stored.
+#[derive(Debug, Clone, Copy)]
+pub struct Extraction<'a> {
+    pub notes_json: &'a str,
+    /// `<provider>/<model>`.
+    pub provider: &'a str,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ExtractionFailure<'a> {
+    /// `<provider>/<model>`, or the provider alone when it could not be set up.
+    pub provider: &'a str,
+    pub error: &'a str,
+    /// Failed attempts so far, this one included.
+    pub attempts: u32,
+    /// `None` gives up: the meeting fails.
+    pub retry_at: Option<Timestamp>,
 }
 
 /// Proof that this process runs the pipeline for one meeting. A clone lets a second thread keep
@@ -219,8 +252,9 @@ const LEASE_EXPIRY_MS: i64 = LEASE_EXPIRY.as_millis() as i64;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
-const MIGRATIONS: &[M<'static>] = &[M::up(
-    "CREATE TABLE meetings (
+const MIGRATIONS: &[M<'static>] = &[
+    M::up(
+        "CREATE TABLE meetings (
         id INTEGER PRIMARY KEY,
         input_kind TEXT NOT NULL,
         input_path TEXT NOT NULL,
@@ -243,10 +277,20 @@ const MIGRATIONS: &[M<'static>] = &[M::up(
     CREATE UNIQUE INDEX meetings_input_started_at ON meetings (input_kind, started_at);
     CREATE INDEX meetings_started_at ON meetings (started_at);
     CREATE UNIQUE INDEX meetings_note_path ON meetings (note_path);",
-)];
+    ),
+    // Existing rows read as "no extraction tried yet". Times are UTC milliseconds, which sort as
+    // numbers; RFC 3339 text with varying fractions does not.
+    M::up(
+        "ALTER TABLE meetings ADD COLUMN extraction_provider TEXT;
+    ALTER TABLE meetings ADD COLUMN extraction_attempts INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE meetings ADD COLUMN extraction_error TEXT;
+    ALTER TABLE meetings ADD COLUMN next_extraction_at_ms INTEGER;",
+    ),
+];
 
 const MEETING_COLUMNS: &str = "id, input_kind, input_path, input_revision, started_at, title, \
-    finished_step, failure, retry_count, calendar_match_json, extraction_json, note_path, \
+    finished_step, failure, retry_count, calendar_match_json, extraction_json, \
+    extraction_provider, extraction_attempts, extraction_error, next_extraction_at_ms, note_path, \
     note_sha256, pending_note_sha256s, created_at, updated_at";
 
 /// The job store. Safe to share between threads; each call holds the connection briefly.
@@ -315,6 +359,10 @@ impl JobStore {
                 failure = NULL,
                 calendar_match_json = NULL,
                 extraction_json = NULL,
+                extraction_provider = NULL,
+                extraction_attempts = 0,
+                extraction_error = NULL,
+                next_extraction_at_ms = NULL,
                 updated_at = excluded.updated_at
              RETURNING id",
             params![
@@ -358,8 +406,9 @@ impl JobStore {
         rows.map(|row| row?).collect()
     }
 
-    /// Meetings that stopped before their note was written without a recorded failure: the app
-    /// quit or crashed mid-run, or a capture arrived while it was down. Oldest first.
+    /// Meetings to run again, oldest first: those that stopped before their note was written
+    /// without a recorded failure (the app quit or crashed mid-run, or a capture arrived while it
+    /// was down), and written ones whose extraction retry is due.
     ///
     /// # Errors
     ///
@@ -368,9 +417,14 @@ impl JobStore {
         let connection = self.connection();
         let mut statement = connection.prepare(&format!(
             "SELECT {MEETING_COLUMNS} FROM meetings
-             WHERE finished_step != ?1 AND failure IS NULL ORDER BY started_at"
+             WHERE failure IS NULL
+                AND (finished_step != ?1 OR next_extraction_at_ms <= ?2)
+             ORDER BY started_at"
         ))?;
-        let rows = statement.query_map([Step::Written.as_str()], read_meeting)?;
+        let rows = statement.query_map(
+            params![Step::Written.as_str(), Timestamp::now().as_millisecond()],
+            read_meeting,
+        )?;
         rows.map(|row| row?).collect()
     }
 
@@ -483,6 +537,8 @@ impl JobStore {
         let updated = self.connection().execute(
             "UPDATE meetings SET finished_step = ?2, input_revision = input_revision + 1,
                 failure = NULL, calendar_match_json = NULL, extraction_json = NULL,
+                extraction_provider = NULL, extraction_attempts = 0, extraction_error = NULL,
+                next_extraction_at_ms = NULL,
                 note_sha256 = CASE WHEN ?3 THEN NULL ELSE note_sha256 END,
                 pending_note_sha256s = CASE WHEN ?3 THEN NULL ELSE pending_note_sha256s END,
                 updated_at = ?4
@@ -520,8 +576,8 @@ impl JobStore {
         )
     }
 
-    /// Records the extraction step as done. `None` means extraction failed and the note carries
-    /// only the transcript.
+    /// Records the extraction step as done. With `extraction` as `None`, no provider is set and
+    /// the note carries only the transcript; nothing is retried.
     ///
     /// # Errors
     ///
@@ -530,14 +586,69 @@ impl JobStore {
         &self,
         lease: &RunLease,
         input_revision: i64,
-        extraction_json: Option<&str>,
+        extraction: Option<Extraction<'_>>,
     ) -> Result<(), StoreError> {
+        let (extraction_json, provider) = match extraction {
+            Some(extraction) => (Some(extraction.notes_json), Some(extraction.provider)),
+            None => (None, None),
+        };
         self.update_leased(
             lease,
             input_revision,
-            "finished_step = ?6, extraction_json = ?7, failure = NULL",
-            &[&Step::Extracted.as_str(), &extraction_json],
+            "finished_step = ?6, extraction_json = ?7, extraction_provider = ?8,
+                extraction_attempts = 0, extraction_error = NULL, next_extraction_at_ms = NULL,
+                failure = NULL",
+            &[&Step::Extracted.as_str(), &extraction_json, &provider],
         )
+    }
+
+    /// Records a failed extraction once the note is written without notes. With `retry_at`, the
+    /// sweep tries again from then; without, the meeting fails with `error`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
+    pub fn record_extraction_failure(
+        &self,
+        lease: &RunLease,
+        input_revision: i64,
+        failure: ExtractionFailure<'_>,
+    ) -> Result<(), StoreError> {
+        let retry_at_ms = failure.retry_at.map(Timestamp::as_millisecond);
+        self.update_leased(
+            lease,
+            input_revision,
+            "extraction_provider = ?6, extraction_attempts = ?7, extraction_error = ?8,
+                next_extraction_at_ms = ?9,
+                failure = CASE WHEN ?9 IS NULL THEN ?8 ELSE NULL END",
+            &[
+                &failure.provider,
+                &failure.attempts,
+                &failure.error,
+                &retry_at_ms,
+            ],
+        )
+    }
+
+    /// Schedules an extraction now for every written meeting that has none and no failure, such
+    /// as notes written while no provider was set. Returns how many were scheduled.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError` when the write fails.
+    pub fn schedule_missing_extractions(&self) -> Result<usize, StoreError> {
+        let now = Timestamp::now();
+        Ok(self.connection().execute(
+            "UPDATE meetings SET next_extraction_at_ms = ?2, extraction_attempts = 0,
+                updated_at = ?3
+             WHERE finished_step = ?1 AND extraction_json IS NULL AND failure IS NULL
+                AND next_extraction_at_ms IS NULL",
+            params![
+                Step::Written.as_str(),
+                now.as_millisecond(),
+                now.to_string()
+            ],
+        )?)
     }
 
     /// Gives `note_path` to the meeting. The unique index makes the check and the claim one step,
@@ -731,6 +842,10 @@ fn read_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting, StoreError>> 
     let failure: Option<String> = row.get("failure")?;
     let calendar_match_json: Option<String> = row.get("calendar_match_json")?;
     let extraction_json: Option<String> = row.get("extraction_json")?;
+    let extraction_provider: Option<String> = row.get("extraction_provider")?;
+    let extraction_attempts: i64 = row.get("extraction_attempts")?;
+    let extraction_error: Option<String> = row.get("extraction_error")?;
+    let next_extraction_at_ms: Option<i64> = row.get("next_extraction_at_ms")?;
     let note_path: Option<String> = row.get("note_path")?;
     let note_sha256: Option<String> = row.get("note_sha256")?;
     let pending_note_sha256s: Option<String> = row.get("pending_note_sha256s")?;
@@ -763,6 +878,26 @@ fn read_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting, StoreError>> 
                 .map_err(|_| invalid("retry_count", retry_count.to_string(), "0 to 4294967295"))?,
             calendar_match_json,
             extraction_json,
+            extraction_provider,
+            extraction_attempts: u32::try_from(extraction_attempts).map_err(|_| {
+                invalid(
+                    "extraction_attempts",
+                    extraction_attempts.to_string(),
+                    "0 to 4294967295",
+                )
+            })?,
+            extraction_error,
+            next_extraction_at: next_extraction_at_ms
+                .map(|ms| {
+                    Timestamp::from_millisecond(ms).map_err(|_| {
+                        invalid(
+                            "next_extraction_at_ms",
+                            ms.to_string(),
+                            "UTC milliseconds since 1970",
+                        )
+                    })
+                })
+                .transpose()?,
             note_path: note_path.map(PathBuf::from),
             note_sha256,
             pending_note_sha256s: pending_note_sha256s

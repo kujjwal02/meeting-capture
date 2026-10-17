@@ -11,6 +11,7 @@ use sources::{SpeakerNaming, Transcript};
 
 use crate::PipelineError;
 use crate::calendar::CalendarMatch;
+use crate::extraction::CheckedNotes;
 
 const BUILT_IN_TEMPLATE: &str = include_str!("note.md.j2");
 const UNTITLED_CALL: &str = "Untitled call";
@@ -20,7 +21,8 @@ pub(crate) struct NoteInput<'a> {
     pub meeting_id: MeetingId,
     pub transcript: &'a Transcript,
     pub calendar_match: &'a CalendarMatch,
-    pub is_extracted: bool,
+    /// `None` when no notes were extracted; the note then carries only the transcript.
+    pub notes: Option<&'a CheckedNotes>,
     pub my_name: Option<&'a str>,
     pub time_zone: &'a TimeZone,
 }
@@ -183,7 +185,7 @@ fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String
     let transcript = note.transcript;
     let started_at = transcript.started_at.to_zoned(note.time_zone.clone());
     let mut tags = vec!["area/meetings", "topic/transcript", "status/active"];
-    if !note.is_extracted {
+    if note.notes.is_none() {
         tags.push(NEEDS_EXTRACTION_TAG);
     }
     let frontmatter = Frontmatter {

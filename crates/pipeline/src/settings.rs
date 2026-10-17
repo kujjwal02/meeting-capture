@@ -440,6 +440,14 @@ impl Settings {
 const MAX_GLOSSARY_ENTRIES: usize = 100;
 
 impl LlmSettings {
+    /// `<provider>/<model>`, or `None` when extraction is off.
+    #[must_use]
+    pub fn label(&self) -> Option<String> {
+        let provider = self.provider?;
+        let model = self.model.as_deref().or(provider.default_model())?;
+        Some(format!("{}/{model}", provider.as_str()))
+    }
+
     /// # Errors
     ///
     /// Returns `SettingsError` naming the first invalid `llm` field.

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use jiff::tz::TimeZone;
-use jobs::{JobStore, Meeting, MeetingId};
+use jobs::{JobState, JobStore, Meeting, MeetingId};
 use pipeline::extraction::{self, CheckedNotes, Prompt};
 use pipeline::keychain::Keychain;
 use pipeline::llm::Provider;
@@ -53,6 +53,8 @@ enum Command {
         #[arg(value_enum)]
         provider: ApiKeyProviderArg,
     },
+    /// Run every meeting the tray's sweep would: unfinished ones and due extraction retries.
+    Sweep,
     /// Show the most recent meetings.
     List {
         #[arg(long, default_value_t = 10)]
@@ -132,6 +134,14 @@ fn main() -> anyhow::Result<()> {
             anyhow::ensure!(!api_key.is_empty(), "stdin held no key");
             Keychain::new(app_dirs.keychain_service()).set_llm_api_key(provider.into(), api_key)?;
             println!("saved");
+        }
+        Command::Sweep => {
+            for meeting in pipeline.store().unfinished()? {
+                match pipeline.run(meeting.id) {
+                    Ok(outcome) => print_outcome(&outcome, &time_zone),
+                    Err(error) => println!("{:>4}  run stopped: {error}", meeting.id),
+                }
+            }
         }
         Command::List { limit } => {
             for meeting in pipeline.store().recent(limit)? {
@@ -226,6 +236,17 @@ fn print_meeting(meeting: &Meeting, time_zone: &TimeZone) {
     );
     if let Some(failure) = &meeting.failure {
         println!("      failed: {failure}");
+    }
+    if let (JobState::ExtractionPending, Some(retry_at), Some(error)) = (
+        meeting.state(),
+        meeting.next_extraction_at,
+        &meeting.extraction_error,
+    ) {
+        let retry_at = retry_at.to_zoned(time_zone.clone()).strftime("%H:%M %Z");
+        println!(
+            "      extraction failed {} times, next try at {retry_at}: {error}",
+            meeting.extraction_attempts
+        );
     }
     if let Some(note_path) = &meeting.note_path {
         println!("      note: {}", note_path.display());
