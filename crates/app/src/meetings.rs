@@ -1,13 +1,12 @@
 //! Turns received captions into jobs and runs the pipeline for them, off the async runtime.
 
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use caption_receiver::ReceivedCaptions;
 use jobs::{InputKind, JobState, Meeting, MeetingId, RunOutcome};
-use pipeline::Pipeline;
+use pipeline::{Pipeline, PipelineError};
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt as _;
 use tokio::net::TcpListener;
@@ -18,8 +17,6 @@ use crate::{Listener, set_listener};
 // Picks up meetings a crash, a quit or a store error left unfinished. A dead process's lease
 // expires after the jobs lease expiry, so a sweep soon after launch can still find one held.
 const SWEEP_INTERVAL: Duration = Duration::from_mins(5);
-// Two, so one slow run does not hold up the rest, and few enough LLM calls for a rate limit.
-const SWEEP_WORKERS: usize = 2;
 
 pub(crate) fn start(app: AppHandle, pipeline: Arc<Pipeline>, port: u16) {
     tauri::async_runtime::spawn(sweep_unfinished(app.clone(), Arc::clone(&pipeline)));
@@ -81,10 +78,19 @@ fn record_and_run(app: &AppHandle, pipeline: &Pipeline, captions: ReceivedCaptio
 
 // Blocks until the run ends, so callers keep it off the async runtime.
 pub(crate) fn run(app: &AppHandle, pipeline: &Pipeline, id: MeetingId) {
-    match pipeline.run(id) {
+    report_run(app, pipeline, id, &pipeline.run(id));
+}
+
+fn report_run(
+    app: &AppHandle,
+    pipeline: &Pipeline,
+    id: MeetingId,
+    outcome: &Result<RunOutcome, PipelineError>,
+) {
+    match outcome {
         Ok(RunOutcome::Finished(meeting)) => {
             tracing::info!(meeting.id = %id, meeting.state = meeting.state().label(), "run finished");
-            notify_outcome(app, pipeline, &meeting);
+            notify_outcome(app, pipeline, meeting);
         }
         Ok(RunOutcome::AlreadyRunning) => {}
         // Step failures are logged and recorded by the pipeline; this covers store errors too.
@@ -151,15 +157,9 @@ fn notify_outcome(app: &AppHandle, pipeline: &Pipeline, meeting: &Meeting) {
 }
 
 pub(crate) fn retry_failed(app: &AppHandle, pipeline: &Pipeline) {
-    match pipeline.store().failed() {
-        Ok(failed) => {
-            for meeting in failed {
-                run(app, pipeline, meeting.id);
-            }
-        }
-        Err(error) => {
-            tracing::error!(exception.message = %error, "could not list failed meetings");
-        }
+    if let Err(error) = pipeline.retry_failed(|id, outcome| report_run(app, pipeline, id, outcome))
+    {
+        tracing::error!(exception.message = %error, "could not list failed meetings");
     }
 }
 
@@ -177,37 +177,8 @@ async fn sweep_unfinished(app: AppHandle, pipeline: Arc<Pipeline>) {
     }
 }
 
-// Runs every unfinished meeting and due extraction retry on `SWEEP_WORKERS` threads. Saving a
-// provider can queue every old note at once, and that many LLM calls in parallel would hit the
-// rate limit together and then retry together. A sweep that finds the last one still running
-// returns; the next tick picks up what is left.
 fn sweep(app: &AppHandle, pipeline: &Pipeline) {
-    static IS_SWEEPING: AtomicBool = AtomicBool::new(false);
-    if IS_SWEEPING.swap(true, Ordering::AcqRel) {
-        tracing::info!("the last sweep is still running; skipping this one");
-        return;
+    if let Err(error) = pipeline.sweep(|id, outcome| report_run(app, pipeline, id, outcome)) {
+        tracing::error!(exception.message = %error, "could not list unfinished meetings");
     }
-    let unfinished = match pipeline.store().unfinished() {
-        Ok(unfinished) => unfinished,
-        Err(error) => {
-            tracing::error!(exception.message = %error, "could not list unfinished meetings");
-            IS_SWEEPING.store(false, Ordering::Release);
-            return;
-        }
-    };
-    let queue = Mutex::new(unfinished.into_iter().map(|meeting| meeting.id));
-    std::thread::scope(|scope| {
-        for _ in 0..SWEEP_WORKERS {
-            scope.spawn(|| {
-                loop {
-                    let next = queue.lock().unwrap_or_else(PoisonError::into_inner).next();
-                    let Some(id) = next else {
-                        return;
-                    };
-                    run(app, pipeline, id);
-                }
-            });
-        }
-    });
-    IS_SWEEPING.store(false, Ordering::Release);
 }

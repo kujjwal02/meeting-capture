@@ -78,19 +78,18 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Ingest { input_file, kind } => {
             let id = pipeline.take_in(kind.into(), &input_file)?;
-            print_outcome(&pipeline.run(id)?, &time_zone);
+            print_outcome(id, &pipeline.run(id)?, &time_zone);
         }
         Command::Reprocess {
             meeting_id,
             discard_edits,
         } => {
-            print_outcome(
-                &pipeline.reprocess(MeetingId::new(meeting_id), discard_edits)?,
-                &time_zone,
-            );
+            let id = MeetingId::new(meeting_id);
+            print_outcome(id, &pipeline.reprocess(id, discard_edits)?, &time_zone);
         }
         Command::Retry { meeting_id } => {
-            print_outcome(&pipeline.run(MeetingId::new(meeting_id))?, &time_zone);
+            let id = MeetingId::new(meeting_id);
+            print_outcome(id, &pipeline.run(id)?, &time_zone);
         }
         Command::Extract {
             meeting_id,
@@ -123,12 +122,14 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string_pretty(&checked)?);
         }
         Command::Sweep => {
-            for meeting in pipeline.store().unfinished()? {
-                match pipeline.run(meeting.id) {
-                    Ok(outcome) => print_outcome(&outcome, &time_zone),
-                    Err(error) => println!("{:>4}  run stopped: {error}", meeting.id),
+            pipeline.sweep(|id, outcome| {
+                // Held across the lines of one meeting, so two workers do not mix their lines.
+                let _stdout = std::io::stdout().lock();
+                match outcome {
+                    Ok(outcome) => print_outcome(id, outcome, &time_zone),
+                    Err(error) => println!("{id:>4}  run stopped: {error}"),
                 }
-            }
+            })?;
         }
         Command::List { limit } => {
             for meeting in pipeline.store().recent(limit)? {
@@ -192,11 +193,13 @@ impl From<ProviderArg> for ProviderKind {
     }
 }
 
-fn print_outcome(outcome: &RunOutcome, time_zone: &TimeZone) {
+fn print_outcome(id: MeetingId, outcome: &RunOutcome, time_zone: &TimeZone) {
     match outcome {
         RunOutcome::Finished(meeting) => print_meeting(meeting, time_zone),
         RunOutcome::AlreadyRunning => {
-            println!("another process is running this meeting; it will pick up the new input");
+            println!(
+                "{id:>4}  another process is running this meeting; it will pick up the new input"
+            );
         }
     }
 }

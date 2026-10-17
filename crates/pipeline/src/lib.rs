@@ -7,12 +7,14 @@ mod intake;
 pub mod llm;
 mod render;
 pub mod settings;
+mod sweep;
 mod vault;
 
 pub use vault::has_user_edits;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use jiff::Timestamp;
@@ -94,6 +96,12 @@ pub struct Pipeline {
     settings_store: Arc<SettingsStore>,
     store: JobStore,
     vault: Vault,
+    /// Set while a sweep runs, so a second sweep, from the timer or a settings save, skips
+    /// instead of queueing.
+    is_sweeping: AtomicBool,
+    /// Set while a retry of failed meetings runs, so a second "Retry failed" click skips instead
+    /// of running the same meetings again.
+    is_retrying: AtomicBool,
 }
 
 impl Pipeline {
@@ -115,6 +123,8 @@ impl Pipeline {
             settings_store,
             store,
             vault,
+            is_sweeping: AtomicBool::new(false),
+            is_retrying: AtomicBool::new(false),
         })
     }
 
