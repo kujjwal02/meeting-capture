@@ -46,7 +46,8 @@ Meet also flags bots as risky and defaults the admit prompt to Deny. The bot wro
 |---|---|
 | Local speech-to-text (Parakeet) | $0 |
 | Soniox async, Hinglish calls only, $0.10 per hour | About $1 |
-| Claude Haiku 5.5 extraction | About $0.15 to $0.90 |
+| Extraction through Claude Code, on the existing Claude plan | $0 extra |
+| Or Claude Haiku 5.5 extraction through the API | About $0.15 to $0.90 |
 | Google Calendar and Meet APIs | $0 |
 | Storage on personal Google Drive | $0 |
 

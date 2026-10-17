@@ -112,19 +112,25 @@ Done when:
 
 ### Step 5: LLM extraction
 
-- [ ] Provider setup through rig: `anthropic` (default, Claude Haiku 5.5) or `openai-compatible`
-  (base URL and model).
-- [ ] Extraction with `prompt_typed` and a JSON schema. A reply that fails to validate marks the
-  job `Failed` and names the provider.
+- [x] Providers: `claude-code` (signed-in plan, Sonnet by default), and through rig `anthropic`
+  (Claude Haiku 5.5 by default) or `openai-compatible` (base URL and model). Off until one is
+  chosen.
+- [x] Extraction with `prompt_typed` and a JSON schema from the Rust type. Every item cites
+  transcript lines; the quote check verdicts match the Python prototype on 26 recorded replies.
+- [x] A bad reply gets 2 repair turns, then the attempt fails and names the provider and model.
 - [x] Lease renewed during the LLM call (step 3 renews it for every run).
-- [ ] Timeouts on the LLM call, so a hung call fails instead of waiting for the lease cap.
-- [ ] Fallback note: transcript only, tagged `status/needs-extraction`, retried later.
-- [ ] Note sections rewritten without losing the user's edits elsewhere in the note.
-- [ ] Settings window: LLM provider and API key.
-- [ ] A note-edited failure offers "Overwrite my edits" in the tray, so it can be cleared without
+- [x] Timeouts: 3 minutes per API call; 5 minutes per Claude Code turn and 10 in total.
+- [x] Fallback note: transcript only, tagged `status/needs-extraction`, retried after 5 minutes,
+  30 minutes and 2 hours, then `Failed`.
+- [x] Note sections between `%% mc:` markers, rewritten without losing the user's edits elsewhere
+  in the note or their frontmatter keys and tags.
+- [x] Settings window: LLM provider, model, base URL, API key in the keychain, "Check Claude Code".
+- [x] A note-edited failure offers "Overwrite my edits" in the tray, so it can be cleared without
   `mc`.
-- [ ] "Note written" notification.
-- [ ] Compare Haiku 5.5 against GLM-5.3-Flash on five real transcripts.
+- [x] "Note written" notification.
+- [ ] Anthropic path run against the real API.
+- [ ] Compare Haiku 5.5, Sonnet through Claude Code and GLM-5.3-Flash on five real transcripts.
+- [x] Review by a subagent; findings fixed.
 
 ### Step 6: real calls
 

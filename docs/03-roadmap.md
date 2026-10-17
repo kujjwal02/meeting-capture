@@ -47,10 +47,12 @@ Progress is tracked in the [checklist](05-checklist.md).
   with their job state. It can retry failed jobs and open a note.
 - The settings window is plain HTML: Google accounts and OAuth client, LLM provider, its API key,
   vault path, port, your name, time zone. It writes `settings.toml`; secrets go to `keyring`.
-- LLM provider is a closed choice: `anthropic` (default, Claude Haiku 5.5) or `openai-compatible`
-  (base URL and model). The endpoint must support JSON-schema structured output; a reply that
-  fails to parse or validate marks the job `Failed` and names the provider.
-- Job states used: `Captured`, `Matched`, `Extracted`, `Written`, `Failed`.
+- LLM provider is a closed choice: `claude-code` (the signed-in Claude plan, Sonnet by default),
+  `anthropic` (Claude Haiku 5.5 by default) or `openai-compatible` (base URL and model). With no
+  provider, extraction is off and notes carry the transcript only. The endpoint must support
+  JSON-schema structured output. A bad reply gets 2 repair turns, then the attempt fails, names the
+  provider and model, and is retried. [LLM extraction](07-llm-extraction.md) has the detail.
+- Job states used: `Captured`, `Matched`, `Extracted`, `Written`, `ExtractionPending`, `Failed`.
 - `mc reprocess <id>` and `mc ingest <file>` reuse the pipeline crates without Tauri.
 - Logs are JSON lines from `tracing`, one span per job step with `meeting.id`, field names from the
   OpenTelemetry semantic conventions. Adding an OTLP exporter later is one `tracing-opentelemetry`
@@ -92,7 +94,8 @@ Progress is tracked in the [checklist](05-checklist.md).
   exists. Test it in phase 2.
 - Parakeet int8 speed on the M2 CPU. The only CPU figure is 13.7x real time on a Ryzen 4750U.
 - Meet caption quality on Indian English and Hinglish.
-- Haiku 5.5 against GLM-5.3-Flash on five real transcripts.
+- Haiku 5.5, Sonnet through Claude Code and GLM-5.3-Flash on five real transcripts.
+- Codex as a fourth provider, through `codex exec`.
 - Recording consent: tray shows recording state; a per-client "never record" list.
 
 ## Risks

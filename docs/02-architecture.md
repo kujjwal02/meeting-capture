@@ -13,13 +13,15 @@ flowchart LR
     CALL["Call apps<br/>Meet, Teams, Zoom, Slack"]
     TT["TranscripTonic<br/>in Chrome"]
     APP["meeting-capture<br/>tray app"]
-    EXT["Google Calendar, LLM,<br/>Soniox, Meet REST API"]
+    EXT["Google Calendar, LLM API,<br/>Soniox, Meet REST API"]
+    CC["Claude Code CLI<br/>local process"]
     VAULT[("~/knowledge<br/>meeting notes")]
     MEDIA[("Media folder<br/>synced to Drive")]
 
     CALL -->|mic and system audio| APP
     TT -->|captions webhook| APP
     APP <-->|HTTPS| EXT
+    APP <-->|stdin, stdout| CC
     APP -->|notes| VAULT
     APP -->|WAV stems, video| MEDIA
 ```
@@ -50,6 +52,9 @@ stateDiagram-v2
     Transcribed --> Matched
     Matched --> Extracted
     Extracted --> Written
+    Extracted --> ExtractionPending: extraction failed
+    ExtractionPending --> Written: a retry succeeds
+    ExtractionPending --> Failed: retry 3 fails
     Written --> [*]
     Captured --> Failed
     Transcribed --> Failed
@@ -57,16 +62,20 @@ stateDiagram-v2
     Extracted --> Failed
 ```
 
-A retry of a `Failed` job resumes at its last finished step.
+A retry of a `Failed` job resumes at its last finished step. A failed extraction still writes the
+note, with the transcript only. The meeting then shows `ExtractionPending` until a retry succeeds
+or the third retry fails. [LLM extraction](07-llm-extraction.md) has the schedule.
 
 The tray app and `mc` share the job store. A run holds a lease on its meeting, so one run per
 meeting is active across both processes. The lease expires after 2 minutes, and a running pipeline
-renews it every 30 s. The app runs every unfinished meeting at launch and every 5 minutes after, so
-a meeting left by a crash or a quit finishes within minutes. Failed meetings wait for a retry from
-the tray or `mc retry`. A new capture of the same meeting bumps its input revision, and the run
-holding the lease starts over on the new input. A note edited after its last write is never
-overwritten; the job fails and names the note. The pipeline tells its own writes from user edits by
-SHA-256, so Syncthing or git changing a file's time is not an edit.
+renews it every 30 s. The app runs every unfinished meeting at launch and every 5 minutes after, on
+2 worker threads, so a meeting left by a crash or a quit finishes within minutes. Failed meetings
+wait for a retry from the tray or `mc retry`. A new capture of the same meeting bumps its input
+revision, and the run holding the lease starts over on the new input. The pipeline tells its own
+writes from user edits by SHA-256, so Syncthing or git changing a file's time is not an edit. A
+rerun over an edited note replaces only the sections between the app's `%% mc:begin %%` and
+`%% mc:end %%` markers. When the user edited inside a section or broke a marker, the job fails and
+names the note, and the tray offers "Overwrite my edits".
 
 Captions from TranscripTonic are already a transcript, so their job passes `Transcribed` without
 running STT.
@@ -139,13 +148,18 @@ flowchart LR
     NOTE --> VAULT[("vault")]
     CAL <-->|work + personal| GC["Google Calendar"]
     LLM <-->|anthropic or openai-compatible| LLMAPI["LLM API"]
+    LLM <-->|claude-code| CCLI["claude -p"]
 ```
 
 - All of this is the `pipeline` crate. It has no Tauri dependency, so `mc reprocess` runs it too.
 - Calendar match takes the event with the same Meet code, else the largest time overlap, across
   both accounts.
+- Extraction asks the LLM for notes in which every item cites transcript lines, then checks each
+  quote against the transcript. [LLM extraction](07-llm-extraction.md) covers the prompt,
+  providers, retries and note sections.
 - If extraction fails, the note is still written with the transcript and the tag
-  `status/needs-extraction`, and the job retries later.
+  `status/needs-extraction`. The job retries after 5 minutes, 30 minutes and 2 hours.
+- LLM settings apply to the next run without a restart. The pipeline reads them per run.
 - `pipeline` also owns the settings file. The app and `mc` load settings through it, so both read
   the same TOML with the same validation.
 
@@ -177,10 +191,10 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 |---|---|---|---|
 | caption-receiver | 1 | Accept TranscripTonic's webhook; fallback watches Downloads for its `.txt` | `axum` |
 | sources | 1 | Turn each input into the common transcript format | Captions, own stems, Meet REST API, dropped audio files |
-| pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction, vault write, settings file | `rig-core`, `schemars`, `garde`, `oauth2`, `reqwest`, `keyring`, `minijinja`, `toml`, `directories` |
-| jobs | 1 | One row per meeting with a closed state enum and retry count | `rusqlite` |
+| pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `keyring`, `minijinja`, `toml`, `directories` |
+| jobs | 1 | One row per meeting with a closed state enum, its run lease and the extraction retry schedule | `rusqlite` |
 | cli | 1 | `mc`: rerun any job step or ingest a file, without Tauri | `clap` |
-| app | 1 | Tray, settings, permission prompts, review of extracted commitments | Tauri 2 |
+| app | 1 | Tray, settings, "Note written" notifications, permission prompts, review of extracted commitments | Tauri 2, plugin `notification` 2 |
 | detect | 2 | Emit "call started" and "call ended" when an app takes or releases the mic | Vendored from Anarlog `crates/detect` (MIT) |
 | capture | 3, 5 | One `CallAudioSource` trait; per-OS adapters emit timestamped PCM frames | Mac: Core Audio tap via `cidre`. Windows: WASAPI process loopback via `wasapi`. Mic: `cpal`. Adapted from Anarlog `crates/audio-actual` |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV, flushed every few seconds | `hound` |
@@ -194,6 +208,9 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 - Notes are written to a temp file outside the vault, then renamed into place. Syncthing never sees
   a half-written note.
 - Media never goes into the vault.
+- Transcript text and model output are data. The note escapes both, so neither can add Markdown
+  structure, wikilinks or section markers.
+- Secrets live in the OS keychain: Google refresh tokens, the OAuth client secret, LLM API keys.
 - Stored times are UTC.
 
 ## Common transcript format

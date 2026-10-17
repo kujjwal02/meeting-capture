@@ -10,6 +10,9 @@ Status: phase 0. A workspace skeleton and a tray icon with a Quit item.
 - [Architecture](docs/02-architecture.md): components, design rules, transcript format
 - [Roadmap](docs/03-roadmap.md): phases, open questions, risks
 - [Libraries](docs/04-libraries.md): crates per job, what was ruled out, what we write
+- [Checklist](docs/05-checklist.md): done and open items per phase
+- [Google setup](docs/06-google-setup.md): the OAuth client for calendar sign-in
+- [LLM extraction](docs/07-llm-extraction.md): prompt, quote check, providers, retries, note sections
 
 ## Development
 
