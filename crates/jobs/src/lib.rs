@@ -143,17 +143,9 @@ pub struct Meeting {
     pub extraction_error: Option<String>,
     /// When set, an extraction is owed and the sweep runs it from this time.
     pub next_extraction_at: Option<Timestamp>,
-    /// Chosen before the first write, so a rerun after a crash rewrites the same note.
-    pub note_path: Option<PathBuf>,
-    /// SHA-256 of the note as the pipeline last wrote it. Other contents on disk mean the user
-    /// edited the note.
-    pub note_sha256: Option<String>,
-    /// SHA-256 of each note write that started but was not recorded, after a crash or a re-post
-    /// mid-write. The pipeline still owns a note with any of these contents.
-    pub pending_note_sha256s: Vec<String>,
-    /// SHA-256 of each marked note section as last written, by section name. A section whose
-    /// contents differ was edited by the user, and a rerun leaves it alone.
-    pub note_section_sha256s: BTreeMap<String, String>,
+    /// The note in the vault and the hashes that tell the pipeline's writes from the user's
+    /// edits.
+    pub note: NoteOwnership,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -173,6 +165,59 @@ impl Meeting {
             Step::Extracted => JobState::Extracted,
             Step::Written => JobState::Written,
         }
+    }
+}
+
+/// The meeting's note in the vault, and what the pipeline knows it wrote there.
+#[derive(Debug, Clone)]
+pub struct NoteOwnership {
+    // `None` until a run claims a path. A run claims the path before its first write, so no
+    // hash exists without one.
+    claimed: Option<ClaimedNote>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaimedNote {
+    path: PathBuf,
+    written_sha256: Option<String>,
+    // Each note write that started but was not recorded, after a crash or a re-post mid-write.
+    pending_sha256s: Vec<String>,
+    section_sha256s: BTreeMap<String, String>,
+}
+
+impl NoteOwnership {
+    /// Chosen before the first write, so a rerun after a crash rewrites the same note.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        self.claimed.as_ref().map(|claimed| claimed.path.as_path())
+    }
+
+    /// SHA-256 of every note the pipeline wrote or started to write. The pipeline still owns a
+    /// note with any of these contents; other contents mean the user edited it. Empty for a new
+    /// note, or after the user chose to discard their edits.
+    #[must_use]
+    pub fn known_sha256s(&self) -> Vec<&str> {
+        self.claimed
+            .iter()
+            .flat_map(|claimed| {
+                claimed
+                    .written_sha256
+                    .iter()
+                    .chain(&claimed.pending_sha256s)
+            })
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// SHA-256 of each marked note section as last written, by section name. A section whose
+    /// contents differ was edited by the user, and a rerun that would replace it refuses
+    /// instead.
+    #[must_use]
+    pub fn section_sha256s(&self) -> &BTreeMap<String, String> {
+        static NO_SECTIONS: BTreeMap<String, String> = BTreeMap::new();
+        self.claimed
+            .as_ref()
+            .map_or(&NO_SECTIONS, |claimed| &claimed.section_sha256s)
     }
 }
 
@@ -628,7 +673,6 @@ impl LeasedRun<'_> {
     }
 }
 
-// The outer Result carries SQLite read errors; the inner one carries invalid stored values.
 /// Each `<section> <sha256>` line, or the first line that is not one.
 fn read_section_sha256s(lines: &str) -> Result<BTreeMap<String, String>, String> {
     lines
@@ -641,6 +685,7 @@ fn read_section_sha256s(lines: &str) -> Result<BTreeMap<String, String>, String>
         .collect()
 }
 
+// The outer Result carries SQLite read errors; the inner one carries invalid stored values.
 fn read_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting, StoreError>> {
     let id: i64 = row.get("id")?;
     let invalid = |column: &'static str, value: String, valid: &str| StoreError::InvalidColumn {
@@ -670,10 +715,7 @@ fn read_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting, StoreError>> 
     let extraction_attempts: i64 = row.get("extraction_attempts")?;
     let extraction_error: Option<String> = row.get("extraction_error")?;
     let next_extraction_at_ms: Option<i64> = row.get("next_extraction_at_ms")?;
-    let note_path: Option<String> = row.get("note_path")?;
-    let note_sha256: Option<String> = row.get("note_sha256")?;
-    let pending_note_sha256s: Option<String> = row.get("pending_note_sha256s")?;
-    let note_section_sha256s: Option<String> = row.get("note_section_sha256s")?;
+    let note = read_note_ownership(row, &invalid)?;
 
     Ok((|| {
         let input_kind = InputKind::ALL
@@ -723,20 +765,55 @@ fn read_meeting(row: &Row<'_>) -> rusqlite::Result<Result<Meeting, StoreError>> 
                     })
                 })
                 .transpose()?,
-            note_path: note_path.map(PathBuf::from),
-            note_sha256,
-            pending_note_sha256s: pending_note_sha256s
-                .iter()
-                .flat_map(|hashes| hashes.split(' ').map(str::to_owned))
-                .collect(),
-            note_section_sha256s: note_section_sha256s
-                .as_deref()
-                .map(read_section_sha256s)
-                .transpose()
-                .map_err(|line| invalid("note_section_sha256s", line, "<section> <sha256>"))?
-                .unwrap_or_default(),
+            note: note?,
             created_at: timestamp("created_at", created_at)?,
             updated_at: timestamp("updated_at", updated_at)?,
         })
     })())
+}
+
+fn read_note_ownership(
+    row: &Row<'_>,
+    invalid: &impl Fn(&'static str, String, &str) -> StoreError,
+) -> rusqlite::Result<Result<NoteOwnership, StoreError>> {
+    let note_path: Option<String> = row.get("note_path")?;
+    let note_sha256: Option<String> = row.get("note_sha256")?;
+    let pending_note_sha256s: Option<String> = row.get("pending_note_sha256s")?;
+    let note_section_sha256s: Option<String> = row.get("note_section_sha256s")?;
+
+    let Some(note_path) = note_path else {
+        let hash_without_path = [
+            ("note_sha256", note_sha256),
+            ("pending_note_sha256s", pending_note_sha256s),
+            ("note_section_sha256s", note_section_sha256s),
+        ]
+        .into_iter()
+        .find_map(|(column, value)| value.map(|value| (column, value)));
+        return Ok(match hash_without_path {
+            Some((column, value)) => Err(invalid(column, value, "NULL while note_path is NULL")),
+            None => Ok(NoteOwnership { claimed: None }),
+        });
+    };
+    let section_sha256s = match note_section_sha256s.as_deref().map(read_section_sha256s) {
+        Some(Ok(section_sha256s)) => section_sha256s,
+        Some(Err(line)) => {
+            return Ok(Err(invalid(
+                "note_section_sha256s",
+                line,
+                "<section> <sha256>",
+            )));
+        }
+        None => BTreeMap::new(),
+    };
+    Ok(Ok(NoteOwnership {
+        claimed: Some(ClaimedNote {
+            path: note_path.into(),
+            written_sha256: note_sha256,
+            pending_sha256s: pending_note_sha256s
+                .iter()
+                .flat_map(|hashes| hashes.split(' ').map(str::to_owned))
+                .collect(),
+            section_sha256s,
+        }),
+    }))
 }

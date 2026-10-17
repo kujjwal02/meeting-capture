@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use huddle_captions::HuddleHealth;
 use jobs::{JobState, Meeting, MeetingId};
-use pipeline::{EXTRACTION_RETRIES, Pipeline};
+use pipeline::{EXTRACTION_RETRIES, Pipeline, has_user_edits};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
@@ -276,7 +276,7 @@ fn meeting_submenu(
         app,
         &MenuAction::OpenNote(meeting.id),
         "Open note",
-        meeting.note_path.is_some(),
+        meeting.note.path().is_some(),
     )?)?;
     submenu.append(&action_entry(
         app,
@@ -285,7 +285,7 @@ fn meeting_submenu(
         job_state == JobState::Failed,
     )?)?;
     // A rerun splices into an edited note; this is for a note whose markers it cannot place.
-    if job_state == JobState::Failed && pipeline.has_edited_note(meeting) {
+    if job_state == JobState::Failed && has_user_edits(&meeting.note) {
         submenu.append(&action_entry(
             app,
             &MenuAction::OverwriteEdits(meeting.id),
@@ -371,11 +371,13 @@ fn open_note(app: &AppHandle, state: &AppState, id: MeetingId) {
         return;
     };
     match pipeline.store().get(id) {
-        Ok(Meeting {
-            note_path: Some(note_path),
-            ..
-        }) => launch(app, &LaunchTarget::Note(&note_path)),
-        Ok(_) => tracing::warn!(meeting.id = %id, "meeting has no note yet"),
+        Ok(meeting) => {
+            if let Some(note_path) = meeting.note.path() {
+                launch(app, &LaunchTarget::Note(note_path));
+            } else {
+                tracing::warn!(meeting.id = %id, "meeting has no note yet");
+            }
+        }
         Err(error) => tracing::error!(exception.message = %error, "could not read the meeting"),
     }
 }

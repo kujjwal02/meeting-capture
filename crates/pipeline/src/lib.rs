@@ -5,19 +5,20 @@ pub mod extraction;
 pub mod google;
 mod intake;
 pub mod llm;
-mod note;
+mod render;
 pub mod settings;
-mod splice;
+mod vault;
 
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+pub use vault::has_user_edits;
+
+use std::path::PathBuf;
 use std::sync::{PoisonError, RwLock};
 use std::time::Duration;
 
 use jiff::Timestamp;
 use jobs::{
-    Extraction, ExtractionFailure, JobStore, LeasedRun, Meeting, MeetingId, NotePathClaim,
-    RunOutcome, Step, StepError, StoreError,
+    Extraction, ExtractionFailure, JobStore, LeasedRun, MeetingId, RunOutcome, Step, StepError,
+    StoreError,
 };
 use sources::Transcript;
 
@@ -26,8 +27,9 @@ use crate::extraction::{CheckedNotes, Prompt};
 use crate::google::GoogleError;
 use crate::intake::read_transcript;
 use crate::llm::{ExtractionError, Provider};
-use crate::note::NoteInput;
+use crate::render::NoteInput;
 use crate::settings::{AppDirs, LlmSettings, Settings};
+use crate::vault::Vault;
 
 pub use crate::intake::{InputError, Intake, IntakeError};
 
@@ -90,6 +92,7 @@ pub struct Pipeline {
     google: GoogleAccounts,
     /// Replaced from the settings window, so a new provider applies to the next run.
     llm: RwLock<LlmSettings>,
+    vault: Vault,
 }
 
 impl Pipeline {
@@ -97,12 +100,14 @@ impl Pipeline {
     pub fn new(app_dirs: AppDirs, settings: Settings, store: JobStore) -> Self {
         let google = GoogleAccounts::new(&settings.google);
         let llm = RwLock::new(settings.llm.clone());
+        let vault = Vault::new(settings.meetings_dir(), app_dirs.note_staging_dir());
         Self {
             app_dirs,
             settings,
             store,
             google,
             llm,
+            vault,
         }
     }
 
@@ -130,19 +135,6 @@ impl Pipeline {
         let queued = self.store.schedule_missing_extractions()?;
         tracing::info!(meeting.count = queued, "LLM settings applied");
         Ok(queued)
-    }
-
-    /// Whether the meeting's note differs from every write the pipeline made, so a rerun has to
-    /// splice into it or overwrite it.
-    #[must_use]
-    pub fn has_edited_note(&self, meeting: &Meeting) -> bool {
-        let known = known_note_sha256s(meeting);
-        let Some(note_path) = &meeting.note_path else {
-            return false;
-        };
-        !known.is_empty()
-            && std::fs::read(note_path)
-                .is_ok_and(|on_disk| !known.contains(&note::note_sha256(&on_disk).as_str()))
     }
 
     #[must_use]
@@ -262,35 +254,10 @@ impl Pipeline {
                 my_name: self.settings.my_name.as_deref(),
                 time_zone: &self.settings.time_zone,
             };
-            let rendered = note::render(&note, &self.app_dirs.note_template_file())?;
-            let note_path = match &meeting.note_path {
-                Some(note_path) => note_path.clone(),
-                None => self.claim_note_path(run, &note)?,
-            };
-            let rendered_section_sha256s =
-                splice::section_sha256s(&rendered).map_err(|reason| PipelineError::NoteEdited {
-                    path: note_path.clone(),
-                    reason: format!("in the template, {reason}"),
-                })?;
-            let FittedNote {
-                contents,
-                edited_sha256,
-                section_sha256s,
-            } = fit_to_note(&note_path, meeting, rendered, rendered_section_sha256s)?;
-            let note_sha256 = note::note_sha256(contents.as_bytes());
-            // Recorded first, so after a crash or a re-post mid-write the next run still knows
-            // the note on disk is its own.
-            run.record_pending_note(&note_sha256)?;
-            note::write_atomically(
-                &self.app_dirs.note_staging_dir(),
-                &note_path,
-                &contents,
-                || {
-                    run.renew_lease()?;
-                    check_note_unchanged(&note_path, meeting, edited_sha256.as_deref())
-                },
-            )?;
-            run.mark_written(&note_sha256, &section_sha256s)?;
+            let rendered = render::note(&note, &self.app_dirs.note_template_file())?;
+            let note_path = self
+                .vault
+                .write(run, &note.started_at(), note.title(), &rendered)?;
             tracing::info!(file.path = %note_path.display(), "note written");
         }
 
@@ -337,7 +304,7 @@ impl Pipeline {
         Prompt::new(
             transcript,
             self.settings.my_name.as_deref(),
-            &note::attendees(transcript, calendar_match),
+            &render::attendees(transcript, calendar_match),
             &self.llm().glossary,
         )
     }
@@ -360,26 +327,6 @@ impl Pipeline {
             .map_err(|error| (label.clone(), error))?;
         Ok(Some((notes, label)))
     }
-
-    // Claimed before the write, so a crash between the write and mark_written rewrites this note
-    // instead of adding a second one. A path is skipped when a file is there, which covers notes
-    // that no job owns, such as the Attendee bot's.
-    fn claim_note_path(
-        &self,
-        run: &LeasedRun<'_>,
-        note: &NoteInput<'_>,
-    ) -> Result<PathBuf, PipelineError> {
-        for note_path in note::note_path_candidates(&self.settings.meetings_dir(), note) {
-            if note_path.exists() {
-                continue;
-            }
-            match run.claim_note_path(&note_path)? {
-                NotePathClaim::Claimed => return Ok(note_path),
-                NotePathClaim::TakenByOtherMeeting => {}
-            }
-        }
-        Err(PipelineError::NoteNameTaken)
-    }
 }
 
 enum ExtractOutcome {
@@ -393,128 +340,6 @@ enum ExtractOutcome {
         provider: String,
         error: ExtractionError,
     },
-}
-
-// The vault promises that a rerun never discards the user's edits. A note whose contents match
-// a write the pipeline made, or started, is still the pipeline's own. Hashes, unlike file times,
-// survive Syncthing and git rewriting the time.
-fn known_note_sha256s(meeting: &Meeting) -> Vec<&str> {
-    meeting
-        .note_sha256
-        .iter()
-        .chain(&meeting.pending_note_sha256s)
-        .map(String::as_str)
-        .collect()
-}
-
-struct FittedNote {
-    contents: String,
-    /// The hash of the edited note the splice started from, which the write checks again just
-    /// before the rename.
-    edited_sha256: Option<String>,
-    /// Stored after the write, so the next rerun can tell the app's sections from the user's.
-    section_sha256s: BTreeMap<String, String>,
-}
-
-// The contents to write: the render spliced into the note on disk, so text the user added outside
-// the sections survives every rerun, not only the first.
-fn fit_to_note(
-    note_path: &Path,
-    meeting: &Meeting,
-    rendered: String,
-    rendered_section_sha256s: BTreeMap<String, String>,
-) -> Result<FittedNote, PipelineError> {
-    let as_rendered = |rendered: String, section_sha256s: BTreeMap<String, String>| FittedNote {
-        contents: rendered,
-        edited_sha256: None,
-        section_sha256s,
-    };
-    let known = known_note_sha256s(meeting);
-    // No hash: a new note, or edits the user chose to discard.
-    if known.is_empty() {
-        return Ok(as_rendered(rendered, rendered_section_sha256s));
-    }
-    let on_disk = match std::fs::read_to_string(note_path) {
-        Ok(on_disk) => on_disk,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(as_rendered(rendered, rendered_section_sha256s));
-        }
-        Err(source) => {
-            return Err(PipelineError::ReadFile {
-                path: note_path.to_path_buf(),
-                source,
-            });
-        }
-    };
-    let on_disk_sha256 = note::note_sha256(on_disk.as_bytes());
-    let is_as_written = known.contains(&on_disk_sha256.as_str());
-    let note_edited = |reason: String| PipelineError::NoteEdited {
-        path: note_path.to_path_buf(),
-        reason,
-    };
-    // A custom template without markers leaves nothing to splice into.
-    if rendered_section_sha256s.is_empty() {
-        return if is_as_written {
-            Ok(as_rendered(rendered, rendered_section_sha256s))
-        } else {
-            Err(note_edited(
-                "the note template has no mc:begin/mc:end markers, so the app cannot keep your edits"
-                    .to_owned(),
-            ))
-        };
-    }
-    let mut written = meeting.note_section_sha256s.clone();
-    if is_as_written {
-        let on_disk_section_sha256s = splice::section_sha256s(&on_disk)
-            .map_err(|reason| note_edited(format!("in the note, {reason}")))?;
-        // Written from a template without markers: every section would land after the old text.
-        if on_disk_section_sha256s.is_empty() {
-            return Ok(as_rendered(rendered, rendered_section_sha256s));
-        }
-        // A note the pipeline wrote holds its sections as written, which covers a write that
-        // crashed before the store recorded its section hashes.
-        written.extend(on_disk_section_sha256s);
-    }
-    let spliced = splice::splice(&on_disk, &rendered, &written).map_err(note_edited)?;
-    let mut section_sha256s = splice::section_sha256s(&spliced)
-        .map_err(|reason| note_edited(format!("in the spliced note, {reason}")))?;
-    // A section the user deleted keeps its hash, so later reruns leave it out too.
-    for (name, sha256) in written {
-        if rendered_section_sha256s.contains_key(&name) {
-            section_sha256s.entry(name).or_insert(sha256);
-        }
-    }
-    Ok(FittedNote {
-        contents: spliced,
-        edited_sha256: Some(on_disk_sha256),
-        section_sha256s,
-    })
-}
-
-// Run just before the rename: the note must still be one the pipeline wrote, or the edited note
-// the splice started from.
-fn check_note_unchanged(
-    note_path: &Path,
-    meeting: &Meeting,
-    edited_sha256: Option<&str>,
-) -> Result<(), PipelineError> {
-    let mut expected = known_note_sha256s(meeting);
-    expected.extend(edited_sha256);
-    if expected.is_empty() {
-        return Ok(());
-    }
-    match std::fs::read(note_path) {
-        Ok(on_disk) if expected.contains(&note::note_sha256(&on_disk).as_str()) => Ok(()),
-        Ok(_) => Err(PipelineError::NoteEdited {
-            path: note_path.to_path_buf(),
-            reason: "it changed while the run was writing; the next run will try again".to_owned(),
-        }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(PipelineError::ReadFile {
-            path: note_path.to_path_buf(),
-            source,
-        }),
-    }
 }
 
 fn schedule_extraction_retry(

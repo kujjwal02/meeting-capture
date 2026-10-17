@@ -58,18 +58,21 @@ impl LeasedRun<'_> {
         &self.meeting
     }
 
-    /// Renews the lease now, so a step can check that it still holds the meeting just before a
-    /// write outside the store.
+    /// Checks that this attempt still holds the lease and that no new capture superseded its
+    /// input, and renews the lease. A step calls it just before a write outside the store.
     ///
     /// # Errors
     ///
-    /// Returns `StoreError::LeaseLost` when another run took the meeting.
-    pub fn renew_lease(&self) -> Result<(), StoreError> {
-        if self.store.renew_lease(self.lease)? {
-            Ok(())
-        } else {
-            Err(self.record_stop(LeaseStop::LeaseLost))
-        }
+    /// Returns `StoreError::LeaseLost` when another run took the meeting, and
+    /// `StoreError::Superseded` when a new capture arrived during the run.
+    pub fn confirm_current_input(&self) -> Result<(), StoreError> {
+        // The check changes nothing the tray shows, so `updated_at` (?5) stays as it was.
+        let renewed = self.execute_leased(
+            "UPDATE meetings SET run_renewed_at_ms = ?4
+             WHERE id = ?1 AND run_token = ?2 AND input_revision = ?3 AND ?5 IS NOT NULL",
+            &[],
+        )?;
+        self.stop_unless_changed(renewed)
     }
 
     // Runs `UPDATE meetings SET <set_clause>` for the lease holder on this attempt's input
@@ -79,7 +82,13 @@ impl LeasedRun<'_> {
             "UPDATE meetings SET {set_clause}, run_renewed_at_ms = ?4, updated_at = ?5
              WHERE id = ?1 AND run_token = ?2 AND input_revision = ?3"
         );
-        match self.execute_leased(&sql, extra)? {
+        let updated = self.execute_leased(&sql, extra)?;
+        self.stop_unless_changed(updated)
+    }
+
+    // A leased update that changed no row means the run must stop.
+    fn stop_unless_changed(&self, changed_rows: usize) -> Result<(), StoreError> {
+        match changed_rows {
             0 => Err(self.record_stop(self.why_unchanged()?)),
             _ => Ok(()),
         }
@@ -109,7 +118,7 @@ impl LeasedRun<'_> {
         let sql = format!(
             "UPDATE meetings SET {set_clause}, run_token = NULL, run_renewed_at_ms = NULL,
                 updated_at = ?5
-             WHERE id = ?1 AND run_token = ?2 AND input_revision = ?3 AND ?4 IS NOT NULL"
+             WHERE id = ?1 AND run_token = ?2 AND input_revision = ?3"
         );
         if self.execute_leased(&sql, extra)? > 0 {
             return Ok(LeaseRelease::Released);
@@ -120,6 +129,9 @@ impl LeasedRun<'_> {
         }
     }
 
+    // Binds ?1 to ?5, then `extra`. rusqlite refuses more values than the highest position a
+    // statement names, so a statement with no use for ?5 names it in the always-true clause
+    // `?5 IS NOT NULL`.
     fn execute_leased(&self, sql: &str, extra: &[&dyn ToSql]) -> Result<usize, StoreError> {
         let now = Timestamp::now();
         let now_ms = now.as_millisecond();
@@ -237,8 +249,8 @@ impl JobStore {
     // A step such as the LLM call can outlast the lease. Renewing from a second thread keeps the
     // lease short, so a crashed process frees its meetings within `LEASE_EXPIRY`. Renewal stops
     // after `MAX_RUN_TIME`, so a hung run frees its meeting too; a step that writes outside the
-    // store calls `LeasedRun::renew_lease` first, so the hung run cannot overwrite a later run's
-    // output.
+    // store calls `LeasedRun::confirm_current_input` first, so neither the hung run nor a run on
+    // an older input overwrites a later run's output.
     fn keep_lease_alive(&self, lease: &RunLease, is_run_over: &Receiver<()>) {
         let _span = tracing::info_span!("pipeline.lease", meeting.id = %lease.id).entered();
         let renew_until = Instant::now() + MAX_RUN_TIME;

@@ -4,7 +4,7 @@ use std::fmt::Write as _;
 
 use sources::Transcript;
 
-use crate::note;
+use crate::render;
 
 /// The transcript as the model sees it, and the lookups the reply checks need.
 #[derive(Debug, Clone)]
@@ -57,7 +57,7 @@ impl Prompt {
                 continue;
             }
             let id = u32::try_from(index + 1).expect("a transcript has under 4 billion segments");
-            let speaker = note::speaker_name(transcript, my_name, &segment.speaker);
+            let speaker = render::speaker_name(transcript, my_name, &segment.speaker);
             let part = LineSegment {
                 id,
                 start_s: segment.start_s,
@@ -96,7 +96,7 @@ impl Prompt {
         Self {
             lines,
             roster,
-            me: note::my_speaker_name(transcript, my_name).map(str::to_owned),
+            me: render::my_speaker_name(transcript, my_name).map(str::to_owned),
             glossary: glossary.to_vec(),
         }
     }

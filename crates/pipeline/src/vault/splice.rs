@@ -8,7 +8,8 @@ use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
-use crate::note::{self, APP_KEYS, APP_TAGS};
+use super::note_sha256;
+use crate::render::{APP_KEYS, APP_TAGS};
 
 const BEGIN: &str = "%% mc:begin ";
 const END: &str = "%% mc:end ";
@@ -19,14 +20,14 @@ const MARKER_CLOSE: &str = " %%";
 /// # Errors
 ///
 /// Returns why the markers do not line up.
-pub(crate) fn section_sha256s(note: &str) -> Result<BTreeMap<String, String>, String> {
+pub(super) fn section_sha256s(note: &str) -> Result<BTreeMap<String, String>, String> {
     let (_, body) = split_frontmatter(note);
     let pieces = pieces(body)?;
     Ok(pieces
         .iter()
         .filter_map(|piece| match piece {
             Piece::Section { name, content } => {
-                Some(((*name).to_owned(), note::note_sha256(content.as_bytes())))
+                Some(((*name).to_owned(), note_sha256(content.as_bytes())))
             }
             Piece::Text(_) => None,
         })
@@ -39,7 +40,7 @@ pub(crate) fn section_sha256s(note: &str) -> Result<BTreeMap<String, String>, St
 /// # Errors
 ///
 /// Returns why the two cannot be lined up, for the `NoteEdited` message.
-pub(crate) fn splice(
+pub(super) fn splice(
     on_disk: &str,
     rendered: &str,
     written: &BTreeMap<String, String>,
@@ -70,7 +71,7 @@ pub(crate) fn splice(
     let is_as_written = |name: &str, content: &str| {
         written
             .get(name)
-            .is_some_and(|sha256| *sha256 == note::note_sha256(content.as_bytes()))
+            .is_some_and(|sha256| *sha256 == note_sha256(content.as_bytes()))
     };
 
     // Only sections the render replaces need to be as the app wrote them.

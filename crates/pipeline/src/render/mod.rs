@@ -1,10 +1,10 @@
-//! Renders a meeting note and moves it into the vault in one rename.
+//! Renders a meeting note to a string. Only the template override is read from disk; the vault
+//! module writes the note.
 
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use jiff::Timestamp;
 use jiff::tz::TimeZone;
+use jiff::{Timestamp, Zoned};
 use jobs::MeetingId;
 use serde::Serialize;
 use sources::slack_huddle::HuddleHealth;
@@ -15,7 +15,7 @@ use crate::calendar::CalendarMatch;
 use crate::extraction::{CheckedCitation, CheckedNotes, CommitmentStrength};
 
 const BUILT_IN_TEMPLATE: &str = include_str!("note.md.j2");
-const UNTITLED_CALL: &str = "Untitled call";
+pub(crate) const UNTITLED_CALL: &str = "Untitled call";
 const NEEDS_EXTRACTION_TAG: &str = "status/needs-extraction";
 const SLACK_HUDDLE_TAG: &str = "topic/slack-huddle";
 const CAPTIONS_DEGRADED_TAG: &str = "status/captions-degraded";
@@ -40,6 +40,11 @@ impl NoteInput<'_> {
             .and_then(|event| event.title.as_deref())
             .or(self.transcript.title.as_deref())
             .unwrap_or(UNTITLED_CALL)
+    }
+
+    /// In the user's time zone, which the frontmatter and the note's file name both use.
+    pub(crate) fn started_at(&self) -> Zoned {
+        self.transcript.started_at.to_zoned(self.time_zone.clone())
     }
 }
 
@@ -126,7 +131,7 @@ struct ChatMessageView<'a> {
 }
 
 /// Renders the note with the template at `template_override` if it exists, else the built-in one.
-pub(crate) fn render(
+pub(crate) fn note(
     note: &NoteInput<'_>,
     template_override: &Path,
 ) -> Result<String, PipelineError> {
@@ -142,7 +147,7 @@ pub(crate) fn render(
     };
 
     let transcript = note.transcript;
-    let started_at = transcript.started_at.to_zoned(note.time_zone.clone());
+    let started_at = note.started_at();
     let attendees = attendees(transcript, note.calendar_match);
     let frontmatter = frontmatter_yaml(note, &attendees)?;
 
@@ -285,7 +290,7 @@ fn duration_min(transcript: &Transcript) -> i64 {
 
 fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String, PipelineError> {
     let transcript = note.transcript;
-    let started_at = transcript.started_at.to_zoned(note.time_zone.clone());
+    let started_at = note.started_at();
     let mut tags = vec!["area/meetings", "topic/transcript", "status/active"];
     let huddle = transcript.slack_huddle.as_ref();
     if let Some(huddle) = huddle {
@@ -450,128 +455,6 @@ fn notes_view(notes: &CheckedNotes) -> NotesView {
             })
             .collect(),
     }
-}
-
-/// Note paths to try for a new meeting, in order: `YYYY/MM/yyyy-mm-dd-hhmm-<title-slug>.md`
-/// under `meetings_dir`, then the same with the meeting id, which is unique to the meeting.
-pub(crate) fn note_path_candidates(meetings_dir: &Path, note: &NoteInput<'_>) -> [PathBuf; 2] {
-    let started_at = note.transcript.started_at.to_zoned(note.time_zone.clone());
-    let month_dir = meetings_dir
-        .join(started_at.strftime("%Y").to_string())
-        .join(started_at.strftime("%m").to_string());
-    let date_time = started_at.strftime("%Y-%m-%d-%H%M");
-    let title = title_slug(note.title());
-    let id = note.meeting_id;
-    [
-        month_dir.join(format!("{date_time}-{title}.md")),
-        month_dir.join(format!("{date_time}-{title}-{id}.md")),
-    ]
-}
-
-// Long event titles would push paths past Windows' 260-character limit.
-const MAX_SLUG_CHARS: usize = 60;
-
-fn title_slug(title: &str) -> String {
-    let slug = slug::slugify(title);
-    let mut slug = if slug.len() <= MAX_SLUG_CHARS {
-        slug
-    } else {
-        let cut = slug[..MAX_SLUG_CHARS].rfind('-').unwrap_or(MAX_SLUG_CHARS);
-        slug[..cut].to_owned()
-    };
-    if slug.is_empty() {
-        slug = slug::slugify(UNTITLED_CALL);
-    }
-    slug
-}
-
-/// SHA-256 of a note, in lowercase hex. The job store keeps it to tell the pipeline's own write
-/// from a user edit.
-pub(crate) fn note_sha256(contents: &[u8]) -> String {
-    use sha2::Digest as _;
-    use std::fmt::Write as _;
-    sha2::Sha256::digest(contents)
-        .iter()
-        .fold(String::with_capacity(64), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        })
-}
-
-/// Writes `contents` to a staging file outside the vault, then renames it over `note_path`.
-/// `check_before_rename` runs once the staged file is on disk, as close to the rename as possible.
-pub(crate) fn write_atomically(
-    staging_dir: &Path,
-    note_path: &Path,
-    contents: &str,
-    check_before_rename: impl Fn() -> Result<(), PipelineError>,
-) -> Result<(), PipelineError> {
-    let write_error = |source| PipelineError::WriteNote {
-        path: note_path.to_path_buf(),
-        source,
-    };
-    let note_dir = note_path
-        .parent()
-        .ok_or_else(|| write_error(std::io::Error::other("note path has no folder")))?;
-    create_dir_durably(note_dir).map_err(write_error)?;
-
-    let staged = tempfile::NamedTempFile::new_in(staging_dir).map_err(write_error)?;
-    let staged = fill(staged, contents).map_err(write_error)?;
-    check_before_rename()?;
-    match staged.persist(note_path) {
-        Ok(_) => {}
-        // A rename works only within one volume. For a vault on another disk, stage next to the
-        // note under a dot-name, which Obsidian hides.
-        Err(error) if error.error.kind() == std::io::ErrorKind::CrossesDevices => {
-            let staged = tempfile::Builder::new()
-                .prefix(".")
-                .suffix(".tmp")
-                .tempfile_in(note_dir)
-                .map_err(write_error)?;
-            let staged = fill(staged, contents).map_err(write_error)?;
-            check_before_rename()?;
-            staged
-                .persist(note_path)
-                .map_err(|error| write_error(error.error))?;
-        }
-        Err(error) => return Err(write_error(error.error)),
-    }
-    sync_dir(note_dir).map_err(write_error)
-}
-
-// A new month folder survives power loss only once its parent's entry is on disk too.
-fn create_dir_durably(dir: &Path) -> std::io::Result<()> {
-    let missing: Vec<&Path> = dir.ancestors().take_while(|path| !path.exists()).collect();
-    std::fs::create_dir_all(dir)?;
-    for created in missing.into_iter().rev() {
-        if let Some(parent) = created.parent() {
-            sync_dir(parent)?;
-        }
-    }
-    Ok(())
-}
-
-// A rename or a new entry is durable only once the folder is on disk. Windows has no folder fsync.
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    std::fs::File::open(dir)?.sync_all()?;
-    #[cfg(not(unix))]
-    let _ = dir;
-    Ok(())
-}
-
-fn fill(
-    mut staged: tempfile::NamedTempFile,
-    contents: &str,
-) -> std::io::Result<tempfile::NamedTempFile> {
-    staged.write_all(contents.as_bytes())?;
-    // Temp files are private (0600); a note gets the vault's usual mode.
-    #[cfg(unix)]
-    staged
-        .as_file()
-        .set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
-    staged.as_file().sync_all()?;
-    Ok(staged)
 }
 
 /// Makes what someone said one line of literal Markdown: it cannot open a heading, list, code

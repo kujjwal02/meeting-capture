@@ -232,7 +232,7 @@ fn print_meeting(meeting: &Meeting, time_zone: &TimeZone) {
             meeting.extraction_attempts
         );
     }
-    if let Some(note_path) = &meeting.note_path {
+    if let Some(note_path) = meeting.note.path() {
         println!("      note: {}", note_path.display());
     }
 }
