@@ -3,13 +3,16 @@
 
 use std::sync::Arc;
 
+use huddle_captions::HuddleHealth;
 use jobs::{JobState, Meeting, MeetingId};
 use pipeline::{EXTRACTION_RETRIES, Pipeline};
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
+use tauri_plugin_opener::OpenerExt as _;
 
+use crate::huddles::HuddleStatus;
 use crate::launch::{LaunchTarget, launch};
 use crate::{AppState, Listener, meetings};
 
@@ -25,6 +28,7 @@ enum MenuAction {
     Retry(MeetingId),
     OverwriteEdits(MeetingId),
     RetryFailed,
+    OpenAccessibilitySettings,
     StartAtLogin,
     OpenSettings,
     ShowLogFile,
@@ -38,6 +42,7 @@ impl MenuAction {
             MenuAction::Retry(id) => format!("retry:{id}"),
             MenuAction::OverwriteEdits(id) => format!("overwrite-edits:{id}"),
             MenuAction::RetryFailed => "retry-failed".to_owned(),
+            MenuAction::OpenAccessibilitySettings => "open-accessibility-settings".to_owned(),
             MenuAction::StartAtLogin => "start-at-login".to_owned(),
             MenuAction::OpenSettings => "open-settings".to_owned(),
             MenuAction::ShowLogFile => "show-log-file".to_owned(),
@@ -58,6 +63,7 @@ impl MenuAction {
         }
         [
             MenuAction::RetryFailed,
+            MenuAction::OpenAccessibilitySettings,
             MenuAction::StartAtLogin,
             MenuAction::OpenSettings,
             MenuAction::ShowLogFile,
@@ -112,6 +118,7 @@ fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         }
     };
     menu.append(&label_entry(app, &listener_label)?)?;
+    append_huddle_status(app, &menu, &state)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
 
     if let Some(pipeline) = &state.pipeline {
@@ -137,6 +144,39 @@ fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&action_entry(app, &MenuAction::Quit, "Quit", true)?)?;
     Ok(menu)
+}
+
+// One line while a huddle runs or the watcher cannot run; nothing otherwise.
+fn append_huddle_status(app: &AppHandle, menu: &Menu<Wry>, state: &AppState) -> tauri::Result<()> {
+    let label = match state.huddle_status() {
+        HuddleStatus::Idle => return Ok(()),
+        HuddleStatus::PermissionNeeded => {
+            return menu.append(&action_entry(
+                app,
+                &MenuAction::OpenAccessibilitySettings,
+                "Slack huddles: allow Accessibility to read captions",
+                true,
+            )?);
+        }
+        HuddleStatus::Reading { channel, health } => {
+            let title = shorten(&channel, MAX_TITLE_CHARS);
+            match health {
+                None => format!("Slack huddle {title}: looking for captions"),
+                Some(HuddleHealth::Healthy) => format!("Slack huddle {title}: reading captions"),
+                Some(HuddleHealth::Untested) => {
+                    format!("Slack huddle {title}: reading captions (untested Slack version)")
+                }
+                Some(HuddleHealth::Degraded) => {
+                    format!("Slack huddle {title}: captions partly read")
+                }
+                Some(HuddleHealth::CaptionsOff) => {
+                    format!("Slack huddle {title}: captions are off")
+                }
+                Some(HuddleHealth::Broken) => format!("Slack huddle {title}: can't read captions"),
+            }
+        }
+    };
+    menu.append(&label_entry(app, &label)?)
 }
 
 // A line per account. One that needs to sign in again opens the settings window.
@@ -307,6 +347,13 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
                 tauri::async_runtime::spawn_blocking(move || {
                     meetings::retry_failed(&app, &pipeline);
                 });
+            }
+        }
+        MenuAction::OpenAccessibilitySettings => {
+            const ACCESSIBILITY_PANE: &str =
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+            if let Err(error) = app.opener().open_url(ACCESSIBILITY_PANE, None::<&str>) {
+                tracing::error!(exception.message = %error, "could not open the Accessibility settings");
             }
         }
         MenuAction::StartAtLogin => toggle_start_at_login(app),

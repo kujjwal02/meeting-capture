@@ -153,7 +153,7 @@ impl AdvancedBody {
         // link to the call in the payload, and the title says nothing about the meeting.
         let meet_code = match platform {
             Platform::Meet => meet_code_from_title(&self.meeting_title),
-            Platform::Teams | Platform::Zoom | Platform::Other => None,
+            Platform::Teams | Platform::Zoom | Platform::Slack | Platform::Other => None,
         };
         let meeting_url = meet_code.map(|code| format!("https://meet.google.com/{code}"));
         // One line, so the title reads the same in a heading, a file name and the tray menu.
@@ -173,6 +173,8 @@ impl AdvancedBody {
             meeting_url,
             title,
             speaker_naming: SpeakerNaming::Real,
+            my_speaker: Some(TRANSCRIPTONIC_ME.to_owned()),
+            attendees: Vec::new(),
             segments,
             chat_messages: self
                 .chat_messages
@@ -183,9 +185,13 @@ impl AdvancedBody {
                     text: message.chat_message_text,
                 })
                 .collect(),
+            slack_huddle: None,
         }
     }
 }
+
+// TranscripTonic's name for the local user.
+const TRANSCRIPTONIC_ME: &str = "You";
 
 fn meet_code_from_title(title: &str) -> Option<&str> {
     let code = title.strip_prefix("Meet \u{2013} ")?;

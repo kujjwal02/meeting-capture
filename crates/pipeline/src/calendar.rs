@@ -4,7 +4,7 @@ use std::cmp::Reverse;
 use std::sync::{Mutex, PoisonError};
 
 use serde::{Deserialize, Serialize};
-use sources::Transcript;
+use sources::{Platform, Transcript};
 
 use crate::google::{self, ApiEvent, GoogleError, OAuthClient, ResponseStatus};
 use crate::settings::GoogleSettings;
@@ -124,6 +124,15 @@ impl GoogleAccounts {
         &self,
         transcript: &Transcript,
     ) -> Result<CalendarMatch, GoogleError> {
+        match transcript.platform {
+            // A huddle often starts next to a meeting it has nothing to do with, so it keeps its
+            // channel title and the people Slack showed.
+            Platform::Slack => {
+                tracing::info!("Slack huddles are not matched to calendar events");
+                return Ok(CalendarMatch { event: None });
+            }
+            Platform::Meet | Platform::Teams | Platform::Zoom | Platform::Other => {}
+        }
         let (settings, accounts) = self.snapshot();
         if accounts.is_empty() {
             tracing::info!("no Google account is signed in");

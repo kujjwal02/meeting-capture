@@ -5,7 +5,7 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 | # | Phase | Delivers | Done when | Evenings |
 |---|---|---|---|---|
 | 0 | Skeleton | Workspace with crate stubs and a tray-icon Tauri app, pinned toolchain, rustfmt, clippy workspace lints, cargo-deny, cargo-shear, taplo, typos, biome, rumdl, lefthook hooks, `just check` | `just check` passes on the Mac and the PC; a misformatted file blocks a commit; a GPL crate fails `cargo deny check` | 2 |
-| 1 | Tray app and captions pipeline | Tauri tray app with autostart and no Dock icon, caption receiver, job store, Google sign-in for work and personal calendars, calendar match, LLM extraction, vault writer, `mc` CLI | 5 real Meet calls write correct notes with no manual step; the tray lists them; a calendar sign-in still works after 8 days | 6 |
+| 1 | Tray app and captions pipeline | Tauri tray app with autostart and no Dock icon, caption receiver, Slack huddle captions on the Mac, job store, Google sign-in for work and personal calendars, calendar match, LLM extraction, vault writer, `mc` CLI | 5 real Meet calls and 3 Slack huddles write correct notes with no manual step; the tray lists them; a calendar sign-in still works after 8 days | 6 |
 | 2 | Call detection | Start and end events, tray state | Meet, Teams, Zoom and a Slack huddle each log start and end within 5 s, on both OSes | 2 |
 | 3 | Mac capture | Tap and mic stems, recovery of orphan WAVs at launch | 3 calls, one with AirPods connected mid-call, no gap over 1 s, app under 5% CPU | 5 |
 | 4 | Local STT | Parakeet, VAD, remote diarization, caption-name merge | A 1 h call transcribes in under 10 min on the M2; names match captions on 3 Meet calls | 4 |
@@ -84,7 +84,27 @@ Progress is tracked in the [checklist](05-checklist.md).
 3. Tray app grown from the phase 0 stub: receiver inside, autostart, single instance, self-signed build.
 4. Google sign-in for both accounts, calendar match.
 5. LLM extraction, fallback note, "note written" notification.
-6. 5 real Meet calls.
+6. Slack huddle captions, read from the Slack desktop app through the accessibility API.
+7. 5 real Meet calls and 3 Slack huddles.
+
+### Slack huddle captions
+
+- The `huddle-captions` crate reads the huddle window of the Slack desktop app on the Mac: caption
+  rows with speaker names, participant tiles and the caption language. Research and live tests:
+  `~/knowledge/areas/infrastructure/meeting-recording/local-capture/slack-huddles/`.
+- It needs the Accessibility permission. Slack's own preference "Automatically turn on captions
+  when you're in a huddle" turns captions on; the app then presses the huddle's Captions tab. The
+  app cannot turn captions on itself: that menu opens only on a real mouse hover.
+- Each huddle is a log in the app data folder, one JSON line per event, written before any parsing.
+  The log is the meeting's input, like a TranscripTonic payload.
+- Huddles are never matched to calendar events. They keep the channel title and the people Slack
+  showed.
+- Markers live in layout profiles, TOML files per Slack version. A file in the app's
+  `slack-layouts` config folder overrides the built-in one without a rebuild.
+- The watcher never fails silently: degraded, captions-off and broken states each show in the tray
+  and send one notification per huddle.
+- A huddle under `min_huddle_seconds` (default 120) or with fewer than 3 caption lines writes no
+  note. `mc ingest --kind slack-huddle-log` writes one from its log.
 
 ## Open questions
 

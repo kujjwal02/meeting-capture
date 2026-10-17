@@ -1,7 +1,8 @@
 # Architecture
 
-One Rust process: a Tauri 2 tray app. OS-specific code stays in two capture crates and the call
-detector. Everything after "audio or captions exist" is shared code that builds on both OSes.
+One Rust process: a Tauri 2 tray app. OS-specific code stays in two capture crates, the call
+detector and the Slack huddle caption reader. Everything after "audio or captions exist" is shared
+code that builds on both OSes.
 
 The sections go from the outside in: what the app talks to, the three stages a meeting passes
 through, then each stage on its own.
@@ -104,6 +105,23 @@ flowchart LR
   job store. It replies 200 only after the app has recorded the meeting; otherwise TranscripTonic
   gets an error and offers a retry.
 
+### Slack huddle captions (phase 1)
+
+```mermaid
+flowchart LR
+    SL["Slack desktop app"] -->|accessibility API| HC["huddle-captions"]
+    HC -->|one JSON line per event| LOG[("huddle log")]
+    HC -->|started, health, ended| APP["app"]
+    APP -->|new job at huddle end| JOBS[("jobs")]
+```
+
+- `huddle-captions` polls Slack's huddle window every 0.5 s: caption rows, the caption overlay while
+  the panel is hidden, participant tiles, the caption language. It writes the huddle log itself,
+  so the log is complete before anything parses it.
+- At huddle end the app parses the log and records the meeting. At launch it closes logs a crash
+  left open and records any with no meeting.
+- macOS only. On Windows the crate starts nothing until a UI Automation adapter exists.
+
 ### Audio (phases 2, 3, 5, 7)
 
 ```mermaid
@@ -153,7 +171,7 @@ flowchart LR
 
 - All of this is the `pipeline` crate. It has no Tauri dependency, so `mc reprocess` runs it too.
 - Calendar match takes the event with the same Meet code, else the largest time overlap, across
-  both accounts.
+  both accounts. Slack huddles are never matched.
 - Extraction asks the LLM for notes in which every item cites transcript lines, then checks each
   quote against the transcript. [LLM extraction](07-llm-extraction.md) covers the prompt,
   providers, retries and note sections.
@@ -177,6 +195,8 @@ flowchart TB
     PIPE --> SRC["sources"]
     PIPE --> JOBS
     RCV --> SRC
+    APP --> HC["huddle-captions"]
+    HC --> SRC
 ```
 
 Later crates attach in their phase: the app depends on `detect`, `capture`, `stem-writer` and
@@ -190,6 +210,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 | Component | Phase | Job | Built on |
 |---|---|---|---|
 | caption-receiver | 1 | Accept TranscripTonic's webhook; fallback watches Downloads for its `.txt` | `axum` |
+| huddle-captions | 1 | Read Slack huddle captions from the Slack desktop app, write the huddle log, report health | Mac: accessibility API via `objc2-application-services` |
 | sources | 1 | Turn each input into the common transcript format | Captions, own stems, Meet REST API, dropped audio files |
 | pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `minijinja`, `toml`, `directories` |
 | jobs | 1 | One row per meeting with a closed state enum, its run lease and the extraction retry schedule | `rusqlite` |
@@ -203,7 +224,8 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 
 ## Design rules
 
-- OS code lives only in the capture adapters and the detector.
+- OS code lives only in the capture adapters, the detector and `huddle-captions`. Each of them may
+  use unsafe code for its FFI; the workspace forbids it everywhere else.
 - The pipeline has no Tauri dependency. A CLI can rerun any meeting from its stored inputs.
 - Notes are written to a temp file outside the vault, then renamed into place. Syncthing never sees
   a half-written note.
@@ -219,13 +241,16 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 Every source produces this shape before the pipeline runs:
 
 ```yaml
-source: transcriptonic | recorder | meet-api | audio-file
+source: transcriptonic | slack-huddle | recorder | meet-api | audio-file
 started_at: 2026-10-16T05:30:00Z
 ended_at: 2026-10-16T06:10:00Z
-platform: meet | teams | zoom | other
+platform: meet | teams | zoom | slack | other
 meeting_url: https://meet.google.com/abc-defg-hij
 title: Weekly sync            # what the call app showed; null if none
 speaker_naming: real | me-vs-them | diarized
+my_speaker: You               # the label the local user's lines carry; null if unknown
+attendees:                    # people the call app showed; empty for TranscripTonic
+  - {name: "Ujjwal Kumar", is_self: true, platform_id: U0123ABCDEF}
 segments:
   - {start_s: 0.0, end_s: 4.2, speaker: "Ujjwal", text: "..."}
 chat_messages:

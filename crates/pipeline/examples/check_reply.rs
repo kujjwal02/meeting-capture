@@ -35,6 +35,9 @@ fn main() -> anyhow::Result<()> {
         meeting_url: None,
         title: None,
         speaker_naming: SpeakerNaming::Real,
+        // TranscripTonic's label for the local user.
+        my_speaker: Some("You".to_owned()),
+        attendees: Vec::new(),
         segments: segments
             .into_iter()
             .map(|segment| Segment {
@@ -45,6 +48,7 @@ fn main() -> anyhow::Result<()> {
             })
             .collect(),
         chat_messages: Vec::new(),
+        slack_huddle: None,
     };
     let prompt = Prompt::new(&transcript, Some("Ujjwal Kumar"), &[], &[]);
     let reply =

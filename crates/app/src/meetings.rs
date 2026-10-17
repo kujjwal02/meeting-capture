@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use caption_receiver::ReceivedCaptions;
-use jobs::{JobState, Meeting, MeetingId};
+use jobs::{InputKind, JobState, Meeting, MeetingId};
 use pipeline::{Pipeline, RunOutcome};
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt as _;
@@ -61,7 +61,11 @@ fn payload_dir(app: &AppHandle) -> std::path::PathBuf {
 }
 
 fn record_and_run(app: &AppHandle, pipeline: &Pipeline, captions: ReceivedCaptions) {
-    let recorded = pipeline.record_transcriptonic(&captions.payload_path, &captions.transcript);
+    let recorded = pipeline.record(
+        InputKind::TranscriptonicPayload,
+        &captions.payload_path,
+        &captions.transcript,
+    );
     let reply = recorded.as_ref().map(|_| ()).map_err(ToString::to_string);
     if captions.recorded.send(reply).is_err() {
         tracing::warn!("TranscripTonic disconnected before the reply");

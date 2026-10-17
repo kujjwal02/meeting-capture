@@ -11,9 +11,11 @@ tauri-build.workspace = true
 
 [dependencies]
 caption-receiver.workspace = true
+huddle-captions.workspace = true
 jobs.workspace = true
 pipeline.workspace = true
 serde.workspace = true
+sources.workspace = true
 tauri.workspace = true
 tauri-plugin-autostart.workspace = true
 tauri-plugin-notification.workspace = true

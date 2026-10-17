@@ -7,7 +7,8 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use jobs::MeetingId;
 use serde::Serialize;
-use sources::{SpeakerNaming, Transcript};
+use sources::slack_huddle::HuddleHealth;
+use sources::{SlackHuddle, Transcript};
 
 use crate::PipelineError;
 use crate::calendar::CalendarMatch;
@@ -16,6 +17,8 @@ use crate::extraction::{CheckedCitation, CheckedNotes, CommitmentStrength};
 const BUILT_IN_TEMPLATE: &str = include_str!("note.md.j2");
 const UNTITLED_CALL: &str = "Untitled call";
 const NEEDS_EXTRACTION_TAG: &str = "status/needs-extraction";
+const SLACK_HUDDLE_TAG: &str = "topic/slack-huddle";
+const CAPTIONS_DEGRADED_TAG: &str = "status/captions-degraded";
 
 pub(crate) struct NoteInput<'a> {
     pub meeting_id: MeetingId,
@@ -54,10 +57,30 @@ struct Frontmatter<'a> {
     attendees: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     extraction: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slack_workspace: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slack_channel: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    slack_attendees: Vec<SlackAttendee<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_min: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    captions: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slack_version: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct SlackAttendee<'a> {
+    id: &'a str,
+    name: &'a str,
 }
 
 // The frontmatter keys the app writes. On a rerun these are rewritten; any other key stays.
-pub(crate) const APP_KEYS: [&str; 10] = [
+pub(crate) const APP_KEYS: [&str; 17] = [
     "title",
     "date",
     "created",
@@ -68,13 +91,22 @@ pub(crate) const APP_KEYS: [&str; 10] = [
     "meeting_id",
     "attendees",
     "extraction",
+    "slack_workspace",
+    "slack_channel",
+    "slack_attendees",
+    "duration_min",
+    "language",
+    "captions",
+    "slack_version",
 ];
 // Tags the app adds or removes. Other tags in `tags` are the user's and stay.
-pub(crate) const APP_TAGS: [&str; 4] = [
+pub(crate) const APP_TAGS: [&str; 6] = [
     "area/meetings",
     "topic/transcript",
     "status/active",
     NEEDS_EXTRACTION_TAG,
+    SLACK_HUDDLE_TAG,
+    CAPTIONS_DEGRADED_TAG,
 ];
 
 #[derive(Serialize)]
@@ -111,12 +143,7 @@ pub(crate) fn render(
 
     let transcript = note.transcript;
     let started_at = transcript.started_at.to_zoned(note.time_zone.clone());
-    let attendees: Vec<String> = note
-        .calendar_match
-        .event
-        .iter()
-        .flat_map(|event| event.attendees.clone())
-        .collect();
+    let attendees = attendees(transcript, note.calendar_match);
     let frontmatter = frontmatter_yaml(note, &attendees)?;
 
     let speaker_name = |speaker: &str| -> String {
@@ -177,6 +204,7 @@ pub(crate) fn render(
             frontmatter,
             title => inline_markdown(note.title()),
             when => started_at.strftime("%Y-%m-%d %H:%M %Z").to_string(),
+            huddle => minijinja::value::Serde(transcript.slack_huddle.as_ref().map(|huddle| huddle_view(transcript, huddle))),
             meeting_url => transcript.meeting_url.as_deref(),
             attendees => attendees.iter().map(|attendee| inline_markdown(attendee)).collect::<Vec<_>>(),
             segments => minijinja::value::Serde(&segments),
@@ -186,37 +214,86 @@ pub(crate) fn render(
     Ok(rendered)
 }
 
-// TranscripTonic's name for the local user.
-const TRANSCRIPTONIC_ME: &str = "You";
-
-/// The name a transcript speaker goes by in the note and the prompt.
+/// The name a transcript speaker goes by in the note and the prompt: the settings name for the
+/// local user, else the speaker label.
 pub(crate) fn speaker_name<'a>(
     transcript: &Transcript,
     my_name: Option<&'a str>,
     speaker: &'a str,
 ) -> &'a str {
-    match transcript.speaker_naming {
-        SpeakerNaming::Real if speaker == TRANSCRIPTONIC_ME => my_name.unwrap_or(speaker),
-        SpeakerNaming::Real | SpeakerNaming::MeVsThem | SpeakerNaming::Diarized => speaker,
+    if transcript.my_speaker.as_deref() == Some(speaker) {
+        my_name.unwrap_or(speaker)
+    } else {
+        speaker
     }
 }
 
 /// The local user's speaker name, when the transcript can tell which speaker that is.
 pub(crate) fn my_speaker_name<'a>(
-    transcript: &Transcript,
+    transcript: &'a Transcript,
     my_name: Option<&'a str>,
 ) -> Option<&'a str> {
-    match transcript.speaker_naming {
-        SpeakerNaming::Real => Some(my_name.unwrap_or(TRANSCRIPTONIC_ME)),
-        // The recorder's stem labels arrive with it in phase 3; diarized labels are anonymous.
-        SpeakerNaming::MeVsThem | SpeakerNaming::Diarized => None,
+    transcript
+        .my_speaker
+        .as_deref()
+        .map(|label| my_name.unwrap_or(label))
+}
+
+/// The calendar event's attendees, else the people the call app showed.
+pub(crate) fn attendees(transcript: &Transcript, calendar_match: &CalendarMatch) -> Vec<String> {
+    match &calendar_match.event {
+        Some(event) => event.attendees.clone(),
+        None => transcript
+            .attendees
+            .iter()
+            .map(|attendee| attendee.name.clone())
+            .collect(),
     }
+}
+
+#[derive(Serialize)]
+struct HuddleView {
+    /// "#team-review in Acme", or the DM's names.
+    place: String,
+    duration: String,
+    /// Set when the captions were not read in full.
+    captions_warning: Option<&'static str>,
+}
+
+fn huddle_view(transcript: &Transcript, huddle: &SlackHuddle) -> HuddleView {
+    let place = if sources::slack_huddle::is_dm(&huddle.channel) {
+        format!("DM with {} in {}", huddle.channel, huddle.workspace)
+    } else {
+        format!("#{} in {}", huddle.channel, huddle.workspace)
+    };
+    let captions_warning = match huddle.health {
+        HuddleHealth::Healthy | HuddleHealth::Untested => None,
+        HuddleHealth::Degraded => Some("read in part; some lines or names may be missing"),
+        HuddleHealth::CaptionsOff => Some("off for part of the huddle"),
+        HuddleHealth::Broken => Some("could not be read for part of the huddle"),
+    };
+    HuddleView {
+        place: inline_markdown(&place),
+        duration: format!("{} min", duration_min(transcript)),
+        captions_warning,
+    }
+}
+
+fn duration_min(transcript: &Transcript) -> i64 {
+    transcript.duration().as_secs().max(0).saturating_add(59) / 60
 }
 
 fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String, PipelineError> {
     let transcript = note.transcript;
     let started_at = transcript.started_at.to_zoned(note.time_zone.clone());
     let mut tags = vec!["area/meetings", "topic/transcript", "status/active"];
+    let huddle = transcript.slack_huddle.as_ref();
+    if let Some(huddle) = huddle {
+        tags.push(SLACK_HUDDLE_TAG);
+        if huddle.health.is_warning() {
+            tags.push(CAPTIONS_DEGRADED_TAG);
+        }
+    }
     if note.notes.is_none() {
         tags.push(NEEDS_EXTRACTION_TAG);
     }
@@ -234,6 +311,26 @@ fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String
         meeting_id: note.meeting_id.as_i64(),
         attendees: attendees.to_vec(),
         extraction: note.notes.and(note.extraction_provider),
+        slack_workspace: huddle.map(|huddle| huddle.workspace.as_str()),
+        slack_channel: huddle.map(|huddle| huddle.channel.as_str()),
+        slack_attendees: huddle
+            .map(|_| {
+                transcript
+                    .attendees
+                    .iter()
+                    .filter_map(|attendee| {
+                        Some(SlackAttendee {
+                            id: attendee.platform_id.as_deref()?,
+                            name: &attendee.name,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        duration_min: huddle.map(|_| duration_min(transcript)),
+        language: huddle.and_then(|huddle| huddle.language.as_deref()),
+        captions: huddle.map(|huddle| huddle.health.as_str()),
+        slack_version: huddle.map(|huddle| huddle.slack_version.as_str()),
     };
     serde_saphyr::to_string(&frontmatter)
         .map_err(|error| PipelineError::Frontmatter(error.to_string()))
@@ -502,6 +599,7 @@ fn source_name(transcript: &Transcript) -> &'static str {
         sources::Source::Recorder => "recorder",
         sources::Source::MeetApi => "meet-api",
         sources::Source::AudioFile => "audio-file",
+        sources::Source::SlackHuddle => "slack-huddle",
     }
 }
 

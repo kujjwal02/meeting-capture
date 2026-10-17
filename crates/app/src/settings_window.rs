@@ -8,7 +8,7 @@ use std::sync::{MutexGuard, PoisonError};
 use pipeline::calendar::AccountStatus;
 use pipeline::google::{self, OAuthClient};
 use pipeline::llm::claude_code_auth;
-use pipeline::settings::{ProviderKind, SettingsFile};
+use pipeline::settings::{ProviderKind, SettingsFile, SlackSettings};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt as _;
@@ -45,6 +45,7 @@ pub(crate) struct SettingsView {
     has_client_secret: bool,
     accounts: Vec<AccountView>,
     llm: LlmView,
+    slack: SlackSettings,
     settings_file: PathBuf,
 }
 
@@ -79,6 +80,8 @@ pub(crate) struct SettingsForm {
     llm_base_url: String,
     /// For `llm_provider`. Blank keeps the stored key while the provider and base URL stay.
     llm_api_key: String,
+    slack_read_captions: bool,
+    slack_auto_start_captions: bool,
 }
 
 #[derive(Serialize)]
@@ -153,6 +156,7 @@ pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, 
         client_id: file.google.client_id,
         accounts,
         llm,
+        slack: file.slack,
         settings_file: state.app_dirs.settings_file(),
     })
 }
@@ -215,11 +219,14 @@ pub(crate) fn settings_save(
         Some(_) | None => None,
     };
     let is_key_removed = takes_api_key && had_api_key && file.llm.api_key.is_none();
+    file.slack.read_captions = form.slack_read_captions;
+    file.slack.auto_start_captions = form.slack_auto_start_captions;
     file.llm.validate().map_err(|error| error.to_string())?;
     file.write(&state.app_dirs)
         .map_err(|error| error.to_string())?;
     // Applied under the lock, so a sign-in or removal that writes next is never overwritten here.
     apply_google(&app, &file);
+    state.set_slack(file.slack);
     drop(settings_file_guard);
     tracing::info!("settings saved");
     if !old_refresh_tokens.is_empty() {

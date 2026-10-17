@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use jiff::tz::TimeZone;
-use jobs::{JobState, JobStore, Meeting, MeetingId};
+use jobs::{InputKind, JobState, JobStore, Meeting, MeetingId};
 use pipeline::extraction::{self, CheckedNotes, Prompt};
 use pipeline::llm::Provider;
 use pipeline::settings::{AppDirs, ProviderKind, Settings};
@@ -20,8 +20,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Add a saved TranscripTonic advanced webhook body as a new meeting and process it.
-    Ingest { payload_file: PathBuf },
+    /// Add a saved input as a new meeting and process it.
+    Ingest {
+        /// A TranscripTonic advanced webhook body, or a Slack huddle log.
+        input_file: PathBuf,
+        #[arg(long, value_enum, default_value_t = InputKindArg::TranscriptonicPayload)]
+        kind: InputKindArg,
+    },
     /// Run every step again for a meeting, rewriting its note.
     Reprocess {
         meeting_id: i64,
@@ -71,8 +76,11 @@ fn main() -> anyhow::Result<()> {
 
     let time_zone = pipeline.settings().time_zone.clone();
     match cli.command {
-        Command::Ingest { payload_file } => {
-            let id = ingest(&pipeline, &app_dirs, &payload_file)?;
+        Command::Ingest { input_file, kind } => {
+            let id = match kind {
+                InputKindArg::TranscriptonicPayload => ingest(&pipeline, &app_dirs, &input_file)?,
+                InputKindArg::SlackHuddleLog => ingest_huddle(&pipeline, &app_dirs, &input_file)?,
+            };
             print_outcome(&pipeline.run(id)?, &time_zone);
         }
         Command::Reprocess {
@@ -151,7 +159,34 @@ fn ingest(
     let transcript = sources::transcriptonic::parse(&payload)?;
     let payload_path = sources::transcriptonic::save_payload(&app_dirs.payload_dir(), &payload)
         .context("could not save the payload in the app folder")?;
-    Ok(pipeline.record_transcriptonic(&payload_path, &transcript)?)
+    Ok(pipeline.record(InputKind::TranscriptonicPayload, &payload_path, &transcript)?)
+}
+
+// Copies the log into the app's huddle folder under its start time, unless it is already there.
+// A huddle the app skipped as too short is already there, and ingesting it writes its note.
+fn ingest_huddle(
+    pipeline: &Pipeline,
+    app_dirs: &AppDirs,
+    log_file: &Path,
+) -> anyhow::Result<MeetingId> {
+    let log = std::fs::read(log_file)
+        .with_context(|| format!("could not read {}", log_file.display()))?;
+    let transcript = sources::slack_huddle::parse(&log)?;
+    let log_path = app_dirs
+        .huddle_log_dir()
+        .join(sources::slack_huddle::log_file_name(transcript.started_at));
+    let is_in_place = std::fs::canonicalize(log_file).ok() == std::fs::canonicalize(&log_path).ok();
+    if !is_in_place {
+        std::fs::copy(log_file, &log_path)
+            .with_context(|| format!("could not copy the log to {}", log_path.display()))?;
+    }
+    Ok(pipeline.record(InputKind::SlackHuddleLog, &log_path, &transcript)?)
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum InputKindArg {
+    TranscriptonicPayload,
+    SlackHuddleLog,
 }
 
 fn check_saved_reply(prompt: &Prompt, reply_file: &Path) -> anyhow::Result<CheckedNotes> {

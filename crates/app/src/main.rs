@@ -4,16 +4,17 @@
 // Release builds on Windows would otherwise open a console window next to the tray icon.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod huddles;
 mod launch;
 mod meetings;
 mod settings_window;
 mod tray;
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use jobs::JobStore;
 use pipeline::Pipeline;
-use pipeline::settings::{AppDirs, Settings};
+use pipeline::settings::{AppDirs, Settings, SlackSettings};
 use tauri::{AppHandle, Manager, RunEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
@@ -32,6 +33,9 @@ pub(crate) struct AppState {
     /// Held across each read, edit and write of the settings file, so two edits never drop each
     /// other's change.
     pub settings_file_lock: Mutex<()>,
+    /// The settings window replaces this, and the huddle watcher reads it before each step.
+    pub slack: RwLock<SlackSettings>,
+    pub huddle_status: Mutex<huddles::HuddleStatus>,
 }
 
 impl AppState {
@@ -40,6 +44,28 @@ impl AppState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    pub fn slack(&self) -> SlackSettings {
+        *self.slack.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn set_slack(&self, slack: SlackSettings) {
+        *self.slack.write().unwrap_or_else(PoisonError::into_inner) = slack;
+    }
+
+    pub fn huddle_status(&self) -> huddles::HuddleStatus {
+        self.huddle_status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set_huddle_status(&self, status: huddles::HuddleStatus) {
+        *self
+            .huddle_status
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = status;
     }
 }
 
@@ -124,16 +150,23 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(reason) => (None, Listener::Stopped { reason }),
     };
+    let slack = pipeline
+        .as_ref()
+        .map(|(pipeline, _)| pipeline.settings().slack)
+        .unwrap_or_default();
     app.manage(AppState {
         app_dirs,
         pipeline: pipeline.as_ref().map(|(pipeline, _)| Arc::clone(pipeline)),
         listener: Mutex::new(listener.clone()),
         settings_file_lock: Mutex::new(()),
+        slack: RwLock::new(slack),
+        huddle_status: Mutex::new(huddles::HuddleStatus::Idle),
     });
     tray::create(app.handle())?;
     match pipeline {
         Some((pipeline, port)) => {
             check_google_accounts(app.handle().clone(), Arc::clone(&pipeline));
+            huddles::start(app.handle(), &pipeline);
             meetings::start(app.handle().clone(), pipeline, port);
         }
         None => set_listener(app.handle(), listener),

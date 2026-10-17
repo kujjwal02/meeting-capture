@@ -1,8 +1,9 @@
 //! Turns each input into the common transcript format.
 
+pub mod slack_huddle;
 pub mod transcriptonic;
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 /// One meeting's transcript, the same shape whatever produced it.
@@ -16,8 +17,45 @@ pub struct Transcript {
     /// The title the call app showed. The calendar event title wins when one matches.
     pub title: Option<String>,
     pub speaker_naming: SpeakerNaming,
+    /// The speaker label the local user's lines carry, when the source can tell.
+    pub my_speaker: Option<String>,
+    /// The people the call app showed. Empty when the source does not list them.
+    pub attendees: Vec<Attendee>,
     pub segments: Vec<Segment>,
     pub chat_messages: Vec<ChatMessage>,
+    /// What only a Slack huddle has. `None` for every other source.
+    pub slack_huddle: Option<SlackHuddle>,
+}
+
+impl Transcript {
+    /// The time the meeting ran.
+    #[must_use]
+    pub fn duration(&self) -> SignedDuration {
+        self.ended_at.duration_since(self.started_at)
+    }
+}
+
+/// A participant as the call app showed them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attendee {
+    pub name: String,
+    pub is_self: bool,
+    /// The call app's id for the person, such as a Slack user id.
+    pub platform_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlackHuddle {
+    pub workspace: String,
+    /// A channel name, or the other people's names in a DM.
+    pub channel: String,
+    pub slack_version: String,
+    /// The layout profile that read the huddle window, or "none".
+    pub layout_profile: String,
+    /// The worst health the watcher reported during the huddle.
+    pub health: slack_huddle::HuddleHealth,
+    /// The caption language Slack showed, such as "English (US)".
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +65,7 @@ pub enum Source {
     Recorder,
     MeetApi,
     AudioFile,
+    SlackHuddle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +74,7 @@ pub enum Platform {
     Meet,
     Teams,
     Zoom,
+    Slack,
     Other,
 }
 

@@ -132,9 +132,44 @@ Done when:
 - [ ] Compare Haiku 5.5, Sonnet through Claude Code and GLM-5.3-Flash on five real transcripts.
 - [x] Review by a subagent; findings fixed.
 
-### Step 6: real calls
+### Step 6: Slack huddle captions
 
-- [ ] 5 real Meet calls write correct notes with no manual step.
+- [x] `huddle-captions` crate: Mac adapter over the accessibility API, layout profiles as TOML with
+  an override folder, three matching levels for the caption panel, overlay fallback, health states.
+- [x] Huddle window found by Slack's "Child window toolbar" and the huddle content class. An
+  unreadable child window counts as a broken huddle only while the main window shows "Leave huddle".
+- [x] Captions tab pressed when the panel is hidden: once at the start, a retry after 10 s, and after
+  the user hides the panel only once it has stayed hidden for 2 minutes.
+- [x] Huddle log schema 1, one file per huddle, flushed per line; open logs get an `ended` line at
+  launch and become meetings.
+- [x] `sources::slack_huddle` parser: rows, overlay lines only while the panel was hidden, backlog
+  rows spread before the first live row, attendees from tiles, the self tile as "me".
+- [x] `InputKind::SlackHuddleLog`, `mc ingest --kind slack-huddle-log`, huddles never matched to the
+  calendar.
+- [x] Note fields: `slack_workspace`, `slack_channel`, `slack_attendees`, `duration_min`,
+  `language`, `captions`, `slack_version`; tags `topic/slack-huddle` and
+  `status/captions-degraded`.
+- [x] Settings: "Read Slack huddle captions" and "Start captions automatically", applied from the
+  next huddle; `min_huddle_seconds` in the file.
+- [x] Tray line per huddle state, Accessibility prompt and a menu item to its settings pane, one
+  notification per huddle and warning state.
+- [x] Two live solo huddles on Slack 4.52.171: captions tab pressed 2 s after start, a Thread-tab
+  visit kept, notes written from the logs.
+- [ ] A huddle with two or more people: join and leave, both speakers' rows, DM titles.
+- [x] Closing and reopening the huddle window mid-huddle keeps one log; lines said while it was
+  closed come from the reopened panel.
+- [ ] A Thread visit over 2 minutes, and a busy Slack.
+- [ ] A 45-minute huddle: does the panel drop or renumber rows?
+- [ ] "Save Slack layout dump" and `mc slack-layout probe`.
+- [ ] `previous_huddle` link, `channel_clients` map, join and leave times in the note.
+- [ ] Purge huddle logs after 90 days.
+- [ ] Resume a log when the app restarts during a huddle (today it ends the log and starts another).
+- [ ] CPU of Slack plus the watcher against a captions-off baseline over 10 minutes.
+- [ ] Windows build checked on the PC (the crate builds a no-op there).
+
+### Step 7: real calls
+
+- [ ] 5 real Meet calls and 3 Slack huddles write correct notes with no manual step.
 - [ ] The tray lists them.
 - [ ] A calendar sign-in still works after 8 days.
 - [ ] Windows build checked on the PC.

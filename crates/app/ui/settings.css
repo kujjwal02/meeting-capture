@@ -32,6 +32,12 @@ label {
   margin: 10px 0;
 }
 
+label.checkbox {
+  align-items: center;
+  flex-direction: row;
+  gap: 8px;
+}
+
 input[type="text"],
 input[type="password"],
 input[type="number"],

@@ -10,6 +10,12 @@
 # {{ title }}
 
 - **When:** {{ when }}
+{% if huddle %}
+- **Slack huddle:** {{ huddle.place }}, {{ huddle.duration }}
+{% if huddle.captions_warning %}
+- **Captions:** {{ huddle.captions_warning }}
+{% endif %}
+{% endif %}
 {% if meeting_url %}
 - **Meeting URL:** {{ meeting_url }}
 {% endif %}

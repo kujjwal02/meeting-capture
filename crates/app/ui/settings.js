@@ -81,6 +81,11 @@ async function checkClaudeCode() {
   }
 }
 
+// Starting captions means nothing while captions are not read.
+function showSlackFields() {
+  field("slack-auto-start-captions").disabled = !field("slack-read-captions").checked;
+}
+
 async function load() {
   try {
     const settings = await invoke("settings_load");
@@ -99,6 +104,9 @@ async function load() {
     field("llm-base-url").value = llm.base_url ?? "";
     field("llm-api-key").value = "";
     showProviderFields();
+    field("slack-read-captions").checked = settings.slack.read_captions;
+    field("slack-auto-start-captions").checked = settings.slack.auto_start_captions;
+    showSlackFields();
     renderAccounts(settings.accounts);
   } catch (error) {
     showMessage(String(error), true);
@@ -119,6 +127,8 @@ async function save(event) {
     llm_model: field("llm-model").value,
     llm_base_url: field("llm-base-url").value,
     llm_api_key: field("llm-api-key").value,
+    slack_read_captions: field("slack-read-captions").checked,
+    slack_auto_start_captions: field("slack-auto-start-captions").checked,
   };
   try {
     showMessage(await invoke("settings_save", { form }), false);
@@ -181,4 +191,5 @@ field("llm-provider").addEventListener("change", () => {
 field("llm-base-url").addEventListener("input", showProviderFields);
 field("client-id").addEventListener("input", showClientSecretState);
 field("check-claude-code").addEventListener("click", checkClaudeCode);
+field("slack-read-captions").addEventListener("change", showSlackFields);
 load();

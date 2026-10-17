@@ -120,6 +120,7 @@ impl AppDirs {
         for path in [
             &self.config_dir,
             &self.payload_dir(),
+            &self.huddle_log_dir(),
             &self.note_staging_dir(),
             &self.log_dir(),
         ] {
@@ -153,6 +154,19 @@ impl AppDirs {
         self.data_dir.join("payloads")
     }
 
+    /// Raw inputs: one log per Slack huddle, as the huddle watcher wrote it.
+    #[must_use]
+    pub fn huddle_log_dir(&self) -> PathBuf {
+        self.data_dir.join("huddles")
+    }
+
+    /// Layout profiles that override the built-in ones, for a Slack release the app does not
+    /// know yet.
+    #[must_use]
+    pub fn slack_layout_dir(&self) -> PathBuf {
+        self.config_dir.join("slack-layouts")
+    }
+
     #[must_use]
     pub fn log_dir(&self) -> PathBuf {
         self.data_dir.join("logs")
@@ -182,6 +196,29 @@ pub struct Settings {
     pub time_zone: TimeZone,
     pub google: GoogleSettings,
     pub llm: LlmSettings,
+    pub slack: SlackSettings,
+}
+
+/// Slack huddle captions, read from the Slack desktop app. The app reads these before each
+/// huddle, so a change applies to the next one without a restart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SlackSettings {
+    pub read_captions: bool,
+    /// Press the huddle's Captions tab when captions are on but the panel is hidden.
+    pub auto_start_captions: bool,
+    /// A shorter huddle writes no note; `mc ingest` can still write one from its log.
+    pub min_huddle_seconds: u32,
+}
+
+impl Default for SlackSettings {
+    fn default() -> Self {
+        Self {
+            read_captions: true,
+            auto_start_captions: true,
+            min_huddle_seconds: 120,
+        }
+    }
 }
 
 /// The LLM that writes the notes. Validated once on load.
@@ -333,6 +370,8 @@ pub struct SettingsFile {
     pub google: GoogleSettings,
     #[serde(default)]
     pub llm: LlmSettings,
+    #[serde(default)]
+    pub slack: SlackSettings,
 }
 
 const DEFAULT_RECEIVER_PORT: u16 = 47615;
@@ -357,6 +396,9 @@ const SETTINGS_HEADER: &str = "\
 # [llm] effort: low, medium or high, claude-code only.
 # [llm] glossary: names and terms the captions often mishear.
 # [llm] claude_path: the claude binary, when it is not in a standard install folder.
+# [slack] read_captions: read Slack huddle captions from the Slack desktop app (macOS).
+# [slack] auto_start_captions: press the huddle's Captions tab when its caption panel is hidden.
+# [slack] min_huddle_seconds: a shorter huddle writes no note. Default 120.
 
 ";
 
@@ -481,6 +523,7 @@ impl Settings {
             time_zone,
             google: file.google,
             llm: file.llm,
+            slack: file.slack,
         })
     }
 

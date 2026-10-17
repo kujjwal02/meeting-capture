@@ -51,6 +51,7 @@ sha2 = "0.11"
 tempfile = "3.27"
 toml = "1.1"
 caption-receiver = { path = "crates/caption-receiver" }
+huddle-captions = { path = "crates/huddle-captions" }
 jobs = { path = "crates/jobs" }
 pipeline = { path = "crates/pipeline" }
 sources = { path = "crates/sources" }

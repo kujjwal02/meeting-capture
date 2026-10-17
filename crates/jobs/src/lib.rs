@@ -99,14 +99,17 @@ impl JobState {
 pub enum InputKind {
     /// A raw TranscripTonic advanced webhook body.
     TranscriptonicPayload,
+    /// A Slack huddle log written by the huddle watcher, one JSON line per event.
+    SlackHuddleLog,
 }
 
 impl InputKind {
-    const ALL: [InputKind; 1] = [InputKind::TranscriptonicPayload];
+    const ALL: [InputKind; 2] = [InputKind::TranscriptonicPayload, InputKind::SlackHuddleLog];
 
     fn as_str(self) -> &'static str {
         match self {
             InputKind::TranscriptonicPayload => "transcriptonic-payload",
+            InputKind::SlackHuddleLog => "slack-huddle-log",
         }
     }
 }
@@ -410,6 +413,19 @@ impl JobStore {
         ))?;
         let rows = statement.query_map([limit], read_meeting)?;
         rows.map(|row| row?).collect()
+    }
+
+    /// Whether a meeting was recorded from the input at `input_path`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError` when the query fails.
+    pub fn has_input(&self, input_path: &Path) -> Result<bool, StoreError> {
+        Ok(self.connection().query_row(
+            "SELECT EXISTS (SELECT 1 FROM meetings WHERE input_path = ?1)",
+            [input_path.to_string_lossy()],
+            |row| row.get(0),
+        )?)
     }
 
     /// Meetings to run again, oldest first: those that stopped before their note was written

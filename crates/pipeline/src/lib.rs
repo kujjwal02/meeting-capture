@@ -40,6 +40,8 @@ pub enum PipelineError {
     },
     #[error(transparent)]
     ParseTranscriptonic(#[from] sources::transcriptonic::ParseError),
+    #[error(transparent)]
+    ParseSlackHuddle(#[from] sources::slack_huddle::ParseError),
     #[error("stored step output is not valid JSON: {0}")]
     StepOutput(#[from] serde_json::Error),
     #[error("calendar match failed: {0}")]
@@ -180,20 +182,21 @@ impl Pipeline {
         Ok(self.prompt(&transcript, &calendar_match))
     }
 
-    /// Records a TranscripTonic payload that is already saved at `payload_path`. A re-post of a
-    /// meeting already in the store reuses that meeting and its note.
+    /// Records a meeting whose input of `kind` is already saved at `input_path`. Recording a
+    /// meeting already in the store, such as a re-posted payload, reuses that meeting and its note.
     ///
     /// # Errors
     ///
     /// Returns `PipelineError::Store` when the write fails.
-    pub fn record_transcriptonic(
+    pub fn record(
         &self,
-        payload_path: &Path,
+        kind: InputKind,
+        input_path: &Path,
         transcript: &Transcript,
     ) -> Result<MeetingId, PipelineError> {
         Ok(self.store.upsert_captured(
-            InputKind::TranscriptonicPayload,
-            payload_path,
+            kind,
+            input_path,
             transcript.started_at,
             transcript.title.as_deref(),
         )?)
@@ -482,15 +485,10 @@ impl Pipeline {
     }
 
     fn prompt(&self, transcript: &Transcript, calendar_match: &CalendarMatch) -> Prompt {
-        let attendees = calendar_match
-            .event
-            .as_ref()
-            .map(|event| event.attendees.as_slice())
-            .unwrap_or_default();
         Prompt::new(
             transcript,
             self.settings.my_name.as_deref(),
-            attendees,
+            &note::attendees(transcript, calendar_match),
             &self.llm().glossary,
         )
     }
@@ -715,6 +713,7 @@ fn load_transcript(meeting: &Meeting) -> Result<Transcript, PipelineError> {
     })?;
     match meeting.input_kind {
         InputKind::TranscriptonicPayload => Ok(sources::transcriptonic::parse(&input)?),
+        InputKind::SlackHuddleLog => Ok(sources::slack_huddle::parse(&input)?),
     }
 }
 
