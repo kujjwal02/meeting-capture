@@ -51,14 +51,22 @@ The app sends no telemetry. Logs are written locally to `logs/app.log` in the ap
 Requirements: a Mac with Apple silicon, Google Chrome with TranscripTonic for Meet calls, and Slack
 for huddles.
 
-1. Download `Meeting-Capture_<version>_aarch64.dmg` from the
-   [latest release](https://github.com/kujjwal02/meeting-capture/releases).
-2. The DMG is not notarized, so macOS blocks it. Clear the download flag:
-   `xattr -d com.apple.quarantine ~/Downloads/Meeting-Capture_<version>_aarch64.dmg`.
-3. Open the DMG and drag Meeting Capture to Applications.
+```sh
+brew trust --tap kujjwal02/tap
+brew install --cask kujjwal02/tap/meeting-capture
+```
 
-The [install guide](docs/08-install.md) covers the checksum, permissions, first-time setup, upgrades
-and removal.
+Or, without Homebrew:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kujjwal02/meeting-capture/main/scripts/install.sh | sh
+```
+
+The app is self-signed and not notarized. Both commands install it without the "Apple could not
+verify" prompt that a browser download gets.
+
+The [install guide](docs/08-install.md) covers the DMG by hand, first-time setup, upgrades and
+removal.
 
 ## Configure
 
@@ -108,6 +116,10 @@ just hooks
 | `just fmt` | Rewrites files to the formatters' output. |
 | `just signing-cert` | Adds a self-signed code-signing identity to the login keychain, once per Mac. macOS keeps the app's permissions across rebuilds only with a stable identity. |
 | `just release` | Runs `just check`, then builds the signed DMG and its SHA-256 file in `target/dist`. |
+
+After `just release`, attach the DMG and its `.sha256` file to a GitHub release. Then set
+`version` and `sha256` in the
+[tap's cask](https://github.com/kujjwal02/homebrew-tap/blob/main/Casks/meeting-capture.rb).
 
 To keep a dev run away from your real job store, set `MEETING_CAPTURE_HOME` to a scratch folder. The
 app then reads `config/settings.toml` and writes `data/` inside it.
