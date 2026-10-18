@@ -9,6 +9,7 @@ mod launch;
 mod meetings;
 mod settings_window;
 mod tray;
+mod updates;
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -32,6 +33,7 @@ pub(crate) struct AppState {
     /// to load.
     pub settings: Arc<SettingsStore>,
     pub huddle_status: Mutex<huddles::HuddleStatus>,
+    pub updates: updates::Updates,
 }
 
 impl AppState {
@@ -85,6 +87,7 @@ fn main() -> tauri::Result<()> {
         ))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .invoke_handler(tauri::generate_handler![
             settings_window::settings_load,
             settings_window::settings_save,
@@ -103,14 +106,17 @@ fn main() -> tauri::Result<()> {
         })
         .build(tauri::generate_context!())?;
 
-    app.run(|_, event| {
+    app.run(|app, event| match event {
         // Closing the last window must not quit a tray app; only the Quit item does.
-        if let RunEvent::ExitRequested {
+        RunEvent::ExitRequested {
             code: None, api, ..
-        } = event
-        {
-            api.prevent_exit();
+        } => api.prevent_exit(),
+        // The Quit item, an AppleScript quit and logout all end here, so a downloaded update
+        // installs at any quit.
+        RunEvent::Exit => {
+            updates::install_downloaded(app);
         }
+        _ => {}
     });
     Ok(())
 }
@@ -141,8 +147,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         listener: Mutex::new(listener.clone()),
         settings: settings_store,
         huddle_status: Mutex::new(huddles::HuddleStatus::Idle),
+        updates: updates::Updates::default(),
     });
     tray::create(app.handle())?;
+    updates::start(app.handle());
     match pipeline {
         Some((pipeline, port)) => {
             check_google_accounts(app.handle().clone());

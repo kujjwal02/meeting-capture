@@ -25,7 +25,7 @@ pub(crate) fn start(app: AppHandle, pipeline: Arc<Pipeline>, port: u16) {
 
 async fn receive(app: AppHandle, pipeline: Arc<Pipeline>, port: u16) {
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let listener = match TcpListener::bind(address).await {
+    let listener = match bind(address).await {
         Ok(listener) => listener,
         Err(error) => {
             let reason = format!("cannot listen on {address}: {error}");
@@ -50,6 +50,24 @@ async fn receive(app: AppHandle, pipeline: Arc<Pipeline>, port: u16) {
         Err(error) => format!("the receiver crashed: {error}"),
     };
     set_listener(&app, Listener::Stopped { reason });
+}
+
+// After an update, the relaunched app starts before the old process has released the port.
+async fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
+    const BIND_ATTEMPTS: u32 = 20;
+    const BIND_RETRY_DELAY: Duration = Duration::from_millis(500);
+    let mut attempt = 1;
+    loop {
+        match TcpListener::bind(address).await {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AddrInUse && attempt < BIND_ATTEMPTS =>
+            {
+                attempt += 1;
+                tokio::time::sleep(BIND_RETRY_DELAY).await;
+            }
+            bound => return bound,
+        }
+    }
 }
 
 fn payload_dir(app: &AppHandle) -> std::path::PathBuf {

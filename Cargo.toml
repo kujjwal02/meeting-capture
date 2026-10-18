@@ -4,7 +4,7 @@ members = ["crates/*"]
 default-members = ["crates/app"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
 publish = false
@@ -18,6 +18,11 @@ tauri-plugin-autostart = "2.7"
 tauri-plugin-notification = "2.7"
 tauri-plugin-opener = "2.7"
 tauri-plugin-single-instance = "2.5"
+# No "zip": it only reads Tauri v1 Windows bundles. native-tls matches the other HTTP clients.
+tauri-plugin-updater = { version = "2.14", default-features = false, features = [
+  "native-tls",
+  "system-proxy",
+] }
 anyhow = "1.0"
 axum = "0.8"
 jiff = { version = "0.2", features = ["serde"] }

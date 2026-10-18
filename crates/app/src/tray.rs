@@ -15,7 +15,7 @@ use tauri_plugin_opener::OpenerExt as _;
 
 use crate::huddles::HuddleStatus;
 use crate::launch::{LaunchTarget, launch};
-use crate::{AppState, Listener, meetings};
+use crate::{AppState, Listener, meetings, updates};
 
 const TRAY_ID: &str = "main";
 const RECENT_MEETINGS: u32 = 5;
@@ -30,6 +30,7 @@ enum MenuAction {
     OverwriteEdits(MeetingId),
     RetryFailed,
     OpenAccessibilitySettings,
+    InstallUpdate,
     StartAtLogin,
     OpenSettings,
     ShowLogFile,
@@ -44,6 +45,7 @@ impl MenuAction {
             MenuAction::OverwriteEdits(id) => format!("overwrite-edits:{id}"),
             MenuAction::RetryFailed => "retry-failed".to_owned(),
             MenuAction::OpenAccessibilitySettings => "open-accessibility-settings".to_owned(),
+            MenuAction::InstallUpdate => "install-update".to_owned(),
             MenuAction::StartAtLogin => "start-at-login".to_owned(),
             MenuAction::OpenSettings => "open-settings".to_owned(),
             MenuAction::ShowLogFile => "show-log-file".to_owned(),
@@ -65,6 +67,7 @@ impl MenuAction {
         [
             MenuAction::RetryFailed,
             MenuAction::OpenAccessibilitySettings,
+            MenuAction::InstallUpdate,
             MenuAction::StartAtLogin,
             MenuAction::OpenSettings,
             MenuAction::ShowLogFile,
@@ -129,6 +132,15 @@ fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         menu.append(&PredefinedMenuItem::separator(app)?)?;
     }
 
+    if let Some(version) = state.updates.ready_version() {
+        let label = format!("Install update {version} and restart");
+        menu.append(&action_entry(
+            app,
+            &MenuAction::InstallUpdate,
+            &label,
+            true,
+        )?)?;
+    }
     menu.append(&start_at_login_entry(app)?)?;
     menu.append(&action_entry(
         app,
@@ -359,6 +371,10 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
             if let Err(error) = app.opener().open_url(ACCESSIBILITY_PANE, None::<&str>) {
                 tracing::error!(exception.message = %error, "could not open the Accessibility settings");
             }
+        }
+        MenuAction::InstallUpdate => {
+            let app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || updates::install_and_restart(&app));
         }
         MenuAction::StartAtLogin => toggle_start_at_login(app),
         MenuAction::OpenSettings => crate::settings_window::open(app),

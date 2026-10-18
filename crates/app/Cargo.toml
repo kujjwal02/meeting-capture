@@ -15,14 +15,20 @@ huddle-captions.workspace = true
 jobs.workspace = true
 pipeline.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tauri.workspace = true
 tauri-plugin-autostart.workspace = true
 tauri-plugin-notification.workspace = true
 tauri-plugin-opener.workspace = true
 tauri-plugin-single-instance.workspace = true
+tauri-plugin-updater.workspace = true
 tokio = { workspace = true, features = ["net", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+# Only tauri::generate_context! uses serde_json, so cargo-shear sees no use.
+[package.metadata.cargo-shear]
+ignored = ["serde_json"]
