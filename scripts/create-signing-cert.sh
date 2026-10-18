@@ -1,11 +1,16 @@
 #!/bin/sh
-# Creates a self-signed code-signing identity in the login keychain, once per Mac.
+# Creates the self-signed code-signing identity in the login keychain. Run it once; on another Mac,
+# import the .p12 it writes instead.
 # macOS ties mic and audio grants to the signing identity. A stable identity keeps those grants
 # across rebuilds; an ad-hoc signature changes with every build.
-# Usage: create-signing-cert.sh "<identity name>". `just signing-cert` passes the name.
+# The release workflow signs with the same identity, so the script also writes it as a PKCS#12 file
+# for the GitHub secret. Store that file and its password in a password manager: a new identity
+# makes every Mac grant the app's permissions again.
+# Usage: create-signing-cert.sh "<identity name>" <output .p12>. `just signing-cert` passes both.
 set -eu
 
-name=${1:?usage: create-signing-cert.sh "<identity name>"}
+name=${1:?usage: create-signing-cert.sh "<identity name>" <output .p12>}
+p12_out=${2:?usage: create-signing-cert.sh "<identity name>" <output .p12>}
 if security find-identity -v -p codesigning | grep -q "\"$name\""; then
   echo "\"$name\" already exists"
   exit 0
@@ -24,12 +29,13 @@ trap 'rm -rf "$work"' EXIT
   -addext "keyUsage=critical,digitalSignature" \
   -addext "extendedKeyUsage=critical,codeSigning" \
   -keyout "$work/key.pem" -out "$work/cert.pem"
-# The password only protects this temporary file, which the trap deletes.
-"$openssl" pkcs12 -export -legacy -name "$name" -passout pass:meeting-capture \
-  -inkey "$work/key.pem" -in "$work/cert.pem" -out "$work/identity.p12"
-# -x keeps the private key from being exported out of the keychain.
-security import "$work/identity.p12" -k login.keychain-db -P meeting-capture -x \
+umask 077
+"$openssl" rand -base64 24 | tr -d '\n' > "$p12_out.password"
+"$openssl" pkcs12 -export -legacy -name "$name" -passout file:"$p12_out.password" \
+  -inkey "$work/key.pem" -in "$work/cert.pem" -out "$p12_out"
+security import "$p12_out" -k login.keychain-db -P "$(cat "$p12_out.password")" \
   -T /usr/bin/codesign
 echo "Trust the certificate for code signing. macOS asks for your login password."
 security add-trusted-cert -p codeSign -k login.keychain-db "$work/cert.pem"
 security find-identity -v -p codesigning | grep "\"$name\""
+echo "Wrote $p12_out and $p12_out.password. Store both in a password manager."

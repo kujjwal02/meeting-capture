@@ -1,6 +1,6 @@
 set windows-shell := ["pwsh.exe", "-NoLogo", "-Command"]
 
-# Every local check. No CI until phase 8, so this is the gate.
+# Every check. The check workflow runs the same recipe on each push.
 check: fmt-check lint deny shear
 
 # Rewrite files in place.
@@ -34,21 +34,38 @@ hooks:
 dev:
     cd crates/app && cargo tauri dev
 
-# The self-signed identity that signs the Mac app.
-signing-identity := "Meeting Capture Dev"
+# The self-signed identity that signs the Mac app, here and in the release workflow.
+signing-identity := "Meeting Capture"
 
-# Create the signing identity in the login keychain, once per Mac.
+# Create the signing identity in the login keychain, once. Keep the .p12 it writes.
 [macos]
 signing-cert:
-    scripts/create-signing-cert.sh "{{signing-identity}}"
+    mkdir -p ~/.tauri
+    scripts/create-signing-cert.sh "{{signing-identity}}" ~/.tauri/meeting-capture-signing.p12
 
-# Build the signed DMG and its checksum into target/dist/. Run `just signing-cert` once first.
+# Check, then build the release files. Run `just signing-cert` once first.
 [macos]
-release: check
-    cd crates/app && APPLE_SIGNING_IDENTITY="{{signing-identity}}" cargo tauri build --bundles app,dmg
+release: check bundle
+
+# Build the signed DMG, the signed updater package and latest.json into target/dist/. The release
+# workflow sets the updater key variables; locally they default to the files in ~/.tauri.
+[macos]
+bundle:
+    #!/bin/sh
+    set -eu
+    export TAURI_SIGNING_PRIVATE_KEY="${TAURI_SIGNING_PRIVATE_KEY:-$(cat ~/.tauri/meeting-capture-updater.key)}"
+    export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-$(cat ~/.tauri/meeting-capture-updater.key.password)}"
+    version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "meeting-capture") | .version')
+    (cd crates/app && APPLE_SIGNING_IDENTITY="{{signing-identity}}" cargo tauri build --bundles app,dmg)
+    bundle=target/release/bundle
     rm -rf target/dist && mkdir -p target/dist
     # GitHub turns spaces in asset names into dots, which would break the checksum file.
-    for f in target/release/bundle/dmg/*.dmg; do cp "$f" "target/dist/$(basename "$f" | tr ' ' '-')"; done
-    cd target/dist && for f in *.dmg; do shasum -a 256 "$f" > "$f.sha256"; done
+    dmg="Meeting-Capture_${version}_aarch64.dmg"
+    package="Meeting-Capture_${version}_aarch64.app.tar.gz"
+    cp "$bundle/dmg/Meeting Capture_${version}_aarch64.dmg" "target/dist/$dmg"
+    cp "$bundle/macos/Meeting Capture.app.tar.gz" "target/dist/$package"
+    cp "$bundle/macos/Meeting Capture.app.tar.gz.sig" "target/dist/$package.sig"
+    scripts/updater-manifest.sh "$version" "target/dist/$package" > target/dist/latest.json
+    (cd target/dist && shasum -a 256 "$dmg" > "$dmg.sha256")
     # The DMG holds the app. A second copy left in target/ shows up in Spotlight and Launch Services.
-    rm -rf target/release/bundle/macos
+    rm -rf "$bundle/macos"
