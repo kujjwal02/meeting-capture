@@ -60,6 +60,13 @@ fn create_dir_durably(dir: &Path) -> std::io::Result<()> {
 }
 
 // A rename or a new entry is durable only once the folder is on disk. Windows has no folder fsync.
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "callers share one signature with the Unix fsync"
+    )
+)]
 fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
