@@ -1,7 +1,7 @@
 # Install
 
 Releases are Mac only, for Apple silicon. The app is signed with the self-signed "Meeting Capture
-Dev" identity and is not notarized, so macOS blocks the first open.
+Dev" identity and is not notarized, so macOS blocks it until you clear the download flag.
 
 ## Install a release
 
@@ -13,17 +13,18 @@ Dev" identity and is not notarized, so macOS blocks the first open.
    cd ~/Downloads && shasum -a 256 -c Meeting-Capture_0.1.0_aarch64.dmg.sha256
    ```
 
-3. Quit every running copy of Meeting Capture, dev builds included. A second copy exits at launch,
-   because the app allows one instance.
-4. Open the DMG and drag Meeting Capture to Applications.
-5. Open the app. macOS refuses it. Open System Settings, then Privacy & Security, and press "Open
-   Anyway" under Security.
-6. If macOS says the app is damaged instead, clear the download flag and open it again:
+3. Clear the download flag on the DMG. macOS blocks a non-notarized DMG with "Apple could not
+   verify", and the app copied out of it inherits the flag:
 
    ```sh
-   xattr -dr com.apple.quarantine "/Applications/Meeting Capture.app"
+   xattr -d com.apple.quarantine ~/Downloads/Meeting-Capture_0.1.0_aarch64.dmg
    ```
 
+4. Quit every running copy of Meeting Capture, dev builds included. A second copy exits at launch,
+   because the app allows one instance.
+5. Open the DMG and drag Meeting Capture to Applications.
+6. Open the app. If macOS still blocks it, open System Settings, then Privacy & Security, and press
+   "Open Anyway" under Security.
 7. In the tray menu, turn "Start at login" off, then on. The LaunchAgent stores the app's path, so
    this points it at `/Applications`.
 8. Log out and back in. The tray icon appears with no Dock icon.

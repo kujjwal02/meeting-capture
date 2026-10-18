@@ -53,9 +53,9 @@ for huddles.
 
 1. Download `Meeting-Capture_<version>_aarch64.dmg` from the
    [latest release](https://github.com/kujjwal02/meeting-capture/releases).
-2. Drag Meeting Capture to Applications.
-3. Open it. The app is not notarized, so macOS blocks it the first time. Press "Open Anyway" in
-   System Settings, Privacy & Security.
+2. The DMG is not notarized, so macOS blocks it. Clear the download flag:
+   `xattr -d com.apple.quarantine ~/Downloads/Meeting-Capture_<version>_aarch64.dmg`.
+3. Open the DMG and drag Meeting Capture to Applications.
 
 The [install guide](docs/08-install.md) covers the checksum, permissions, first-time setup, upgrades
 and removal.
