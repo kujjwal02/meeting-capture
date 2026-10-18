@@ -10,7 +10,7 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 | 3 | Mac capture | Tap and mic stems, recovery of orphan WAVs at launch | 3 calls, one with AirPods connected mid-call, no gap over 1 s, app under 5% CPU | 5 |
 | 4 | Local STT | Parakeet, VAD, remote diarization, caption-name merge | A 1 h call transcribes in under 10 min on the M2; names match captions on 3 Meet calls | 4 |
 | 5 | Windows capture | WASAPI loopback, mic, Windows mic detection | Phase 3 checks pass on the PC | 4 |
-| 6 | Extra sources | Soniox routing, Meet REST API, dropped audio files | A Hinglish call gets a Soniox transcript; the Meet API fills a missed call | 3 |
+| 6 | Extra sources | Soniox routing, Meet REST API, dropped audio files, calendar from a secret iCal address | A Hinglish call gets a Soniox transcript; the Meet API fills a missed call; an iCal address matches a call with no Google sign-in | 3 |
 | 7 | Recording | OBS start and stop, audio archive, Drive folder | Video and audio for 3 calls land in the Drive folder, none in the vault | 2 |
 | 8 | Hardening | Tests, GitHub Actions CI on macOS and Windows, model download with checksum, updater, commitment review | Two weeks without a lost meeting | 4 |
 

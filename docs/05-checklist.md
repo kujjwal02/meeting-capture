@@ -225,6 +225,9 @@ Done when:
 - [ ] Hinglish calls routed to Soniox.
 - [ ] Meet REST API fills a call TranscripTonic missed.
 - [ ] Dropped audio files transcribed.
+- [ ] Calendar match from Google Calendar's "secret address in iCal format", with no OAuth sign-in
+  and no "Google hasn't verified this app" screen. The URL is a secret, so it goes in
+  `settings.toml`. Workspace admins can turn these addresses off.
 - [ ] Check Meet caption quality on Indian English and Hinglish.
 
 Done when:
