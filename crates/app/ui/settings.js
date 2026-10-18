@@ -27,7 +27,18 @@ function renderAccounts(accounts) {
     remove.type = "button";
     remove.textContent = "Remove";
     remove.addEventListener("click", () => removeAccount(account.email));
-    row.append(email, remove);
+    const actions = document.createElement("span");
+    actions.className = "account-actions";
+    if (account.needs_sign_in) {
+      // Signing in with the same email replaces its token and keeps its place in the list.
+      const signIn = document.createElement("button");
+      signIn.type = "button";
+      signIn.textContent = "Sign in again";
+      signIn.addEventListener("click", (event) => addAccount(event.currentTarget));
+      actions.append(signIn);
+    }
+    actions.append(remove);
+    row.append(email, actions);
     list.append(row);
   }
 }
@@ -154,8 +165,7 @@ async function readClientFile() {
   }
 }
 
-async function addAccount() {
-  const button = field("add-account");
+async function addAccount(button = field("add-account")) {
   button.disabled = true;
   field("sign-in-status").hidden = false;
   try {
@@ -182,7 +192,7 @@ async function removeAccount(email) {
 
 field("settings").addEventListener("submit", save);
 field("client-file").addEventListener("change", readClientFile);
-field("add-account").addEventListener("click", addAccount);
+field("add-account").addEventListener("click", () => addAccount());
 field("llm-provider").addEventListener("change", () => {
   // A model name belongs to one provider; the field then shows the new provider's default.
   field("llm-model").value = "";
