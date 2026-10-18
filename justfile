@@ -47,5 +47,6 @@ signing-cert:
 release: check
     cd crates/app && APPLE_SIGNING_IDENTITY="{{signing-identity}}" cargo tauri build --bundles app,dmg
     rm -rf target/dist && mkdir -p target/dist
-    cp target/release/bundle/dmg/*.dmg target/dist/
+    # GitHub turns spaces in asset names into dots, which would break the checksum file.
+    for f in target/release/bundle/dmg/*.dmg; do cp "$f" "target/dist/$(basename "$f" | tr ' ' '-')"; done
     cd target/dist && for f in *.dmg; do shasum -a 256 "$f" > "$f.sha256"; done

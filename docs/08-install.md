@@ -5,12 +5,12 @@ Dev" identity and is not notarized, so macOS blocks the first open.
 
 ## Install a release
 
-1. Download `Meeting Capture_<version>_aarch64.dmg` and its `.sha256` file from the
+1. Download `Meeting-Capture_<version>_aarch64.dmg` and its `.sha256` file from the
    [GitHub releases](https://github.com/kujjwal02/meeting-capture/releases).
 2. Check the download. The command prints `OK`:
 
    ```sh
-   cd ~/Downloads && shasum -a 256 -c "Meeting Capture_0.1.0_aarch64.dmg.sha256"
+   cd ~/Downloads && shasum -a 256 -c Meeting-Capture_0.1.0_aarch64.dmg.sha256
    ```
 
 3. Quit every running copy of Meeting Capture, dev builds included. A second copy exits at launch,
