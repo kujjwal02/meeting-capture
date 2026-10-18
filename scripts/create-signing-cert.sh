@@ -35,6 +35,8 @@ umask 077
   -inkey "$work/key.pem" -in "$work/cert.pem" -out "$p12_out"
 security import "$p12_out" -k login.keychain-db -P "$(cat "$p12_out.password")" \
   -T /usr/bin/codesign
+echo "Let codesign use the key without a prompt. macOS asks for your login password."
+security set-key-partition-list -S apple-tool:,apple:,codesign: -s -D "$name" login.keychain-db >/dev/null
 echo "Trust the certificate for code signing. macOS asks for your login password."
 security add-trusted-cert -p codeSign -k login.keychain-db "$work/cert.pem"
 security find-identity -v -p codesigning | grep "\"$name\""
