@@ -50,3 +50,5 @@ release: check
     # GitHub turns spaces in asset names into dots, which would break the checksum file.
     for f in target/release/bundle/dmg/*.dmg; do cp "$f" "target/dist/$(basename "$f" | tr ' ' '-')"; done
     cd target/dist && for f in *.dmg; do shasum -a 256 "$f" > "$f.sha256"; done
+    # The DMG holds the app. A second copy left in target/ shows up in Spotlight and Launch Services.
+    rm -rf target/release/bundle/macos
