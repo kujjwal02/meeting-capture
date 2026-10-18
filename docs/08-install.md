@@ -80,7 +80,13 @@ To upgrade v0.1.0, which has no updater, use one of these:
 - Install script: run the same command again.
 - By hand: quit the app from the tray, then install the new DMG and replace the old app.
 
-v0.2.0 is signed with a new identity, so macOS asks for the Accessibility grant again once.
+v0.2.0 is signed with a new identity, so macOS asks for the Accessibility grant again once. The
+old grant stays switched on in System Settings but matches only the old identity, so switching it
+on again does nothing. Remove it, then allow the new prompt:
+
+```sh
+tccutil reset Accessibility com.ujjwalkumar.meetingcapture
+```
 
 Settings, sign-ins and the job store stay in `~/Library/Application Support/
 com.ujjwalkumar.meetingcapture`. The Accessibility grant survives an upgrade while the signing
