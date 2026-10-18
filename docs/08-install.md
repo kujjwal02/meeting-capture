@@ -67,9 +67,20 @@ store.
 
 ## Upgrade
 
-- Homebrew: `brew upgrade --cask meeting-capture`. It quits the app first.
+From v0.2.0, the app updates itself. It checks the GitHub releases at launch and every 6 hours, and
+downloads a newer version in the background. Then the tray menu shows "Install update <version>
+and restart". If you don't pick it, the update installs the next time the app quits.
+
+The update keeps the quarantine flag off, so it opens without a prompt. `brew upgrade` skips the
+app, because the cask is marked as self-updating.
+
+To upgrade v0.1.0, which has no updater, use one of these:
+
+- Homebrew: `brew upgrade --cask --greedy meeting-capture`. It quits the app first.
 - Install script: run the same command again.
 - By hand: quit the app from the tray, then install the new DMG and replace the old app.
+
+v0.2.0 is signed with a new identity, so macOS asks for the Accessibility grant again once.
 
 Settings, sign-ins and the job store stay in `~/Library/Application Support/
 com.ujjwalkumar.meetingcapture`. The Accessibility grant survives an upgrade while the signing
@@ -77,9 +88,17 @@ identity stays the same.
 
 ## The signing identity
 
-`just signing-cert` imports the private key as non-exportable, so it cannot be backed up. If the
-login keychain loses it, run `just signing-cert` again. The next install then needs the
-Accessibility grant again.
+Releases are signed with the self-signed "Meeting Capture" identity. macOS keeps the
+Accessibility grant across updates only while that identity stays the same.
+
+`just signing-cert` creates the identity once. It writes `~/.tauri/meeting-capture-signing.p12`
+and its password file, which are also the `APPLE_CERTIFICATE` secrets of the Release workflow.
+Keep both in a password manager. To sign on another Mac, import the `.p12` into the login keychain.
+
+The updater has its own key pair, in `~/.tauri/meeting-capture-updater.key`. The app holds the
+public key and installs only packages signed with the private key. Keep the private key and its
+password in a password manager too. If they are lost, installed apps reject every later update,
+and each Mac needs a manual install.
 
 ## Uninstall
 

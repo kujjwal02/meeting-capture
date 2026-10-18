@@ -12,7 +12,7 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 | 5 | Windows capture | WASAPI loopback, mic, Windows mic detection | Phase 3 checks pass on the PC | 4 |
 | 6 | Extra sources | Soniox routing, Meet REST API, dropped audio files, calendar from a secret iCal address | A Hinglish call gets a Soniox transcript; the Meet API fills a missed call; an iCal address matches a call with no Google sign-in | 3 |
 | 7 | Recording | OBS start and stop, audio archive, Drive folder | Video and audio for 3 calls land in the Drive folder, none in the vault | 2 |
-| 8 | Hardening | Tests, GitHub Actions CI on macOS and Windows, model download with checksum, updater, commitment review | Two weeks without a lost meeting | 4 |
+| 8 | Hardening | Tests, model download with checksum, commitment review | Two weeks without a lost meeting | 4 |
 
 Phase 1 is useful on its own: with TranscripTonic it covers most Meet calls.
 
@@ -27,7 +27,8 @@ Progress is tracked in the [checklist](05-checklist.md).
   RustSec advisories, and allows crates.io only.
 - `lefthook` runs fmt, taplo, typos and biome before each commit, and clippy before each
   push.
-- `just check` runs every check locally. No CI and no tests until phase 8.
+- `just check` runs every check. The Check workflow runs it on macOS for each push, and clippy on
+  Windows. No tests until phase 8.
 - `.gitattributes` sets `* text=auto eol=lf`, so Windows checkouts match rustfmt output.
 
 ## Phase 1 detail

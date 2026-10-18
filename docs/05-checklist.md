@@ -84,9 +84,15 @@ Done when:
 - [x] Every tray "open" names its app: notes open in Obsidian (else the text editor), the
   settings file in the text editor, the log file selected in Finder. None depends on a file
   type's default app.
-- [x] `just signing-cert` creates a self-signed identity; `just release` signs the DMG with it.
+- [x] `just signing-cert` creates the self-signed "Meeting Capture" identity and writes it as a
+  `.p12` file. `just release` and the Release workflow sign with it.
 - [x] Create the signing identity.
 - [ ] Install the v0.1.0 DMG from the GitHub release and take one Meet call with it.
+- [x] The app checks GitHub releases every 6 hours, downloads a newer version, and installs it from
+  the tray item or at quit.
+- [x] Check workflow: `just check` on macOS, clippy on Windows. Release workflow on a `v*` tag:
+  build, sign, publish, update the Homebrew cask.
+- [ ] Update an installed v0.2.0 to the next release through the tray item.
 - [ ] Check the tray menu by hand: listener line, meetings, retry, open note, start at login.
 - [ ] After a reboot the tray icon appears with no Dock icon and no window, and says
   "Listening".
@@ -247,10 +253,8 @@ Done when:
 
 ## Phase 8: hardening
 
-- [ ] Tests.
-- [ ] GitHub Actions CI on macOS and Windows.
+- [ ] Tests, run by the Check workflow.
 - [ ] Model download with checksum.
-- [ ] Updater.
 - [ ] Commitment review.
 - [ ] Monthly diff of vendored Anarlog crates against upstream.
 

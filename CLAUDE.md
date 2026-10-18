@@ -19,7 +19,8 @@ speech-to-text, and a pipeline that writes meeting notes into `~/knowledge`. Rea
 - Stored times are UTC; anything reported to me is IST.
 - Never write media into the vault. Client call recordings never go into the repo.
 - Stay on Tauri 2 stable. Tauri 3 is alpha.
-- No tests and no CI until phase 8 (pre-v1 hardening). `just check` is the local gate.
+- No tests until phase 8 (pre-v1 hardening). `just check` is the gate. The Check workflow runs it
+  on each push, with clippy on Windows. A `v*` tag runs the Release workflow.
 - The repo is public on GitHub. No secrets, client data or OAuth client secrets in commits.
 - Logs stay OpenTelemetry-friendly: `tracing` spans, semantic-convention field names, no OTel SDK yet.
 - LLM calls go through rig and work with `anthropic` or any `openai-compatible` endpoint. No

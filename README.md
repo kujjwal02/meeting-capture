@@ -4,6 +4,7 @@ Bot-free meeting notes. A tray app turns the calls you take into Markdown notes 
 vault.
 
 [![Latest release](https://img.shields.io/github/v/release/kujjwal02/meeting-capture)](https://github.com/kujjwal02/meeting-capture/releases)
+[![Check](https://github.com/kujjwal02/meeting-capture/actions/workflows/check.yml/badge.svg)](https://github.com/kujjwal02/meeting-capture/actions/workflows/check.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS%20(Apple%20silicon)-lightgrey)
 
@@ -112,14 +113,15 @@ just hooks
 | Command | Does |
 | --- | --- |
 | `just dev` | Runs the tray app in dev mode. |
-| `just check` | Runs every format, lint, licence and advisory check. There is no CI yet, so this is the gate. |
+| `just check` | Runs every format, lint, licence and advisory check. The Check workflow runs it on each push. |
 | `just fmt` | Rewrites files to the formatters' output. |
-| `just signing-cert` | Adds a self-signed code-signing identity to the login keychain, once per Mac. macOS keeps the app's permissions across rebuilds only with a stable identity. |
-| `just release` | Runs `just check`, then builds the signed DMG and its SHA-256 file in `target/dist`. |
+| `just signing-cert` | Adds the self-signed code-signing identity to the login keychain, once. macOS keeps the app's permissions across updates only with a stable identity. |
+| `just release` | Runs `just check`, then builds the signed DMG, the updater package and `latest.json` in `target/dist`. |
 
-After `just release`, attach the DMG and its `.sha256` file to a GitHub release. Then set
-`version` and `sha256` in the
-[tap's cask](https://github.com/kujjwal02/homebrew-tap/blob/main/Casks/meeting-capture.rb).
+To release, set `version` in `Cargo.toml`, merge to `main`, then push a tag such as `v0.2.0`. The
+Release workflow runs the checks, builds and signs the app, publishes the GitHub release, and
+updates the [Homebrew cask](https://github.com/kujjwal02/homebrew-tap). Installed apps pick up the
+release within 6 hours.
 
 To keep a dev run away from your real job store, set `MEETING_CAPTURE_HOME` to a scratch folder. The
 app then reads `config/settings.toml` and writes `data/` inside it.
