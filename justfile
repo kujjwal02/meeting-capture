@@ -42,7 +42,10 @@ signing-identity := "Meeting Capture Dev"
 signing-cert:
     scripts/create-signing-cert.sh "{{signing-identity}}"
 
-# Build the signed Mac app bundle. Run `just signing-cert` once first.
+# Build the signed DMG and its checksum into target/dist/. Run `just signing-cert` once first.
 [macos]
-bundle:
-    cd crates/app && APPLE_SIGNING_IDENTITY="{{signing-identity}}" cargo tauri build --bundles app
+release: check
+    cd crates/app && APPLE_SIGNING_IDENTITY="{{signing-identity}}" cargo tauri build --bundles app,dmg
+    rm -rf target/dist && mkdir -p target/dist
+    cp target/release/bundle/dmg/*.dmg target/dist/
+    cd target/dist && for f in *.dmg; do shasum -a 256 "$f" > "$f.sha256"; done

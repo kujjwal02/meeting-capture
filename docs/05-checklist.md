@@ -84,8 +84,9 @@ Done when:
 - [x] Every tray "open" names its app: notes open in Obsidian (else the text editor), the
   settings file in the text editor, the log file selected in Finder. None depends on a file
   type's default app.
-- [x] `just signing-cert` creates a self-signed identity; `just bundle` signs the app with it.
-- [ ] Create the signing identity and build a signed bundle.
+- [x] `just signing-cert` creates a self-signed identity; `just release` signs the DMG with it.
+- [x] Create the signing identity.
+- [ ] Install the v0.1.0 DMG from the GitHub release and take one Meet call with it.
 - [ ] Check the tray menu by hand: listener line, meetings, retry, open note, start at login.
 - [ ] After a reboot the tray icon appears with no Dock icon and no window, and says
   "Listening".

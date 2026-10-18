@@ -4,7 +4,8 @@ Bot-free meeting transcripts for Mac and Windows. A Rust tray app detects calls,
 system audio, receives Google Meet captions, transcribes locally after the call, and writes a meeting
 note into the Obsidian vault.
 
-Status: phase 0. A workspace skeleton and a tray icon with a Quit item.
+Status: phase 1, released as v0.1.0 for the Mac. Meet captions from TranscripTonic and Slack huddle
+captions become notes. Audio capture and local speech-to-text are not built yet.
 
 - [Overview](docs/01-overview.md): problem, goals, non-goals, budget
 - [Architecture](docs/02-architecture.md): components, design rules, transcript format
@@ -13,6 +14,7 @@ Status: phase 0. A workspace skeleton and a tray icon with a Quit item.
 - [Checklist](docs/05-checklist.md): done and open items per phase
 - [Google setup](docs/06-google-setup.md): the OAuth client for calendar sign-in
 - [LLM extraction](docs/07-llm-extraction.md): prompt, quote check, providers, retries, note sections
+- [Install](docs/08-install.md): install a release DMG, upgrade, uninstall
 
 ## Development
 
@@ -31,7 +33,8 @@ just hooks
 - `just dev`: run the tray app.
 - `just signing-cert`: once per Mac, add a self-signed code-signing identity to the login
   keychain, so macOS keeps the app's permissions across rebuilds. Needs `brew install openssl@3`.
-- `just bundle`: build the signed `Meeting Capture.app` in `target/release/bundle/macos`.
+- `just release`: run `just check`, then build the signed DMG and its SHA-256 file in
+  `target/dist`.
 - `cargo run -p cli -- list`: show recent meetings. `mc ingest <payload.json>` adds a saved
   TranscripTonic body, `mc reprocess <id>` reruns every step, and `mc retry <id>` resumes a failed
   meeting. A note you edited is kept; `mc reprocess <id> --discard-edits` overwrites it.

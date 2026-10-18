@@ -549,7 +549,7 @@ dependencies = [
 
 [[package]]
 name = "caption-receiver"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -698,7 +698,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1979,7 +1979,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "huddle-captions"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "jiff",
  "objc2",
@@ -2420,7 +2420,7 @@ dependencies = [
 
 [[package]]
 name = "jobs"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "jiff",
  "rusqlite",
@@ -2629,7 +2629,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "meeting-capture"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "caption-receiver",
  "huddle-captions",
@@ -3376,7 +3376,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pipeline"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -4572,7 +4572,7 @@ dependencies = [
 
 [[package]]
 name = "sources"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "jiff",
  "serde",
