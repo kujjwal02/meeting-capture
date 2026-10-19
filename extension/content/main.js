@@ -1,6 +1,7 @@
 // Content script, isolated world. It owns the call session of its tab: it finds call start and
-// end, forwards what the page hook reads, falls back to the DOM when the channels give nothing,
-// and reports health. Events go to the service worker over a port as they happen.
+// end, forwards what the two caption readers emit, starts and stops the DOM reader as the caption
+// source policy decides, and reports health. Events go to the service worker over a port as they
+// happen.
 (() => {
   if (globalThis.mcMeetContentStarted) return;
   globalThis.mcMeetContentStarted = true;
@@ -14,41 +15,29 @@
   const RESUME_WINDOW_MS = 5 * 60 * 1000;
   const LEAVE_GRACE_MS = 3000;
   const CHECK_MS = 1000;
-  // The DOM reader starts when no caption arrives this long after the caption channels open.
-  const CAPTION_WAIT_MS = 20000;
   const ROSTER_WAIT_MS = 30000;
   const DOM_ROSTER_EVERY_MS = 10000;
   const KEEPALIVE_MS = 20000;
-  const CAPTIONS_CLICK_ATTEMPTS = 3;
-  const CAPTIONS_CLICK_GAP_MS = 2000;
   const MAX_OUTBOX = 5000;
   const MEETING_CODE_PATTERN = /^\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:\/|$)/;
 
   let call = null;
   let leaveMissingSinceMs = null;
-  let hookState = { installed: false, caption_channels_opened_at: null };
-  let source = "none";
-  let parseFailures = 0;
-  let healthDetail = null;
   let lastHealthKey = "";
-  let lastChannelCaptionMs = null;
   let isSelfRemoved = false;
   let selfName = "";
   let isRosterFromChannel = false;
   let lastRosterKey = "";
   let channelRoster = null;
   let lastDomRosterMs = 0;
-  let captionsClicks = 0;
-  let lastCaptionsClickMs = 0;
   let lastPingMs = 0;
   let port = null;
   let isContextValid = true;
   const outbox = [];
 
+  const captionSource = globalThis.mcMeetCreateCaptionSourcePolicy();
   const domCaptions = globalThis.mcMeetCreateDomCaptions({
-    emit: (event) => {
-      if (call && source === "dom") send(event);
-    },
+    emit: (event) => onReaderEvent("dom", event),
     selfName: () => selfName,
   });
 
@@ -61,8 +50,7 @@
         sessionStorage.removeItem(SESSION_KEY);
       } catch {}
       call = null;
-      domCaptions.stop();
-      source = "none";
+      follow(captionSource.decide({ kind: "session_dropped" }));
       return;
     }
     if (message?.type !== "stored") return;
@@ -171,12 +159,10 @@
       );
     }
     call.page_started_ms = Date.now();
-    source = "none";
-    lastChannelCaptionMs = null;
     lastRosterKey = "";
     lastHealthKey = "";
     if (channelRoster) sendRoster(channelRoster);
-    reportHealth();
+    follow(captionSource.decide({ kind: "call_began", atMs: call.page_started_ms }));
   }
 
   function endCall(reason) {
@@ -185,9 +171,7 @@
       sessionStorage.removeItem(SESSION_KEY);
     } catch {}
     call = null;
-    domCaptions.stop();
-    source = "none";
-    captionsClicks = 0;
+    follow(captionSource.decide({ kind: "call_ended" }));
     isSelfRemoved = false;
   }
 
@@ -199,72 +183,33 @@
 
   function reportHealth() {
     if (!call) return;
-    const health = {
-      source,
-      captionsOn: areCaptionsOn(),
-      parseFailures,
-      detail: healthDetail,
-    };
+    const { source, parseFailures, detail } = captionSource.health();
+    const health = { source, captionsOn: areCaptionsOn(), parseFailures, detail };
     const key = JSON.stringify(health);
     if (key === lastHealthKey) return;
     lastHealthKey = key;
     send(callEvents.health({ atMs: Date.now(), ...health }));
   }
 
-  function useDom(reason) {
-    if (source === "dom") return;
-    source = "dom";
-    healthDetail = reason;
-    captionsClicks = 0;
-    domCaptions.start();
-    reportHealth();
-  }
-
-  function useChannel() {
-    if (source === "channel") return;
-    source = "channel";
-    healthDetail = null;
-    domCaptions.stop();
-    reportHealth();
+  // Runs the DOM reader exactly while the policy picks it. start and stop are idempotent.
+  function follow(decision) {
+    if (decision.source === "dom") domCaptions.start();
+    else domCaptions.stop();
+    if (decision.reportsHealth) reportHealth();
   }
 
   // Meet sends nothing on the caption channels until its captions are on, and the DOM reader
   // needs them visible. Never touches the caption language.
-  function clickCaptionsOnIfOff(nowMs) {
-    if (
-      captionsClicks >= CAPTIONS_CLICK_ATTEMPTS ||
-      nowMs - lastCaptionsClickMs < CAPTIONS_CLICK_GAP_MS
-    ) {
-      return;
-    }
+  function clickCaptionsOn(nowMs) {
     const button = findIconButton(selectors.captionsOffIcon);
     if (!button) return;
-    captionsClicks += 1;
-    lastCaptionsClickMs = nowMs;
+    captionSource.decide({ kind: "captions_clicked", atMs: nowMs });
     button.click();
   }
 
-  function captionWaitStartMs() {
-    return Math.max(call.page_started_ms, hookState.caption_channels_opened_at ?? 0);
-  }
+  // ---- Reader events. Both caption readers deliver spec events here; origin names the reader.
 
-  // ---- Page hook messages.
-
-  function onReaderEvent(event) {
-    if (event.kind === "self_removed") {
-      isSelfRemoved = true;
-      return;
-    }
-    if (event.kind === "parse_gap") {
-      parseFailures = event.parse_failures;
-      healthDetail = event.detail;
-      const isCaptionChannel = event.channel === "captions" || event.channel === "captions_v2";
-      const isChannelQuiet =
-        lastChannelCaptionMs === null || Date.now() - lastChannelCaptionMs > CAPTION_WAIT_MS;
-      if (call && isCaptionChannel && isChannelQuiet) useDom(event.detail);
-      else reportHealth();
-      return;
-    }
+  function onReaderEvent(origin, event) {
     if (event.kind === "roster") {
       isRosterFromChannel = true;
       selfName = event.participants.find((p) => p.is_self)?.name ?? selfName;
@@ -274,12 +219,29 @@
     }
     if (!call) return;
     if (event.kind === "caption") {
-      lastChannelCaptionMs = Date.now();
-      useChannel();
-      send(event);
-      return;
+      if (origin === "channel") {
+        follow(captionSource.decide({ kind: "channel_caption", atMs: Date.now() }));
+      }
+      if (captionSource.health().source !== origin) return;
     }
-    if (event.kind === "chat") send(event);
+    send(event);
+  }
+
+  function onPageNotice(notice) {
+    if (notice.kind === "self_removed") {
+      isSelfRemoved = true;
+    } else if (notice.kind === "parse_gap") {
+      follow(
+        captionSource.decide({
+          kind: "parse_gap",
+          atMs: Date.now(),
+          channel: notice.channel,
+          parseFailures: notice.parse_failures,
+          detail: notice.detail,
+          isInCall: Boolean(call),
+        }),
+      );
+    }
   }
 
   function sendRoster(participants) {
@@ -292,13 +254,15 @@
 
   function onPageMessage(message) {
     if (message?.t === "hook_state") {
-      hookState = message;
-      reportHealth();
-    } else if (message?.t === "reader") {
-      onReaderEvent(message.event);
+      const channelsOpenedAtMs = message.caption_channels_opened_at;
+      follow(captionSource.decide({ kind: "hook_state", channelsOpenedAtMs }));
+    } else if (message?.t === "event") {
+      onReaderEvent("channel", message.event);
+    } else if (message?.t === "notice") {
+      onPageNotice(message.notice);
     } else if (message?.t === "caption_channel_failed") {
-      healthDetail = `opening ${message.label} failed: ${message.error}`;
-      reportHealth();
+      const { label, error } = message;
+      follow(captionSource.decide({ kind: "channel_open_failed", label, error }));
     }
   }
 
@@ -347,14 +311,9 @@
     if (!call) return;
     if (nowMs - call.last_seen_ms >= 5000) storeSession();
 
-    if (source === "none" && nowMs - captionWaitStartMs() >= CAPTION_WAIT_MS) {
-      useDom(
-        hookState.caption_channels_opened_at
-          ? "no caption frame within 20 s of opening the caption channels"
-          : "page hook did not open the caption channels",
-      );
-    }
-    clickCaptionsOnIfOff(nowMs);
+    const decision = captionSource.decide({ kind: "tick", atMs: nowMs });
+    follow(decision);
+    if (decision.isCaptionsClickDue) clickCaptionsOn(nowMs);
 
     const isRosterLate = nowMs - call.page_started_ms >= ROSTER_WAIT_MS;
     if (!isRosterFromChannel && isRosterLate && nowMs - lastDomRosterMs >= DOM_ROSTER_EVERY_MS) {

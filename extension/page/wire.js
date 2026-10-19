@@ -390,9 +390,10 @@
     return { raw: 0, parsed: 0, control: 0, rejected: 0, consecutive: 0 };
   }
 
-  // emit(message) receives { kind: "caption" | "chat" | "roster", ... } events in the spec's
-  // shapes, and { kind: "parse_gap" | "self_removed" } notices for the content script.
-  function createMeetReader({ now = () => Date.now(), emit }) {
+  // emit(event) receives caption, chat and roster events in the spec's shapes. notice(notice)
+  // receives { kind: "parse_gap" | "self_removed" } notices for the content script, which never
+  // reach the app.
+  function createMeetReader({ now = () => Date.now(), emit, notice = () => {} }) {
     const devices = new Map();
     const utterances = new Map();
     const chatIds = new Set();
@@ -433,7 +434,7 @@
       const run = counter.consecutive;
       if (run === PARSE_GAP_FIRST || (run > PARSE_GAP_FIRST && run % PARSE_GAP_REPEAT === 0)) {
         const reasonList = [...reasons.entries()].map(([r, n]) => `${r}:${n}`).join(",");
-        emit({
+        notice({
           kind: "parse_gap",
           channel: label,
           consecutive: run,
@@ -473,7 +474,7 @@
         if (p.isSelf) selfDeviceId = p.deviceId;
         if (p.deviceId === selfDeviceId && p.status === REMOVED_STATUS && !selfRemoved) {
           selfRemoved = true;
-          emit({ kind: "self_removed", at: new Date(now()).toISOString() });
+          notice({ kind: "self_removed", at: new Date(now()).toISOString() });
         }
       }
       emitRosterIfChanged();

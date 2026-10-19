@@ -20,7 +20,13 @@
     },
     {
       "matches": ["https://meet.google.com/*"],
-      "js": ["call-events.js", "content/selectors.js", "content/dom-readers.js", "content/main.js"],
+      "js": [
+        "call-events.js",
+        "content/selectors.js",
+        "content/dom-readers.js",
+        "content/caption-source.js",
+        "content/main.js"
+      ],
       "run_at": "document_start"
     }
   ]

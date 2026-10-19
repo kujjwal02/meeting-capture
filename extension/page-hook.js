@@ -52,7 +52,10 @@
     return;
   }
 
-  const reader = wire.createMeetReader({ emit: (event) => post({ t: "reader", event }) });
+  const reader = wire.createMeetReader({
+    emit: (event) => post({ t: "event", event }),
+    notice: (notice) => post({ t: "notice", notice }),
+  });
 
   async function frameBytes(data) {
     if (data instanceof ArrayBuffer) return new Uint8Array(data);
@@ -197,7 +200,7 @@
     postHookState();
     if (isFirstListener) for (const message of earlyMessages.splice(0)) post(message);
     const roster = reader.lastRoster();
-    if (roster) post({ t: "reader", event: roster });
+    if (roster) post({ t: "event", event: roster });
   });
 
   // The content script may have loaded first and missed nothing but this signal.
