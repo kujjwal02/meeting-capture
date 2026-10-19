@@ -9,10 +9,10 @@ vault.
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS%20(Apple%20silicon)-lightgrey)
 
 > [!NOTE]
-> v0.1.0 is an early release for Apple silicon Macs. It turns Google Meet captions and Slack huddle
-> captions into notes. Call detection, audio capture, local speech-to-text and the Windows build are
-> on the [roadmap](docs/03-roadmap.md). The app is built for one person's machines, so expect rough
-> edges.
+> v0.3.0 is an early release for Apple silicon Macs. It turns Google Meet captions, read by the
+> mc-meet extension, and Slack huddle captions into notes. Call detection, audio capture, local
+> speech-to-text and the Windows build are on the [roadmap](docs/03-roadmap.md). The app is built
+> for one person's machines, so expect rough edges.
 
 ## Why
 
@@ -113,9 +113,10 @@ just hooks
 | `just check` | Runs every format, lint, licence and advisory check. The Check workflow runs it on each push. |
 | `just fmt` | Rewrites files to the formatters' output. |
 | `just signing-cert` | Adds the self-signed code-signing identity to the login keychain, once. macOS keeps the app's permissions across updates only with a stable identity. |
+| `just meet-e2e` | Runs a live Meet call through mc-meet and a dev app, then checks the call log and the note. Needs two Google accounts: see [tools/meet-e2e](tools/meet-e2e/README.md). |
 | `just release` | Runs `just check`, then builds the signed DMG, the updater package and `latest.json` in `target/dist`. |
 
-To release, set `version` in `Cargo.toml`, merge to `main`, then push a tag such as `v0.2.0`. The
+To release, set `version` in `Cargo.toml`, merge to `main`, then push a tag such as `v0.3.0`. The
 Release workflow runs the checks, builds and signs the app, publishes the GitHub release, and
 updates the [Homebrew cask](https://github.com/kujjwal02/homebrew-tap). Installed apps pick up the
 release within 6 hours.
