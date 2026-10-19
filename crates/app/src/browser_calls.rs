@@ -185,7 +185,9 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
 // Chrome reads the manifest each time the extension connects, so a moved or updated app is
 // found again after its next start.
 fn register_host(data_dir: &Path) {
-    let executable = match std::env::current_exe() {
+    // Canonical, since macOS reports the path the app was started with, `..` parts included,
+    // and Chrome does not start a host whose path has them.
+    let executable = match std::env::current_exe().and_then(std::fs::canonicalize) {
         Ok(executable) => executable,
         Err(error) => {
             tracing::error!(exception.message = %error, "could not find the app executable");
