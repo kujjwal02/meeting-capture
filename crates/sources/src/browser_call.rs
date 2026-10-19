@@ -92,6 +92,101 @@ impl CallEvent {
             CallEvent::Unknown => None,
         }
     }
+
+    /// Whether the event ends its call.
+    #[must_use]
+    pub fn ends_call(&self) -> bool {
+        match self {
+            CallEvent::CallEnded { .. } => true,
+            CallEvent::CallStarted { .. }
+            | CallEvent::Caption { .. }
+            | CallEvent::Chat { .. }
+            | CallEvent::Roster { .. }
+            | CallEvent::Health { .. }
+            | CallEvent::Unknown => false,
+        }
+    }
+}
+
+/// What a `call_started` event says about its call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallStart {
+    /// Trimmed. `None` when blank.
+    pub meeting_code: Option<String>,
+    /// Meet's title on one line, so it reads the same in a heading, a file name and the tray
+    /// menu. `None` when blank or when it holds the meeting code: Meet titles a call with no
+    /// calendar event with its code, which says nothing about the meeting.
+    pub title: Option<String>,
+}
+
+impl CallStart {
+    /// The start `event` reports, if it is a `call_started`.
+    #[must_use]
+    pub fn from_event(event: &CallEvent) -> Option<Self> {
+        match event {
+            CallEvent::CallStarted {
+                meeting_code,
+                title,
+                ..
+            } => {
+                let meeting_code = Some(meeting_code.trim())
+                    .filter(|code| !code.is_empty())
+                    .map(str::to_owned);
+                let title = title
+                    .as_deref()
+                    .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .filter(|title| {
+                        !title.is_empty()
+                            && meeting_code
+                                .as_deref()
+                                .is_none_or(|code| !title.contains(code))
+                    });
+                Some(Self {
+                    meeting_code,
+                    title,
+                })
+            }
+            CallEvent::Caption { .. }
+            | CallEvent::Chat { .. }
+            | CallEvent::Roster { .. }
+            | CallEvent::Health { .. }
+            | CallEvent::CallEnded { .. }
+            | CallEvent::Unknown => None,
+        }
+    }
+}
+
+/// What a whole log says about its call.
+#[derive(Debug, Clone)]
+pub struct LogSummary {
+    /// From the first `call_started`. A rejoined call has one per session, and the first names
+    /// the call.
+    pub start: Option<CallStart>,
+    /// The first `call_started`'s time, else the earliest event time: a log whose
+    /// `call_started` was lost still has times on its other events.
+    pub started_at: Option<Timestamp>,
+    pub last_at: Option<Timestamp>,
+    /// Whether the last line ends the call.
+    pub has_ended: bool,
+}
+
+/// Summarises the lines of one log.
+#[must_use]
+pub fn summarize(lines: &[LogLine]) -> LogSummary {
+    let event_times = || lines.iter().filter_map(|line| line.event.at());
+    let first_start = lines
+        .iter()
+        .find_map(|line| Some((line.event.at()?, CallStart::from_event(&line.event)?)));
+    let started_at = first_start
+        .as_ref()
+        .map(|(at, _)| *at)
+        .or_else(|| event_times().min());
+    LogSummary {
+        start: first_start.map(|(_, start)| start),
+        started_at,
+        last_at: event_times().max(),
+        has_ended: lines.last().is_some_and(|line| line.event.ends_call()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -194,17 +289,6 @@ pub fn read_lines(log: &[u8]) -> Result<Vec<LogLine>, ParseError> {
     Ok(lines)
 }
 
-/// The log's file name: the call's start time and the extension's session id. No meeting code
-/// or title, since those can name a client.
-#[must_use]
-pub fn log_file_name(started_at: Timestamp, session_id: &str) -> String {
-    // No colons: Windows rejects them in file names.
-    format!(
-        "{}-{session_id}.jsonl",
-        started_at.strftime("%Y%m%dT%H%M%S%.3fZ")
-    )
-}
-
 /// Parses a browser call log into a transcript.
 ///
 /// # Errors
@@ -212,35 +296,14 @@ pub fn log_file_name(started_at: Timestamp, session_id: &str) -> String {
 /// Returns `ParseError` for a bad line or a log with no events.
 pub fn parse(log: &[u8]) -> Result<Transcript, ParseError> {
     let lines = read_lines(log)?;
-    let event_times = || lines.iter().filter_map(|line| line.event.at());
-    let started = lines.iter().find_map(|line| match &line.event {
-        CallEvent::CallStarted {
-            at,
-            meeting_code,
-            title,
-            ..
-        } => Some((*at, meeting_code, title)),
-        CallEvent::Caption { .. }
-        | CallEvent::Chat { .. }
-        | CallEvent::Roster { .. }
-        | CallEvent::Health { .. }
-        | CallEvent::CallEnded { .. }
-        | CallEvent::Unknown => None,
-    });
-    // A log whose `call_started` was lost still has times on its other events.
-    let Some(started_at) = started.map(|(at, ..)| at).or_else(|| event_times().min()) else {
+    let summary = summarize(&lines);
+    let Some(started_at) = summary.started_at else {
         return Err(ParseError::NoEvents);
     };
-    let ended_at = event_times().max().unwrap_or(started_at).max(started_at);
-    let meeting_code = started
-        .map(|(_, code, _)| code.trim())
-        .filter(|code| !code.is_empty());
-    // Meet titles a call with no calendar event with its code, which says nothing about the
-    // meeting. One line, so the title reads the same in a heading, a file name and the tray menu.
-    let title = started
-        .and_then(|(_, _, title)| title.as_deref())
-        .map(|title| title.split_whitespace().collect::<Vec<_>>().join(" "))
-        .filter(|title| !title.is_empty() && meeting_code.is_none_or(|code| !title.contains(code)));
+    let ended_at = summary.last_at.unwrap_or(started_at).max(started_at);
+    let (meeting_code, title) = summary
+        .start
+        .map_or((None, None), |start| (start.meeting_code, start.title));
 
     let Collected {
         captions,

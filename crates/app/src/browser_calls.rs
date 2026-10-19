@@ -2,6 +2,7 @@
 //! ends calls, shows what the extension reports, and turns each finished log into a meeting.
 
 mod call_log;
+mod log_folder;
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -16,12 +17,13 @@ use native_host::frames::{LengthOrder, read_frame, write_frame};
 use native_host::socket::{AppEnd, CallListener};
 use pipeline::{InputError, Intake, IntakeError, Pipeline};
 use serde::{Deserialize, Serialize};
-use sources::browser_call::{CallEvent, EndReason, HealthSource};
+use sources::browser_call::{CallEvent, CallStart, EndReason, HealthSource};
 use tauri::{AppHandle, Manager as _};
 use tokio::io::{AsyncWrite, ReadHalf};
 use tracing::Instrument as _;
 
 use self::call_log::CallLog;
+use self::log_folder::LogFolder;
 use crate::AppState;
 
 /// The protocol this app speaks. An extension that says an older one gets a tray warning.
@@ -54,14 +56,13 @@ struct OpenCall {
     log: CallLog,
     /// The sessions writing to the log. The call ends when the last one ends.
     sessions: HashSet<String>,
-    meeting_code: Option<String>,
+    /// The first session's start, which names the call.
+    start: Option<CallStart>,
     /// The ports that sent an event for the call since it opened.
     holder_ports: HashSet<u64>,
     last_event_at: Instant,
     /// The latest event time in the call.
     last_at: Option<Timestamp>,
-    /// The title Meet showed, else the meeting code.
-    title: Option<String>,
     caption_source: Option<HealthSource>,
     health_problem: Option<String>,
 }
@@ -76,6 +77,7 @@ pub(crate) struct BrowserCallStatus {
 
 #[derive(Debug, Clone)]
 pub(crate) struct CallStatus {
+    /// The title Meet showed, else the meeting code.
     pub title: Option<String>,
     pub caption_source: Option<HealthSource>,
     pub health_problem: Option<String>,
@@ -99,7 +101,7 @@ impl BrowserCalls {
             calls: calls
                 .into_iter()
                 .map(|(_, call)| CallStatus {
-                    title: call.title.clone(),
+                    title: call.title(),
                     caption_source: call.caption_source,
                     health_problem: call.health_problem.clone(),
                 })
@@ -169,24 +171,21 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
     let state = app.state::<AppState>();
     let app_dirs = state.settings.app_dirs();
     register_host(app_dirs.host_manifest_dir());
-    let log_dir = app_dirs.browser_call_log_dir();
+    let logs = LogFolder::new(app_dirs.browser_call_log_dir());
     // Before the listener starts, so a resent event cannot reopen a log this is closing.
-    match call_log::finish_open_logs(&log_dir) {
-        Ok(logs) => {
+    match logs.finish_open_logs() {
+        Ok(log_paths) => {
             let (app, pipeline) = (app.clone(), Arc::clone(pipeline));
-            tauri::async_runtime::spawn_blocking(move || record_left_over(&app, &pipeline, logs));
+            tauri::async_runtime::spawn_blocking(move || {
+                record_left_over(&app, &pipeline, log_paths);
+            });
         }
         Err(error) => {
             tracing::error!(exception.message = %error, "could not read the browser call folder");
         }
     }
     let socket = app_dirs.browser_call_socket().to_path_buf();
-    tauri::async_runtime::spawn(listen(
-        app.clone(),
-        Arc::clone(pipeline),
-        socket,
-        log_dir.clone(),
-    ));
+    tauri::async_runtime::spawn(listen(app.clone(), Arc::clone(pipeline), socket, logs));
     tauri::async_runtime::spawn(end_idle_calls(app.clone(), Arc::clone(pipeline)));
 }
 
@@ -228,8 +227,8 @@ fn register_host(data_dir: &Path) {
 
 // Logs the last run did not turn into meetings: the app quit or crashed during the call, or
 // before its note.
-fn record_left_over(app: &AppHandle, pipeline: &Pipeline, logs: Vec<PathBuf>) {
-    for log_path in logs {
+fn record_left_over(app: &AppHandle, pipeline: &Pipeline, log_paths: Vec<PathBuf>) {
+    for log_path in log_paths {
         match pipeline.store().has_input(&log_path) {
             Ok(true) => {}
             Ok(false) => record_and_run(app, pipeline, &log_path),
@@ -240,7 +239,7 @@ fn record_left_over(app: &AppHandle, pipeline: &Pipeline, logs: Vec<PathBuf>) {
     }
 }
 
-async fn listen(app: AppHandle, pipeline: Arc<Pipeline>, socket: PathBuf, log_dir: PathBuf) {
+async fn listen(app: AppHandle, pipeline: Arc<Pipeline>, socket: PathBuf, logs: LogFolder) {
     let mut listener = match CallListener::bind(&socket) {
         Ok(listener) => listener,
         Err(error) => {
@@ -262,7 +261,7 @@ async fn listen(app: AppHandle, pipeline: Arc<Pipeline>, socket: PathBuf, log_di
                 let port = Port {
                     app: app.clone(),
                     pipeline: Arc::clone(&pipeline),
-                    log_dir: log_dir.clone(),
+                    logs: logs.clone(),
                     id: port_id,
                 };
                 tauri::async_runtime::spawn(port.serve(connection).instrument(span));
@@ -280,7 +279,7 @@ async fn listen(app: AppHandle, pipeline: Arc<Pipeline>, socket: PathBuf, log_di
 struct Port {
     app: AppHandle,
     pipeline: Arc<Pipeline>,
-    log_dir: PathBuf,
+    logs: LogFolder,
     id: u64,
 }
 
@@ -412,7 +411,7 @@ impl Port {
             return Err(EventError::InvalidSessionId(session_id));
         }
         let event = CallEvent::deserialize(raw_event).map_err(EventError::InvalidEvent)?;
-        let is_end = call_log::is_end(&event);
+        let is_end = event.ends_call();
         let mut guard = self.calls().lock();
         let registry = &mut *guard;
         let log_path = if let Some(log_path) = registry.open_sessions.get(&session_id) {
@@ -459,20 +458,20 @@ impl Port {
         seq: u64,
         event: &CallEvent,
     ) -> Result<Option<PathBuf>, EventError> {
-        let log_path = if let Some(log_path) = call_log::find(&self.log_dir, session_id)? {
+        let log_path = if let Some(log_path) = self.logs.find(session_id)? {
             log_path
         } else if let Some(log_path) = self.rejoined_log(registry, event)? {
-            call_log::record_rejoin(&self.log_dir, session_id, &log_path)?;
+            self.logs.record_rejoin(session_id, &log_path)?;
             tracing::info!(file.path = %log_path.display(), "browser call rejoined");
             log_path
         } else {
             let started_at = event.at().unwrap_or_else(Timestamp::now);
-            let log = CallLog::create(&self.log_dir, started_at, session_id)?;
+            let log = self.logs.create(started_at, session_id)?;
             tracing::info!(file.path = %log.path().display(), "browser call started");
             let log_path = log.path().to_path_buf();
             registry
                 .open_calls
-                .insert(log_path.clone(), OpenCall::new(log));
+                .insert(log_path.clone(), OpenCall::new(log, None));
             log_path
         };
         let call = match registry.open_calls.entry(log_path.clone()) {
@@ -480,12 +479,12 @@ impl Port {
             // One that already ended: a resend after a quit, late events after an idle end, or
             // a rejoin.
             Entry::Vacant(ended) => {
-                let log = CallLog::reopen(&log_path)?;
+                let (log, summary) = CallLog::reopen(&log_path)?;
                 if log.has_seq(seq) {
                     return Ok(None);
                 }
                 tracing::info!(file.path = %log_path.display(), "browser call reopened");
-                ended.insert(OpenCall::new(log))
+                ended.insert(OpenCall::new(log, summary.start))
             }
         };
         if call.log.has_seq(seq) {
@@ -505,44 +504,42 @@ impl Port {
         registry: &Registry,
         event: &CallEvent,
     ) -> std::io::Result<Option<PathBuf>> {
-        let CallEvent::CallStarted {
-            at, meeting_code, ..
-        } = event
-        else {
+        let meeting_code = CallStart::from_event(event).and_then(|start| start.meeting_code);
+        let (Some(at), Some(meeting_code)) = (event.at(), meeting_code) else {
             return Ok(None);
         };
-        let meeting_code = meeting_code.trim();
-        if meeting_code.is_empty() {
-            return Ok(None);
-        }
-        let open = registry
-            .open_calls
-            .iter()
-            .find(|(_, call)| call.meeting_code.as_deref() == Some(meeting_code));
+        let open = registry.open_calls.iter().find(|(_, call)| {
+            call.start
+                .as_ref()
+                .is_some_and(|start| start.meeting_code.as_ref() == Some(&meeting_code))
+        });
         if let Some((log_path, _)) = open {
             return Ok(Some(log_path.clone()));
         }
         let since = at
             .checked_sub(REJOIN_WINDOW)
             .map_err(std::io::Error::other)?;
-        call_log::find_rejoinable(&self.log_dir, meeting_code, since)
+        self.logs.find_rejoinable(&meeting_code, since)
     }
 }
 
 impl OpenCall {
-    fn new(log: CallLog) -> Self {
-        let started = read_start(log.path());
+    fn new(log: CallLog, start: Option<CallStart>) -> Self {
         Self {
             log,
             sessions: HashSet::new(),
-            meeting_code: started.as_ref().map(|(_, code)| code.clone()),
+            start,
             holder_ports: HashSet::new(),
             last_event_at: Instant::now(),
             last_at: None,
-            title: started.map(|(title, _)| title),
             caption_source: None,
             health_problem: None,
         }
+    }
+
+    fn title(&self) -> Option<String> {
+        let start = self.start.as_ref()?;
+        start.title.clone().or_else(|| start.meeting_code.clone())
     }
 }
 
@@ -562,54 +559,12 @@ fn is_valid_session_id(session_id: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
-// The title and meeting code of a reopened call, from its first `call_started` line.
-fn read_start(log_path: &Path) -> Option<(String, String)> {
-    let contents = std::fs::read(log_path).ok()?;
-    let lines = sources::browser_call::read_lines(&contents).ok()?;
-    lines.iter().find_map(|line| match &line.event {
-        CallEvent::CallStarted { meeting_code, .. } => {
-            Some((call_title(&line.event)?, meeting_code.trim().to_owned()))
-        }
-        CallEvent::Caption { .. }
-        | CallEvent::Chat { .. }
-        | CallEvent::Roster { .. }
-        | CallEvent::Health { .. }
-        | CallEvent::CallEnded { .. }
-        | CallEvent::Unknown => None,
-    })
-}
-
-fn call_title(event: &CallEvent) -> Option<String> {
-    match event {
-        CallEvent::CallStarted {
-            title,
-            meeting_code,
-            ..
-        } => Some(
-            title
-                .clone()
-                .filter(|title| !title.trim().is_empty())
-                .unwrap_or_else(|| meeting_code.clone()),
-        ),
-        CallEvent::Caption { .. }
-        | CallEvent::Chat { .. }
-        | CallEvent::Roster { .. }
-        | CallEvent::Health { .. }
-        | CallEvent::CallEnded { .. }
-        | CallEvent::Unknown => None,
-    }
-}
-
 // Keeps what the tray shows about the call current.
 fn note_event(call: &mut OpenCall, event: &CallEvent) {
     match event {
-        CallEvent::CallStarted { meeting_code, .. } => {
-            // The first session's title and code name the call.
-            if call.title.is_none() {
-                call.title = call_title(event);
-            }
-            if call.meeting_code.is_none() {
-                call.meeting_code = Some(meeting_code.trim().to_owned());
+        CallEvent::CallStarted { .. } => {
+            if call.start.is_none() {
+                call.start = CallStart::from_event(event);
             }
         }
         CallEvent::Health {
@@ -723,7 +678,7 @@ fn record_and_run(app: &AppHandle, pipeline: &Pipeline, log_path: &Path) {
                 | InputError::ParseBrowserCall(_) => error.to_string(),
             };
             crate::huddles::notify(app, "Meet call not recorded", &cause);
-            crate::huddles::set_aside(log_path);
+            log_folder::set_aside(log_path);
         }
         Err(error @ (IntakeError::Copy { .. } | IntakeError::Store(_))) => {
             tracing::error!(exception.message = %error, "could not record a browser call");
