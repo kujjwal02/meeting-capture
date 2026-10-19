@@ -10,6 +10,7 @@ Sources:
 - Attendee, its `meet_payload.js` (Elastic License 2.0; read for facts only). Cited as
   `A:<line>`.
 - Fireflies notes in `~/knowledge/areas/infrastructure/meeting-recording/local-capture/how-tools-work/meet-extensions.md`.
+- Frames captured in a live two-account call on 2026-10-19. Cited as "live frame".
 
 ## Frames
 
@@ -41,7 +42,8 @@ offset 3 (legacy captions). Source: T:10409-10413.
 | participant | `29` string | display name, used when `2` is empty | A:1716 |
 | chat message | `1` string | message name, `spaces/<id>/messages/<id>` | A:1791, T:10024 (`ji` byte search) |
 | chat message | `2` string | sender device ID | T:6526, A:1792 |
-| chat message | `3` varint | timestamp, looks like microseconds | T:6526, A:1793 |
+| chat message | `3` varint | the sender's join time, milliseconds since the epoch | T:6526, A:1793, live frame |
+| chat message | `4.1` varint, `4.2` varint | sent time: seconds since the epoch, then nanos | live frame |
 | chat message | `5.1` string | text | T:6471, T:6526, A:1794-1800 |
 | `meet_messages` frame | collections chat nesting, or a bare chat message | chat | T:9623 (`Bu`), T:10808 |
 | `SyncMeetingSpaceCollections` response | base64 text, then `2.2.2` repeated | participant | T:7684-7899 (`BMeetingCollection`), T:10971, A:1896-1908 |
