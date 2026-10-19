@@ -30,6 +30,11 @@ shear:
 hooks:
     lefthook install
 
+# Run a live Meet call through mc-meet and a dev app, then check the log and note (Mac only).
+meet-e2e:
+    cargo build -p meeting-capture
+    node tools/meet-e2e/run.mjs
+
 # Run the tray app in dev mode.
 dev:
     cd crates/app && cargo tauri dev
