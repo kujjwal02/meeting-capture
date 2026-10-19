@@ -7,6 +7,7 @@
 
   const selectors = globalThis.mcMeetSelectors;
   const findIconButton = globalThis.mcMeetFindIconButton;
+  const callEvents = globalThis.mcMeetCallEvents;
 
   const SESSION_KEY = "mc-meet-session";
   // A reload of the same meeting in this tab within this window keeps the session.
@@ -156,24 +157,18 @@
       storeSession();
       postToWorker({ type: "resume", session_id: call.session_id });
     } else {
-      const startedAt = new Date().toISOString();
+      const startedMs = Date.now();
       call = {
         session_id: crypto.randomUUID(),
         meeting_code: code,
-        started_at: startedAt,
-        started_ms: Date.now(),
+        started_at: new Date(startedMs).toISOString(),
+        started_ms: startedMs,
         next_n: 1,
         last_seen_ms: Date.now(),
       };
-      send({
-        kind: "call_started",
-        at: startedAt,
-        platform: "meet",
-        meeting_code: code,
-        title: meetingTitle(code),
-        // The worker fills in the tab ID: a content script cannot read it.
-        tab_id: null,
-      });
+      send(
+        callEvents.callStarted({ atMs: startedMs, meetingCode: code, title: meetingTitle(code) }),
+      );
     }
     call.page_started_ms = Date.now();
     source = "none";
@@ -185,7 +180,7 @@
   }
 
   function endCall(reason) {
-    send({ kind: "call_ended", at: new Date().toISOString(), reason });
+    send(callEvents.callEnded({ atMs: Date.now(), reason }));
     try {
       sessionStorage.removeItem(SESSION_KEY);
     } catch {}
@@ -206,14 +201,14 @@
     if (!call) return;
     const health = {
       source,
-      captions_on: areCaptionsOn(),
-      parse_failures: parseFailures,
+      captionsOn: areCaptionsOn(),
+      parseFailures,
       detail: healthDetail,
     };
     const key = JSON.stringify(health);
     if (key === lastHealthKey) return;
     lastHealthKey = key;
-    send({ kind: "health", at: new Date().toISOString(), ...health });
+    send(callEvents.health({ atMs: Date.now(), ...health }));
   }
 
   function useDom(reason) {
@@ -292,7 +287,7 @@
     const key = JSON.stringify(participants);
     if (key === lastRosterKey) return;
     lastRosterKey = key;
-    send({ kind: "roster", at: new Date().toISOString(), participants });
+    send(callEvents.roster({ atMs: Date.now(), participants }));
   }
 
   function onPageMessage(message) {

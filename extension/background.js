@@ -11,6 +11,8 @@
 //   pendingEnds   { [session_id]: { tab_id, at_ms } } sessions whose page went away
 //   endedSessions the last session IDs that got a call_ended, newest last
 
+import "./call-events.js";
+
 const HOST_NAME = "com.meetingcapture.app";
 const PROTOCOL = 1;
 // A page that unloads mid-call has this long to come back to the same session.
@@ -81,10 +83,6 @@ function setDiscardable(tabId, isDiscardable) {
   chrome.tabs.update(Number(tabId), { autoDiscardable: isDiscardable }).catch(() => {});
 }
 
-function endEvent(reason, atMs) {
-  return { kind: "call_ended", at: new Date(atMs).toISOString(), reason };
-}
-
 // Ends a session the worker tracks. Runs on the chain.
 async function endSession(state, sessionId, reason, atMs) {
   for (const [tabId, tabSession] of Object.entries(state.tabSessions)) {
@@ -94,7 +92,7 @@ async function endSession(state, sessionId, reason, atMs) {
   }
   delete state.pendingEnds[sessionId];
   markEnded(state, sessionId);
-  await storeEvent(sessionId, endEvent(reason, atMs), state);
+  await storeEvent(sessionId, globalThis.mcMeetCallEvents.callEnded({ atMs, reason }), state);
 }
 
 // A tab starts or resumes a session. Any other session of that tab is over.

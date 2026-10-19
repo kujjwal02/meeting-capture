@@ -45,16 +45,17 @@ globalThis.mcMeetCreateDomCaptions = ({ emit, selfName }) => {
     if (text === turn.text) return;
     turn.text = text;
     turn.version += 1;
-    emit({
-      kind: "caption",
-      at: new Date(turn.atMs).toISOString(),
-      device_id: turn.speaker,
-      utterance_id: turn.utteranceId,
-      version: turn.version,
-      speaker: turn.speaker,
-      text,
-      source: "dom",
-    });
+    emit(
+      globalThis.mcMeetCallEvents.caption({
+        atMs: turn.atMs,
+        deviceId: turn.speaker,
+        utteranceId: turn.utteranceId,
+        version: turn.version,
+        speaker: turn.speaker,
+        text,
+        source: "dom",
+      }),
+    );
   }
 
   function onMutations(mutations) {
@@ -114,21 +115,26 @@ globalThis.mcMeetCreateDomCaptions = ({ emit, selfName }) => {
 // Used only while the collections channel gives no roster.
 globalThis.mcMeetReadDomRoster = () => {
   const selectors = globalThis.mcMeetSelectors;
+  const callEvents = globalThis.mcMeetCallEvents;
   const byName = new Map();
   for (const row of document.querySelectorAll(selectors.peopleRow)) {
     const name = row.getAttribute("aria-label")?.trim();
-    if (name) byName.set(name, { device_id: name, name, is_self: false });
+    if (name)
+      byName.set(name, callEvents.rosterParticipant({ deviceId: name, name, isSelf: false }));
   }
   if (byName.size === 0) {
     for (const tile of document.querySelectorAll(selectors.participantTile)) {
       const selfName = tile.querySelector(selectors.selfName)?.getAttribute("data-self-name");
       const name = (selfName || tile.getAttribute("aria-label") || "").trim();
       if (!name) continue;
-      byName.set(name, {
-        device_id: tile.getAttribute("data-participant-id") || name,
+      byName.set(
         name,
-        is_self: Boolean(selfName),
-      });
+        callEvents.rosterParticipant({
+          deviceId: tile.getAttribute("data-participant-id") || name,
+          name,
+          isSelf: Boolean(selfName),
+        }),
+      );
     }
   }
   return [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));

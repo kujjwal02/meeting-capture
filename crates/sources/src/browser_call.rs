@@ -39,6 +39,7 @@ pub enum CallEvent {
         #[serde(deserialize_with = "id_text")]
         utterance_id: String,
         version: u64,
+        /// Empty when the device had no name yet. The parser then takes the roster's name.
         speaker: String,
         text: String,
         source: ReadSource,
@@ -47,6 +48,10 @@ pub enum CallEvent {
         at: Timestamp,
         #[serde(deserialize_with = "id_text")]
         message_id: String,
+        /// Only channel chat carries the sender's device.
+        #[serde(default)]
+        device_id: Option<String>,
+        /// Empty when the device had no name yet, as for a caption's `speaker`.
         sender: String,
         text: String,
         source: ReadSource,
@@ -278,6 +283,11 @@ struct Caption {
     text: String,
 }
 
+struct Chat<'a> {
+    device_id: Option<&'a str>,
+    message: ChatMessage,
+}
+
 struct Collected {
     captions: Vec<Caption>,
     chat_messages: Vec<ChatMessage>,
@@ -287,7 +297,7 @@ struct Collected {
 fn collect(lines: &[LogLine]) -> Collected {
     let mut captions: Vec<Caption> = Vec::new();
     let mut caption_index: BTreeMap<(&str, &str), usize> = BTreeMap::new();
-    let mut chat_messages = Vec::new();
+    let mut chats: Vec<Chat> = Vec::new();
     let mut chat_ids: Vec<&str> = Vec::new();
     let mut attendees: Vec<Attendee> = Vec::new();
     for line in lines {
@@ -326,16 +336,20 @@ fn collect(lines: &[LogLine]) -> Collected {
             CallEvent::Chat {
                 at,
                 message_id,
+                device_id,
                 sender,
                 text,
                 ..
             } => {
                 if !chat_ids.contains(&message_id.as_str()) {
                     chat_ids.push(message_id);
-                    chat_messages.push(ChatMessage {
-                        sent_at: *at,
-                        sender: sender.clone(),
-                        text: text.clone(),
+                    chats.push(Chat {
+                        device_id: device_id.as_deref(),
+                        message: ChatMessage {
+                            sent_at: *at,
+                            sender: sender.clone(),
+                            text: text.clone(),
+                        },
                     });
                 }
             }
@@ -359,6 +373,7 @@ fn collect(lines: &[LogLine]) -> Collected {
             | CallEvent::Unknown => {}
         }
     }
+    let mut chat_messages = name_from_roster(&mut captions, chats, &attendees);
     captions.retain(|caption| !caption.text.trim().is_empty());
     captions.sort_by_key(|caption| caption.first_at);
     chat_messages.sort_by_key(|message| message.sent_at);
@@ -367,6 +382,45 @@ fn collect(lines: &[LogLine]) -> Collected {
         chat_messages,
         attendees,
     }
+}
+
+// A caption or chat sent before the roster named its device has no name. It gets the device's
+// attendee name, from any roster in the log: a late roster still names early lines, and the
+// label matches the attendee list.
+fn name_from_roster(
+    captions: &mut [Caption],
+    chats: Vec<Chat>,
+    attendees: &[Attendee],
+) -> Vec<ChatMessage> {
+    let roster_name = |device_id: &str| {
+        attendees
+            .iter()
+            .find(|attendee| attendee.platform_id.as_deref() == Some(device_id))
+            .map(|attendee| attendee.name.clone())
+    };
+    for caption in captions {
+        if caption.speaker.trim().is_empty()
+            && let Some(name) = roster_name(&caption.device_id)
+        {
+            caption.speaker = name;
+        }
+    }
+    chats
+        .into_iter()
+        .map(
+            |Chat {
+                 device_id,
+                 mut message,
+             }| {
+                if message.sender.trim().is_empty()
+                    && let Some(name) = device_id.and_then(roster_name)
+                {
+                    message.sender = name;
+                }
+                message
+            },
+        )
+        .collect()
 }
 
 fn segments(captions: Vec<Caption>, started_at: Timestamp) -> Vec<Segment> {
