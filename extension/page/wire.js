@@ -271,19 +271,27 @@
     };
   }
 
-  // Chat message: { 1: message name, 2: device id, 3: timestamp, 5: { 1: text } }
+  // Chat message: { 1: message name, 2: device id, 3: the sender's join time in ms,
+  // 4: sent time { 1: seconds, 2: nanos }, 5: { 1: text } }
   function decodeChatMessage(fields) {
     const deviceId = stringField(fields, 2);
     const body = messageField(fields, 5);
     const text = body ? stringField(body, 1) : undefined;
     if (!deviceId || !text) return undefined;
-    const timestamp = varintField(fields, 3);
+    const sentMs = timestampMs(messageField(fields, 4));
     return {
-      messageId: stringField(fields, 1) || `${deviceId}/${timestamp ?? ""}`,
+      messageId: stringField(fields, 1) || `${deviceId}/${sentMs ?? ""}`,
       deviceId,
-      timestamp,
+      sentMs,
       text,
     };
+  }
+
+  function timestampMs(timestamp) {
+    const seconds = timestamp ? varintField(timestamp, 1) : undefined;
+    if (seconds === undefined) return undefined;
+    const nanos = varintField(timestamp, 2) ?? 0n;
+    return Number(seconds * 1000n + nanos / 1000000n);
   }
 
   // collections: { 1: { 2: { 13: { 1: { 2: repeated participant }, 4: repeated { 2: chat } } } } }
@@ -369,15 +377,10 @@
   const MAX_UTTERANCES = 5000;
   const MAX_CHATS = 5000;
 
-  // Chat timestamps look like microseconds since the epoch. Use them only when they land
-  // within a day of the arrival time.
-  function chatTime(timestamp, arrivedMs) {
-    if (timestamp === undefined) return arrivedMs;
-    for (const divisor of [1000n, 1n, 1000000n]) {
-      const ms = Number(timestamp / divisor);
-      if (Math.abs(ms - arrivedMs) < 86400000) return ms;
-    }
-    return arrivedMs;
+  // A sent time more than a day from the arrival time is a misread field.
+  function chatTime(sentMs, arrivedMs) {
+    if (sentMs === undefined || Math.abs(sentMs - arrivedMs) >= 86400000) return arrivedMs;
+    return sentMs;
   }
 
   function newCounters() {
@@ -480,7 +483,7 @@
         if (chatIds.size > MAX_CHATS) chatIds.delete(chatIds.values().next().value);
         emit({
           kind: "chat",
-          at: iso(chatTime(chat.timestamp, arrivedMs)),
+          at: iso(chatTime(chat.sentMs, arrivedMs)),
           message_id: chat.messageId,
           device_id: chat.deviceId,
           sender: nameOf(chat.deviceId),
