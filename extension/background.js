@@ -57,8 +57,11 @@ function markEnded(state, sessionId) {
   );
 }
 
+// A fresh install starts at the install time in microseconds. A reinstall mid-call resumes the
+// tab's session, and the app drops any seq that session's log already has.
 async function takeSeq() {
-  if (nextSeq === null) nextSeq = (await chrome.storage.local.get("nextSeq")).nextSeq ?? 1;
+  if (nextSeq === null)
+    nextSeq = (await chrome.storage.local.get("nextSeq")).nextSeq ?? Date.now() * 1000;
   const seq = nextSeq;
   nextSeq += 1;
   return seq;
@@ -317,19 +320,26 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === RECONNECT_ALARM) ensureNative();
 });
 
-// After a browser restart no old tab is left, but a restored tab may resume its session.
-chrome.runtime.onStartup.addListener(() => {
-  serially(async () => {
-    const state = await readState();
-    const nowMs = Date.now();
-    for (const sessionId of Object.values(state.tabSessions)) {
-      state.pendingEnds[sessionId] ??= { tab_id: null, at_ms: nowMs };
-    }
-    state.tabSessions = {};
-    await chrome.storage.local.set(state);
-    await schedulePendingEnds(state);
+// A session whose tab no longer exists lost its page with no tab close seen: a browser restart
+// or crash, or the extension was off. A restored tab may still resume it.
+async function holdSessionsOfMissingTabs() {
+  const state = await readState();
+  const nowMs = Date.now();
+  let isChanged = false;
+  for (const [tabId, sessionId] of Object.entries(state.tabSessions)) {
+    const tab = await chrome.tabs.get(Number(tabId)).catch(() => undefined);
+    if (tab) continue;
+    state.pendingEnds[sessionId] ??= { tab_id: null, at_ms: nowMs };
+    delete state.tabSessions[tabId];
+    isChanged = true;
+  }
+  if (!isChanged) return;
+  await chrome.storage.local.set({
+    tabSessions: state.tabSessions,
+    pendingEnds: state.pendingEnds,
   });
-});
+  await schedulePendingEnds(state);
+}
 
 // An update or reload orphans the content scripts in open Meet tabs. Inject fresh ones; they
 // resume the tab's session from sessionStorage. The page hook from the old version keeps running.
@@ -343,4 +353,5 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 });
 
 chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
+serially(holdSessionsOfMissingTabs);
 ensureNative();
