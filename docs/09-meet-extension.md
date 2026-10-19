@@ -205,12 +205,21 @@ could not write gets no `ack`.
 
 ## Install
 
-1. Open `chrome://extensions`. Turn on Developer mode.
-2. Click "Load unpacked". Pick the repo's `extension/` folder.
-3. Start the app once, so it writes the native host manifest.
+Each GitHub release has `mc-meet_<version>.zip`. Chrome installs extensions from outside the
+Chrome Web Store only as an unpacked folder.
 
-After a pull, click the reload icon on mc-meet in `chrome://extensions`. The tray warns when the
-extension's protocol is older than the app's.
+1. Download `mc-meet_<version>.zip` from the
+   [latest release](https://github.com/kujjwal02/meeting-capture/releases/latest). Unzip it into a
+   folder you keep, such as `~/Applications/mc-meet`. Chrome loads the extension from that folder
+   at each start.
+2. Open `chrome://extensions`. Turn on Developer mode.
+3. Click "Load unpacked". Pick the `mc-meet` folder from the zip. From a clone, pick the repo's
+   `extension/` folder.
+4. Start the app once, so it writes the native host manifest.
+
+To update, replace the folder with the new release's `mc-meet` folder, or pull the repo. Then click
+the reload icon on mc-meet in `chrome://extensions`. The tray warns when the extension's protocol
+is older than the app's.
 
 ### Dev runs on macOS
 

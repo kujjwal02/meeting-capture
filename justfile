@@ -52,8 +52,8 @@ signing-cert:
 [macos]
 release: check bundle
 
-# Build the signed DMG, the signed updater package and latest.json into target/dist/. The release
-# workflow sets the updater key variables; locally they default to the files in ~/.tauri.
+# Build the signed DMG, the signed updater package, latest.json and the mc-meet zip into
+# target/dist/. The release workflow sets the updater key variables; locally they default to the files in ~/.tauri.
 [macos]
 bundle:
     #!/bin/sh
@@ -72,5 +72,13 @@ bundle:
     cp "$bundle/macos/Meeting Capture.app.tar.gz.sig" "target/dist/$package.sig"
     scripts/updater-manifest.sh "$version" "target/dist/$package" > target/dist/latest.json
     (cd target/dist && shasum -a 256 "$dmg" > "$dmg.sha256")
+    # mc-meet ships as a folder to load unpacked, stamped with the app's version. Its manifest key
+    # keeps the extension ID that the native host manifest allows.
+    extension=target/mc-meet
+    rm -rf "$extension" && mkdir -p "$extension"
+    (cd extension && find . -type f ! -name '*.md' | cpio -pdm --quiet "../$extension")
+    cp LICENSE "$extension/LICENSE"
+    jq --arg version "$version" '.version = $version' extension/manifest.json > "$extension/manifest.json"
+    (cd target && zip -qrX "dist/mc-meet_${version}.zip" mc-meet)
     # The DMG holds the app. A second copy left in target/ shows up in Spotlight and Launch Services.
     rm -rf "$bundle/macos"

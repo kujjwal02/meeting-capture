@@ -74,6 +74,10 @@ and restart". If you don't pick it, the update installs the next time the app qu
 The update keeps the quarantine flag off, so it opens without a prompt. `brew upgrade` skips the
 app, because the cask is marked as self-updating.
 
+mc-meet does not update itself. When the tray warns that its protocol is older than the app's,
+replace its folder with the one in the new release's `mc-meet_<version>.zip`. See
+[mc-meet](09-meet-extension.md#install).
+
 To upgrade v0.1.0, which has no updater, use one of these:
 
 - Homebrew: `brew upgrade --cask --greedy meeting-capture`. It quits the app first.
