@@ -180,7 +180,7 @@ impl Pipeline {
     }
 
     /// Returns the path in the app folder to record. A file already in place stays there, so a
-    /// payload the receiver saved, or a log the watcher wrote, never gets a second copy.
+    /// saved payload, or a log the app wrote, never gets a second copy.
     fn copy_in(
         &self,
         kind: InputKind,

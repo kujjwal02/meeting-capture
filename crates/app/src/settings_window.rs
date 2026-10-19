@@ -39,7 +39,6 @@ pub(crate) fn open(app: &AppHandle) {
 pub(crate) struct SettingsView {
     vault_dir: Option<PathBuf>,
     my_name: Option<String>,
-    receiver_port: Option<u16>,
     time_zone: Option<String>,
     client_id: Option<String>,
     has_client_secret: bool,
@@ -71,7 +70,6 @@ pub(crate) struct AccountView {
 pub(crate) struct SettingsForm {
     vault_dir: String,
     my_name: String,
-    receiver_port: Option<u16>,
     time_zone: String,
     client_id: String,
     client_secret: String,
@@ -114,7 +112,6 @@ impl SettingsForm {
     fn apply_to(&self, file: &mut SettingsFile) {
         file.vault_dir = non_blank(&self.vault_dir).map(PathBuf::from);
         file.my_name = non_blank(&self.my_name);
-        file.receiver_port = self.receiver_port;
         file.time_zone = non_blank(&self.time_zone);
         file.google.set_client_id(non_blank(&self.client_id));
         if let Some(client_secret) = non_blank(&self.client_secret) {
@@ -158,7 +155,6 @@ pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, 
     Ok(SettingsView {
         vault_dir: file.vault_dir,
         my_name: file.my_name,
-        receiver_port: file.receiver_port,
         time_zone: file.time_zone,
         has_client_secret: file.google.client_secret.is_some(),
         client_id: file.google.client_id().map(str::to_owned),

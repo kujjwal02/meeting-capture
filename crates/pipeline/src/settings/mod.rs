@@ -33,8 +33,6 @@ pub enum SettingsError {
     },
     #[error("settings field vault_dir: {path} is not a folder")]
     VaultDirMissing { path: PathBuf },
-    #[error("settings field receiver_port: must be between 1 and 65535")]
-    ReceiverPortZero,
     #[error("settings field my_name: must not be blank")]
     BlankMyName,
     #[error(

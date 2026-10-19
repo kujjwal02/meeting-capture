@@ -103,7 +103,6 @@ async function load() {
     field("vault-dir").value = settings.vault_dir ?? "";
     field("my-name").value = settings.my_name ?? "";
     field("time-zone").value = settings.time_zone ?? "";
-    field("receiver-port").value = settings.receiver_port ?? "";
     field("client-id").value = settings.client_id ?? "";
     field("client-secret").value = "";
     savedClient = settings;
@@ -126,11 +125,9 @@ async function load() {
 
 async function save(event) {
   event.preventDefault();
-  const port = field("receiver-port").value.trim();
   const form = {
     vault_dir: field("vault-dir").value,
     my_name: field("my-name").value,
-    receiver_port: port === "" ? null : Number(port),
     time_zone: field("time-zone").value,
     client_id: field("client-id").value,
     client_secret: field("client-secret").value,

@@ -181,8 +181,9 @@ pub struct SettingsFile {
     pub vault_dir: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub my_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub receiver_port: Option<u16>,
+    /// Read and dropped. Files from versions with the TranscripTonic receiver have it.
+    #[serde(default, rename = "receiver_port", skip_serializing)]
+    pub dropped_receiver_port: Option<serde::de::IgnoredAny>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time_zone: Option<String>,
     #[serde(default)]
@@ -200,7 +201,6 @@ const SETTINGS_HEADER: &str = "\
 #
 # vault_dir: the Obsidian vault. Notes go under areas/meetings. Default ~/knowledge.
 # my_name: replaces \"You\" in TranscripTonic transcripts.
-# receiver_port: the port in TranscripTonic's webhook URL. Default 47615.
 # time_zone: the IANA time zone for note names and shown times. Default: the device's.
 # [google] client_id, client_secret: the Desktop app OAuth client.
 # [google] accounts: signed-in accounts. On a tied calendar match the first one wins.
