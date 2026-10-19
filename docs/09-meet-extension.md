@@ -152,7 +152,12 @@ could not write gets no `ack`.
   source. When no caption arrives within 20 s of opening the channels, or 10 caption frames in a
   row fail to decode with no good caption in the last 20 s, the content script reads the caption
   region in the DOM. The first channel caption after that switches back to the channel and stops
-  the DOM reader.
+  the DOM reader. `extension/content/caption-source.js` holds these rules. It reads no DOM and no
+  clock, so it also runs in Node. `content/main.js` feeds it timestamped facts and runs the reader
+  it picks.
+- Page hook to content script. The hook sends spec events (`caption`, `chat`, `roster`) as
+  `event` messages. It sends its own notices (`parse_gap`, `self_removed`) as `notice` messages,
+  which never reach the app.
 - Roster. From `collections` and the `SyncMeetingSpaceCollections` response. When neither gives a
   roster 30 s into the call, the content script reads the People panel if it is open, else the
   video tiles, every 10 s.
