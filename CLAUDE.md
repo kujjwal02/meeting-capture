@@ -17,6 +17,7 @@ speech-to-text, and a pipeline that writes meeting notes into `~/knowledge`. Rea
 - Vendored Anarlog crates (MIT, <https://github.com/fastrepl/anarlog>) keep the licence and record the
   upstream commit in their README.
 - Stored times are UTC; anything reported to me is IST.
+- Nothing committed refers to `scratch/`, since it is never committed.
 - Never write media into the vault. Client call recordings never go into the repo.
 - Stay on Tauri 2 stable. Tauri 3 is alpha.
 - No tests until phase 8 (pre-v1 hardening). `just check` is the gate. The Check workflow runs it
