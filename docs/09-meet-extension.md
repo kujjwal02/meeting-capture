@@ -210,7 +210,8 @@ extension's protocol is older than the app's.
   `--user-data-dir`. A dev app overwrites the installed app's manifest there.
 - An extension loaded through CDP `Extensions.loadUnpacked` is gone after a browser restart. Its
   storage stays.
-- Meet sends no captions while you are alone in the call. A live test needs a second account.
+- A fake microphone built on an `AudioContext` starts suspended. Resume it from a user gesture,
+  or the call gets no speech and no captions.
 - The tray shows mc-meet as connected only while the worker has work, since the port closes
   after the last ack.
 
