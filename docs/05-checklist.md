@@ -208,14 +208,16 @@ Done when:
 
 ## Phase 2: call detection
 
-- [ ] `detect` reports when an app takes or releases the mic, and which app.
-- [ ] Start and end events reach the app; the tray shows call state.
-- [ ] Test Anarlog's Windows mic detection (`crates/detect/src/mic/windows.rs`).
+- [x] `calls` turns mc-meet and huddle events into one call stream and logs each event.
+- [x] Each call ended at launch logs `call.ended` with reason `app_restarted`.
 
 Done when:
 
-- [ ] Meet, Teams, Zoom and a Slack huddle each log start and end within 5 s, on the Mac.
-- [ ] The same on the PC.
+- [x] Meet and a Slack huddle each log start within 5 s on the Mac. Meet logs its end within 5 s;
+  a huddle within 6 s, with the end time in its log set to when its window was last seen.
+- [x] A Meet rejoin within 10 minutes logs `call.resumed` with the same `call.id`.
+- [x] An app killed mid-call logs `call.ended` with `app_restarted`, then a fresh `call.started`.
+- [ ] Meet logs start and end within 5 s on the PC.
 
 ## Phase 3: Mac capture
 
@@ -229,6 +231,18 @@ Done when:
 
 - [ ] 3 calls recorded, one with AirPods connected mid-call, no gap over 1 s.
 - [ ] The app stays under 5% CPU.
+
+## Phase 3b: mic detection
+
+- [ ] `detect` reports which app takes or releases the mic.
+- [ ] Teams and Zoom calls reach the call stream.
+- [ ] A Meet call ends when its browser releases the mic, not 5 minutes later.
+- [ ] Test Anarlog's Windows mic detection (`crates/detect/src/mic/windows.rs`).
+
+Done when:
+
+- [ ] Teams and Zoom each log start and end within 5 s, on the Mac.
+- [ ] The same on the PC.
 
 ## Phase 4: local speech-to-text
 
@@ -245,7 +259,6 @@ Done when:
 ## Phase 5: Windows capture
 
 - [ ] WASAPI process loopback for remote audio; `cpal` for the mic.
-- [ ] Windows mic detection.
 
 Done when:
 

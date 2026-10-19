@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
-use sources::append_log;
+use sources::append_log::{self, FinishedLogs};
 use sources::browser_call::{self, EndReason, LogSummary};
 
 use super::call_log::{CallLog, LoggedLine, ended_event};
@@ -137,19 +137,25 @@ impl LogFolder {
     }
 
     /// Ends each log whose last event is not a `call_ended`, at the time of its last event. The
-    /// app quit or crashed during those calls. Returns every log path, oldest first.
-    pub(super) fn finish_open_logs(&self) -> std::io::Result<Vec<PathBuf>> {
-        let paths = append_log::log_paths(&self.dir)?;
-        for path in &paths {
-            if let Err(error) = finish_log(path) {
-                tracing::warn!(
+    /// app quit or crashed during those calls. Returns every log path, and the ones it ended.
+    pub(super) fn finish_open_logs(&self) -> std::io::Result<FinishedLogs> {
+        let log_paths = append_log::log_paths(&self.dir)?;
+        let mut ended_paths = Vec::new();
+        for path in &log_paths {
+            match finish_log(path) {
+                Ok(true) => ended_paths.push(path.clone()),
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
                     file.path = %path.display(),
                     exception.message = %error,
                     "could not finish an open browser call log"
-                );
+                ),
             }
         }
-        Ok(paths)
+        Ok(FinishedLogs {
+            log_paths,
+            ended_paths,
+        })
     }
 }
 
@@ -175,7 +181,7 @@ fn read_summary(log_path: &Path) -> std::io::Result<LogSummary> {
     Ok(browser_call::summarize(&lines))
 }
 
-fn finish_log(log_path: &Path) -> std::io::Result<()> {
+fn finish_log(log_path: &Path) -> std::io::Result<bool> {
     append_log::finish(log_path, |lines: &[browser_call::LogLine]| {
         let last = lines.last()?;
         let summary = browser_call::summarize(lines);

@@ -22,6 +22,7 @@ use tracing::Instrument as _;
 use self::call_book::{CallBook, EventError, Logged, Now};
 use self::log_folder::LogFolder;
 use crate::AppState;
+use crate::calls::{CallEndReason, CallPlatform};
 use crate::finished_logs::{self, LogSource};
 
 /// The protocol this app speaks. An extension that says an older one gets a tray warning.
@@ -110,10 +111,19 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
     let logs = state.browser_calls.lock().logs().clone();
     // Before the listener starts, so a resent event cannot reopen a log this is closing.
     match logs.finish_open_logs() {
-        Ok(log_paths) => {
+        Ok(logs) => {
+            state
+                .calls
+                .end_at_launch(&logs.ended_paths, CallPlatform::Meet);
             let (app, pipeline) = (app.clone(), Arc::clone(pipeline));
             tauri::async_runtime::spawn_blocking(move || {
-                finished_logs::record_left_over(&app, &pipeline, LogSource::MeetCall, log_paths, 0);
+                finished_logs::record_left_over(
+                    &app,
+                    &pipeline,
+                    LogSource::MeetCall,
+                    logs.log_paths,
+                    0,
+                );
             });
         }
         Err(error) => {
@@ -288,14 +298,28 @@ impl Port {
             browser_call.session_id = session_id
         );
         let _entered = span.enter();
-        let logged = self
-            .calls()
-            .lock()
-            .take_event(self.id, seq, session_id, event, Now::read());
+        let state = self.app.state::<AppState>();
+        let logged = {
+            let mut book = self.calls().lock();
+            let logged = book.take_event(self.id, seq, session_id, event, Now::read());
+            // Under the book lock, so the call stream sees opens and ends in the book's order.
+            match &logged {
+                Ok(Logged::Opened { log_path, title }) => {
+                    state
+                        .calls
+                        .open(log_path, CallPlatform::Meet, title.clone());
+                }
+                Ok(Logged::Ended { log_path, reason }) => {
+                    state.calls.end(log_path, CallEndReason::from(*reason));
+                }
+                Ok(Logged::Appended | Logged::Duplicate) | Err(_) => {}
+            }
+            logged
+        };
         crate::tray::refresh(&self.app);
         match &logged {
-            Ok(Logged::Appended | Logged::Duplicate) => {}
-            Ok(Logged::Ended(log_path)) => {
+            Ok(Logged::Appended | Logged::Opened { .. } | Logged::Duplicate) => {}
+            Ok(Logged::Ended { log_path, .. }) => {
                 let (app, pipeline) = (self.app.clone(), Arc::clone(&self.pipeline));
                 let log_path = log_path.clone();
                 tauri::async_runtime::spawn_blocking(move || {
@@ -318,7 +342,7 @@ impl Port {
 // the extension's queue.
 fn is_acked(logged: &Result<Logged, EventError>) -> bool {
     match logged {
-        Ok(Logged::Appended | Logged::Duplicate | Logged::Ended(_))
+        Ok(Logged::Appended | Logged::Opened { .. } | Logged::Duplicate | Logged::Ended { .. })
         | Err(EventError::InvalidSessionId(_) | EventError::InvalidEvent(_)) => true,
         Err(EventError::Write(_)) => false,
     }
@@ -337,11 +361,16 @@ async fn end_idle_calls(app: AppHandle, pipeline: Arc<Pipeline>) {
     let mut interval = tokio::time::interval(IDLE_CHECK_INTERVAL);
     loop {
         interval.tick().await;
-        let ended = app
-            .state::<AppState>()
-            .browser_calls
-            .lock()
-            .end_idle_calls(Now::read());
+        let ended = {
+            let state = app.state::<AppState>();
+            let mut book = state.browser_calls.lock();
+            let ended = book.end_idle_calls(Now::read());
+            // Under the book lock, so a late event cannot reopen the call before this ends it.
+            for log_path in &ended {
+                state.calls.end(log_path, CallEndReason::Idle);
+            }
+            ended
+        };
         if ended.is_empty() {
             continue;
         }

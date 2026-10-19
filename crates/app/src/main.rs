@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser_calls;
+mod calls;
 mod finished_logs;
 mod huddles;
 mod launch;
@@ -32,6 +33,7 @@ pub(crate) struct AppState {
     pub settings: Arc<SettingsStore>,
     pub huddle_status: Mutex<huddles::HuddleStatus>,
     pub browser_calls: browser_calls::BrowserCalls,
+    pub calls: calls::Calls,
     pub updates: updates::Updates,
 }
 
@@ -156,6 +158,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         settings: settings_store,
         huddle_status: Mutex::new(huddles::HuddleStatus::Idle),
         browser_calls,
+        calls: calls::Calls::new(),
         updates: updates::Updates::default(),
     });
     tray::create(app.handle())?;

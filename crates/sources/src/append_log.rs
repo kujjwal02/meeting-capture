@@ -166,8 +166,17 @@ impl AppendLog {
     }
 }
 
-/// Appends the line `end_line` makes from a log's lines, when it makes one. For a log the app
-/// quit or crashed during. A torn last line is cut first.
+/// The logs in a folder after a start-up pass ended the ones left open.
+#[derive(Debug, Default)]
+pub struct FinishedLogs {
+    /// Every log, oldest first.
+    pub log_paths: Vec<PathBuf>,
+    /// The logs the pass ended: the app quit or crashed during their calls.
+    pub ended_paths: Vec<PathBuf>,
+}
+
+/// Appends the line `end_line` makes from a log's lines, when it makes one, and reports whether
+/// it did. For a log the app quit or crashed during. A torn last line is cut first.
 ///
 /// # Errors
 ///
@@ -175,13 +184,14 @@ impl AppendLog {
 pub fn finish<T: DeserializeOwned, L: Serialize>(
     log_path: &Path,
     end_line: impl FnOnce(&[T]) -> Option<L>,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     let contents = std::fs::read(log_path)?;
     let lines = read_lines(&contents).map_err(std::io::Error::other)?;
     let Some(end) = end_line(&lines) else {
-        return Ok(());
+        return Ok(false);
     };
-    AppendLog::reopen(log_path, &contents)?.append(&end, true)
+    AppendLog::reopen(log_path, &contents)?.append(&end, true)?;
+    Ok(true)
 }
 
 // Up to and with the last newline.

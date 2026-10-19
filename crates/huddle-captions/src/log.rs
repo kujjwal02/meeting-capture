@@ -1,9 +1,9 @@
 //! Appends huddle log lines to disk as they happen, so a crash loses at most the last line.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use jiff::Timestamp;
-use sources::append_log::{self, AppendLog};
+use sources::append_log::{self, AppendLog, FinishedLogs};
 use sources::slack_huddle::{self, LogLine};
 
 pub(crate) struct HuddleLog {
@@ -27,24 +27,30 @@ impl HuddleLog {
 }
 
 /// Adds an `ended` line to each log in `log_dir` that has none, at the time of its last line.
-/// The app quit or crashed during those huddles. Returns every log path, oldest first.
+/// The app quit or crashed during those huddles. Returns every log path, and the ones it ended.
 ///
 /// # Errors
 ///
 /// Returns the I/O error that stopped the folder read. A log that cannot be read or finished is
 /// logged and skipped.
-pub fn finish_open_logs(log_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let paths = append_log::log_paths(log_dir)?;
-    for path in &paths {
-        if let Err(error) = append_log::finish(path, ended_line) {
-            tracing::warn!(
+pub fn finish_open_logs(log_dir: &Path) -> std::io::Result<FinishedLogs> {
+    let log_paths = append_log::log_paths(log_dir)?;
+    let mut ended_paths = Vec::new();
+    for path in &log_paths {
+        match append_log::finish(path, ended_line) {
+            Ok(true) => ended_paths.push(path.clone()),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
                 file.path = %path.display(),
                 exception.message = %error,
                 "could not finish an open huddle log"
-            );
+            ),
         }
     }
-    Ok(paths)
+    Ok(FinishedLogs {
+        log_paths,
+        ended_paths,
+    })
 }
 
 fn ended_line(lines: &[LogLine]) -> Option<LogLine> {
