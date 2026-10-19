@@ -33,7 +33,8 @@ pub(crate) struct LineSegment {
 }
 
 impl Prompt {
-    /// `attendees` are the calendar event's; names join the roster, emails are left out.
+    /// `attendees` are the people who joined, then the calendar event's invitees; names join the
+    /// roster, emails are left out.
     /// `glossary` lists names and terms the captions often get wrong.
     ///
     /// # Panics
