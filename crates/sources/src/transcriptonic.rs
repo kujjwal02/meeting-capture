@@ -280,9 +280,6 @@ pub fn merge_payloads(payload: &[u8], other_payload: &[u8]) -> Result<Vec<u8>, P
 
 /// Saves a raw payload in `payload_dir` under a name no other payload has, synced to disk.
 ///
-/// TranscripTonic marks a meeting posted on a 2xx reply and never sends it again, so the payload
-/// must be durable before the receiver replies.
-///
 /// # Errors
 ///
 /// Returns the I/O error that stopped the save.

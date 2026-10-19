@@ -1,5 +1,5 @@
-//! Tray app with no Dock icon and no window. Receives TranscripTonic's webhook and mc-meet's call
-//! events, and runs the pipeline for each meeting. Starts at login once "Start at login" is on.
+//! Tray app with no Dock icon and no window. Receives mc-meet's call events and Slack huddle
+//! captions, and runs the pipeline for each meeting. Starts at login once "Start at login" is on.
 //! Started by a browser with an extension origin as its argument, it runs host mode instead.
 
 // Release builds on Windows would otherwise open a console window next to the tray icon.
@@ -21,17 +21,10 @@ use pipeline::settings::{AppDirs, SettingsStore};
 use tauri::{AppHandle, Manager, RunEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
-#[derive(Debug, Clone)]
-pub(crate) enum Listener {
-    Starting,
-    Listening { port: u16 },
-    Stopped { reason: String },
-}
-
 pub(crate) struct AppState {
-    /// `None` when the settings or the job store failed to load. The listener then says why.
+    /// `None` when the settings or the job store failed to load. `pipeline_error` says why.
     pub pipeline: Option<Arc<Pipeline>>,
-    pub listener: Mutex<Listener>,
+    pub pipeline_error: Option<String>,
     /// Exists without a pipeline, so the settings window can save a fix for settings that failed
     /// to load.
     pub settings: Arc<SettingsStore>,
@@ -41,13 +34,6 @@ pub(crate) struct AppState {
 }
 
 impl AppState {
-    pub fn listener(&self) -> Listener {
-        self.listener
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
     pub fn huddle_status(&self) -> huddles::HuddleStatus {
         self.huddle_status
             .lock()
@@ -61,22 +47,6 @@ impl AppState {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = status;
     }
-}
-
-/// Records the listener state and shows it in the tray.
-pub(crate) fn set_listener(app: &AppHandle, listener: Listener) {
-    match &listener {
-        Listener::Starting => {}
-        Listener::Listening { port } => tracing::info!(server.port = port, "listening"),
-        Listener::Stopped { reason } => {
-            tracing::error!(exception.message = reason, "not listening");
-        }
-    }
-    *app.state::<AppState>()
-        .listener
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner) = listener;
-    tray::refresh(app);
 }
 
 // The env var `AppDirs::locate` reads. A dev run with its own home is a separate instance.
@@ -169,21 +139,16 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     init_logging(&app_dirs)?;
 
     let settings_store = Arc::new(SettingsStore::new(app_dirs));
-    let (pipeline, listener) = match Pipeline::open(Arc::clone(&settings_store)) {
-        Ok(pipeline) => {
-            let port = pipeline.settings().receiver_port;
-            (Some((Arc::new(pipeline), port)), Listener::Starting)
+    let (pipeline, pipeline_error) = match Pipeline::open(Arc::clone(&settings_store)) {
+        Ok(pipeline) => (Some(Arc::new(pipeline)), None),
+        Err(error) => {
+            tracing::error!(exception.message = %error, "could not start the pipeline");
+            (None, Some(error.to_string()))
         }
-        Err(error) => (
-            None,
-            Listener::Stopped {
-                reason: error.to_string(),
-            },
-        ),
     };
     app.manage(AppState {
-        pipeline: pipeline.as_ref().map(|(pipeline, _)| Arc::clone(pipeline)),
-        listener: Mutex::new(listener.clone()),
+        pipeline: pipeline.clone(),
+        pipeline_error,
         settings: settings_store,
         huddle_status: Mutex::new(huddles::HuddleStatus::Idle),
         browser_calls: browser_calls::BrowserCalls::default(),
@@ -191,14 +156,11 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
     tray::create(app.handle())?;
     updates::start(app.handle());
-    match pipeline {
-        Some((pipeline, port)) => {
-            check_google_accounts(app.handle().clone());
-            huddles::start(app.handle(), &pipeline);
-            browser_calls::start(app.handle(), &pipeline);
-            meetings::start(app.handle().clone(), pipeline, port);
-        }
-        None => set_listener(app.handle(), listener),
+    if let Some(pipeline) = pipeline {
+        check_google_accounts(app.handle().clone());
+        huddles::start(app.handle(), &pipeline);
+        browser_calls::start(app.handle(), &pipeline);
+        meetings::start(app.handle().clone(), pipeline);
     }
     Ok(())
 }

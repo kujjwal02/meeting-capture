@@ -16,7 +16,7 @@ use tauri_plugin_opener::OpenerExt as _;
 
 use crate::huddles::HuddleStatus;
 use crate::launch::{LaunchTarget, launch};
-use crate::{AppState, Listener, meetings, updates};
+use crate::{AppState, meetings, updates};
 
 const TRAY_ID: &str = "main";
 const RECENT_MEETINGS: u32 = 5;
@@ -115,14 +115,10 @@ pub(crate) fn refresh(app: &AppHandle) {
 fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     let state = app.state::<AppState>();
     let menu = Menu::new(app)?;
-    let listener_label = match state.listener() {
-        Listener::Starting => "Starting…".to_owned(),
-        Listener::Listening { port } => format!("Listening on 127.0.0.1:{port}"),
-        Listener::Stopped { reason } => {
-            format!("Not listening: {}", shorten(&reason, MAX_REASON_CHARS))
-        }
-    };
-    menu.append(&label_entry(app, &listener_label)?)?;
+    if let Some(reason) = &state.pipeline_error {
+        let label = format!("Not running: {}", shorten(reason, MAX_REASON_CHARS));
+        menu.append(&label_entry(app, &label)?)?;
+    }
     append_huddle_status(app, &menu, &state)?;
     append_browser_call_status(app, &menu, &state)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;

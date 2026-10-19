@@ -1,97 +1,19 @@
-//! Turns received captions into jobs and runs the pipeline for them, off the async runtime.
+//! Runs the pipeline for meetings, off the async runtime, and sweeps up unfinished ones.
 
-use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use caption_receiver::ReceivedCaptions;
-use jobs::{FailureCause, FailureKind, InputKind, JobState, Meeting, MeetingId, RunOutcome};
+use jobs::{FailureCause, FailureKind, JobState, Meeting, MeetingId, RunOutcome};
 use pipeline::{Pipeline, PipelineError};
 use tauri::AppHandle;
 use tauri_plugin_notification::NotificationExt as _;
-use tokio::net::TcpListener;
-use tokio::sync::mpsc;
-
-use crate::{Listener, set_listener};
 
 // Picks up meetings a crash, a quit or a store error left unfinished. A dead process's lease
 // expires after the jobs lease expiry, so a sweep soon after launch can still find one held.
 const SWEEP_INTERVAL: Duration = Duration::from_mins(5);
 
-pub(crate) fn start(app: AppHandle, pipeline: Arc<Pipeline>, port: u16) {
-    tauri::async_runtime::spawn(sweep_unfinished(app.clone(), Arc::clone(&pipeline)));
-    tauri::async_runtime::spawn(receive(app, pipeline, port));
-}
-
-async fn receive(app: AppHandle, pipeline: Arc<Pipeline>, port: u16) {
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
-    let listener = match bind(address).await {
-        Ok(listener) => listener,
-        Err(error) => {
-            let reason = format!("cannot listen on {address}: {error}");
-            set_listener(&app, Listener::Stopped { reason });
-            return;
-        }
-    };
-    set_listener(&app, Listener::Listening { port });
-
-    let (sender, mut received) = mpsc::channel(8);
-    let payload_dir = payload_dir(&app);
-    let server =
-        tauri::async_runtime::spawn(caption_receiver::serve(listener, payload_dir, sender));
-    while let Some(captions) = received.recv().await {
-        let app = app.clone();
-        let pipeline = Arc::clone(&pipeline);
-        tauri::async_runtime::spawn_blocking(move || record_and_run(&app, &pipeline, captions));
-    }
-    let reason = match server.await {
-        Ok(Ok(())) => "the receiver stopped".to_owned(),
-        Ok(Err(error)) => format!("the receiver stopped: {error}"),
-        Err(error) => format!("the receiver crashed: {error}"),
-    };
-    set_listener(&app, Listener::Stopped { reason });
-}
-
-// After an update, the relaunched app starts before the old process has released the port.
-async fn bind(address: SocketAddr) -> std::io::Result<TcpListener> {
-    const BIND_ATTEMPTS: u32 = 20;
-    const BIND_RETRY_DELAY: Duration = Duration::from_millis(500);
-    let mut attempt = 1;
-    loop {
-        match TcpListener::bind(address).await {
-            Err(error)
-                if error.kind() == std::io::ErrorKind::AddrInUse && attempt < BIND_ATTEMPTS =>
-            {
-                attempt += 1;
-                tokio::time::sleep(BIND_RETRY_DELAY).await;
-            }
-            bound => return bound,
-        }
-    }
-}
-
-fn payload_dir(app: &AppHandle) -> std::path::PathBuf {
-    use tauri::Manager as _;
-    app.state::<crate::AppState>()
-        .settings
-        .app_dirs()
-        .payload_dir()
-}
-
-fn record_and_run(app: &AppHandle, pipeline: &Pipeline, captions: ReceivedCaptions) {
-    // A read error on the saved payload also replies 500. TranscripTonic's retry posts it again,
-    // and the receiver saves it under a new name.
-    let recorded = pipeline.take_in(InputKind::TranscriptonicPayload, &captions.payload_path);
-    let reply = recorded.as_ref().map(|_| ()).map_err(ToString::to_string);
-    if captions.recorded.send(reply).is_err() {
-        tracing::warn!("TranscripTonic disconnected before the reply");
-    }
-    let Ok(id) = recorded else {
-        // The receiver logged the error and replied 500, so TranscripTonic offers a retry.
-        return;
-    };
-    crate::tray::refresh(app);
-    run(app, pipeline, id);
+pub(crate) fn start(app: AppHandle, pipeline: Arc<Pipeline>) {
+    tauri::async_runtime::spawn(sweep_unfinished(app, pipeline));
 }
 
 // Blocks until the run ends, so callers keep it off the async runtime.

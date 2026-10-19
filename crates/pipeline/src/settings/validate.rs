@@ -12,12 +12,10 @@ pub struct Settings {
     pub vault_dir: PathBuf,
     /// Replaces "You", the name TranscripTonic gives the local user.
     pub my_name: Option<String>,
-    pub receiver_port: u16,
     /// Note names, dates and the times the tray and `mc` show. Stored times stay UTC.
     pub time_zone: TimeZone,
 }
 
-const DEFAULT_RECEIVER_PORT: u16 = 47615;
 const GOOGLE_CLIENT_ID_SUFFIX: &str = ".apps.googleusercontent.com";
 
 impl Settings {
@@ -47,9 +45,6 @@ impl Settings {
                 reason: error.to_string(),
             })?,
         };
-        if file.receiver_port == Some(0) {
-            return Err(SettingsError::ReceiverPortZero);
-        }
         if let Some(client_id) = file.google.client_id()
             && !client_id.ends_with(GOOGLE_CLIENT_ID_SUFFIX)
         {
@@ -68,7 +63,6 @@ impl Settings {
         Ok(Self {
             vault_dir,
             my_name: file.my_name.clone(),
-            receiver_port: file.receiver_port.unwrap_or(DEFAULT_RECEIVER_PORT),
             time_zone,
         })
     }
