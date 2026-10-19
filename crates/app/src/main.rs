@@ -86,7 +86,7 @@ fn run_host_mode(origin: &str) -> ExitCode {
 fn run_tray_app() -> tauri::Result<()> {
     let mut builder = tauri::Builder::default();
     if std::env::var_os(HOME_OVERRIDE_VAR).is_none() {
-        // Registered first, so a second launch exits before it binds the port.
+        // Registered first, so a second launch exits before it binds the socket.
         builder = builder.plugin(tauri_plugin_single_instance::init(|_, _, _| {
             tracing::info!("a second launch was refused; the tray app is already running");
         }));
