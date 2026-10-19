@@ -199,10 +199,7 @@
   // ---- Caption source and health.
 
   function areCaptionsOn() {
-    return (
-      Boolean(hookState.caption_channels_opened_at) ||
-      Boolean(findIconButton(selectors.captionsOnIcon))
-    );
+    return Boolean(findIconButton(selectors.captionsOnIcon));
   }
 
   function reportHealth() {
@@ -236,7 +233,8 @@
     reportHealth();
   }
 
-  // Turns visible captions on for the DOM reader. Never touches the caption language.
+  // Meet sends nothing on the caption channels until its captions are on, and the DOM reader
+  // needs them visible. Never touches the caption language.
   function clickCaptionsOnIfOff(nowMs) {
     if (
       captionsClicks >= CAPTIONS_CLICK_ATTEMPTS ||
@@ -361,7 +359,7 @@
           : "page hook did not open the caption channels",
       );
     }
-    if (source === "dom") clickCaptionsOnIfOff(nowMs);
+    clickCaptionsOnIfOff(nowMs);
 
     const isRosterLate = nowMs - call.page_started_ms >= ROSTER_WAIT_MS;
     if (!isRosterFromChannel && isRosterLate && nowMs - lastDomRosterMs >= DOM_ROSTER_EVERY_MS) {

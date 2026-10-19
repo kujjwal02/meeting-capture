@@ -87,7 +87,7 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `caption` | `at`, `device_id`, `utterance_id`, `version`, `speaker`, `text`, `source` (`channel` or `dom`) |
 | `chat` | `at`, `message_id`, `device_id` (channel only), `sender`, `text`, `source` |
 | `roster` | `at`, `participants`: list of `{device_id, name, is_self}`, the whole list each time it changes |
-| `health` | `at`, `source` (`channel`, `dom` or `none`), `captions_on`, `parse_failures`, `detail` |
+| `health` | `at`, `source` (`channel`, `dom` or `none`), `captions_on` (Meet's captions button is on), `parse_failures`, `detail` |
 | `call_ended` | `at`, `reason` (`left`, `tab_closed`, `kicked`, `page_unload`; the app writes `idle` and `app_restarted`) |
 
 - `caption`: `utterance_id` is a string and `version` an integer. `at` is when the utterance first
@@ -143,11 +143,12 @@ could not write gets no `ack`.
 ## Extension internals
 
 - Caption source. The hook opens `captions` and `captions_v2` on the peer connection that carries
-  `collections`, so captions flow without the captions button. When no caption arrives within 20 s
-  of that, or 10 caption frames in a row fail to decode with no good caption in the last 20 s, the
-  content script reads the caption region in the DOM. It clicks the captions button if captions are
-  off, at most 3 times. The first channel caption after that switches back to the channel and
-  stops the DOM reader.
+  `collections`. Meet sends nothing on them until its captions are on, so the content script
+  clicks the captions button when the call starts if captions are off, at most 3 times per caption
+  source. When no caption arrives within 20 s of opening the channels, or 10 caption frames in a
+  row fail to decode with no good caption in the last 20 s, the content script reads the caption
+  region in the DOM. The first channel caption after that switches back to the channel and stops
+  the DOM reader.
 - Roster. From `collections` and the `SyncMeetingSpaceCollections` response. When neither gives a
   roster 30 s into the call, the content script reads the People panel if it is open, else the
   video tiles, every 10 s.
