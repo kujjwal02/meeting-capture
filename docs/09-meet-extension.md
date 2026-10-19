@@ -194,6 +194,18 @@ could not write gets no `ack`.
 After a pull, click the reload icon on mc-meet in `chrome://extensions`. The tray warns when the
 extension's protocol is older than the app's.
 
+### Dev runs on macOS
+
+- Run a dev app from outside `~/Documents`. Privacy controls stop Chrome from starting a host
+  there, and Chrome reports only "Native host has exited".
+- Chrome reads host manifests from its default config folder, even when started with a custom
+  `--user-data-dir`. A dev app overwrites the installed app's manifest there.
+- An extension loaded through CDP `Extensions.loadUnpacked` is gone after a browser restart. Its
+  storage stays.
+- Meet sends no captions while you are alone in the call. A live test needs a second account.
+- The tray shows mc-meet as connected only while the worker has work, since the port closes
+  after the last ack.
+
 ## Sources
 
 - DOM readers: TranscripTonic, MIT, <https://github.com/vivek-nexus/transcriptonic>, commit
