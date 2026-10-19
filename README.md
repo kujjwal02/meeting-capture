@@ -64,8 +64,9 @@ curl -fsSL https://raw.githubusercontent.com/kujjwal02/meeting-capture/main/scri
 The app is self-signed and not notarized. Both commands install it without the "Apple could not
 verify" prompt that a browser download gets.
 
-Then load the mc-meet extension: see [mc-meet](docs/09-meet-extension.md#install). The
-[install guide](docs/08-install.md) covers the DMG by hand, first-time setup, upgrades and removal.
+Then load the mc-meet extension from the release's `mc-meet_<version>.zip`: see
+[mc-meet](docs/09-meet-extension.md#install). The [install guide](docs/08-install.md) covers the
+DMG by hand, first-time setup, upgrades and removal.
 
 ## Configure
 
