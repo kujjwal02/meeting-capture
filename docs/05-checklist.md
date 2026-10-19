@@ -189,19 +189,21 @@ Done when:
   and 33 of 2026-10-19 merged.
 - [x] `attendees` lists only people who joined: the roster, else speakers and chat senders plus
   you. Calendar invitees go to `invited`, with their response kept in the stored match.
-- [ ] Host mode in the app binary relays native messaging frames to the app socket, and starts
+- [x] Host mode in the app binary relays native messaging frames to the app socket, and starts
   the app when it is not running.
-- [ ] The app writes the host manifest for each Chromium browser on every start.
-- [ ] Browser call events: one JSONL log per session, acked, ended on `call_ended` or 5 minutes
+- [x] The app writes the host manifest for each Chromium browser on every start.
+- [x] Browser call events: one JSONL log per session, acked, ended on `call_ended` or 5 minutes
   without a port, closed after a crash. `InputKind::BrowserCallLog` and its parser.
-- [ ] mc-meet extension: data channel decoder, DOM fallback, session per tab, acked resend, no
+- [x] mc-meet extension: data channel decoder, DOM fallback, session per tab, acked resend, no
   telemetry.
-- [ ] Tray line: extension connected, current call, caption source, last health problem.
-- [ ] TranscripTonic uninstalled; caption receiver and its docs removed.
+- [x] Tray line: extension connected, current call, caption source, last health problem.
+- [x] A rejoin of the same meeting within 10 minutes goes into the same log and note.
+- [x] Captions turn on when the call starts, so the first words are kept.
+- [x] TranscripTonic uninstalled; caption receiver and its docs removed.
 
 Done when:
 
-- [ ] 3 Meet calls, one with a second Meet tab, one browser restart and one app quit mid-call,
+- [x] 3 Meet calls, one with a second Meet tab, one browser restart and one app quit mid-call,
   each give one note whose attendees joined the call.
 
 ## Phase 2: call detection

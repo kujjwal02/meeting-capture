@@ -8,8 +8,8 @@ crates.io on 2026-10-17.
 | Job | Pick | Version | Why | Ruled out |
 |---|---|---|---|---|
 | App shell | tauri + plugins autostart, single-instance, notification, opener | 2.12 | Stable line, tray and plugins maintained by the Tauri team, 14.6M downloads in 90 days | egui/iced: no autostart, single-instance or notification plugins. Tauri 3: alpha |
-| Async runtime | tokio | 1.53 | Tauri, axum and reqwest all run on it | None viable for this stack |
-| Webhook server | axum + tower-http | 0.8 / 0.7 | Runs on Tauri's tokio runtime; tower-http adds body limits and request tracing | actix-web: its own runtime, a second executor in the process |
+| Async runtime | tokio | 1.53 | Tauri and reqwest both run on it | None viable for this stack |
+| Chrome native messaging | Own `native-host` crate on tokio |  | Adapted from Anarlog's `crates/chrome-native-host` (MIT): stdio framing, a Unix socket or named pipe to the running app, host manifests per browser | A localhost HTTP server: any web page can post to it, and Chrome cannot start the app when it is not running |
 | HTTP client | reqwest | 0.12 | Default Rust HTTP client, 220M downloads in 90 days. 0.12 matches oauth2 5.0 | - |
 | LLM API | rig-core + rig-agent, prompt_typed only | 0.44 | One code path for the two API provider kinds chosen in settings: anthropic (Haiku 5.5 by default) and openai-compatible (base URL + model: OpenAI, OpenRouter, Groq, z.ai GLM, Ollama, LM Studio). For OpenAI-style endpoints rig sends response_format json_schema with strict true (providers/openai/wire/chat.rs:359); for Anthropic it sends output_config. Breaking 0.x releases are accepted: we update our code on each upgrade | rig Extractor: forces tool_choice any, which current Claude models reject. genai: no typed helper or agent layer. llm, swiftide, aisdk: drop the schema on the Anthropic path. async-openai: OpenAI only |
 | Claude plan as provider | Claude Code CLI, `claude -p` with stream-json |  | Uses the signed-in Claude plan, no API key. `--json-schema` returns structured output; `--tools ""` and `--safe-mode` keep it a pure function | Claude Agent SDK: TypeScript and Python only |
@@ -26,7 +26,6 @@ crates.io on 2026-10-17.
 | Note rendering | minijinja + serde-saphyr | 3.0 / 2.0 | Runtime template, so the note shape changes without a rebuild. serde-saphyr writes the YAML frontmatter | askama: compiled-in templates. serde_yaml: deprecated. serde_yml: RUSTSEC-2025-0068, unsound |
 | Atomic write | tempfile | 3.27 | NamedTempFile::persist renames into place on the same volume | atomic-write-file: writes the temp file inside the vault folder, where Syncthing sees it |
 | File names | slug | 0.1 | Lowercase ASCII slugs; deunicode transliterates non-Latin event titles. 7.8M downloads in 90 days, last release 2024-08, a finished 100-line crate | sanitize-filename: keeps case and spaces. Own slugifier: would drop Hindi titles to nothing |
-| Downloads watcher (fallback) | notify + notify-debouncer-full | 8.2 / 0.7 | Only if the webhook test fails | - |
 | CLI | clap (derive) | 4.6 | Standard | - |
 | Slack huddle captions (Mac) | objc2-application-services, objc2-app-kit, objc2-foundation | 0.3 | Typed bindings to the macOS accessibility API and `NSRunningApplication`, from the objc2 family Tauri already pulls in. Zlib, Apache-2.0 or MIT | accessibility-sys and core-foundation 0.10: older hand-written bindings, a second CF type family next to objc2's. A Swift helper process: a second build toolchain and an IPC channel |
 | Errors | thiserror in libraries, anyhow in binaries | 2.0 / 1.0 | Typed errors at crate edges, context in the app | color-eyre: last release 2025-05 |
@@ -37,7 +36,8 @@ crates.io on 2026-10-17.
 
 - The job state table and its step runner: about 150 lines. Every library option is a generic
   queue, and the tray needs one row per meeting.
-- TranscripTonic payload to transcript mapping.
+- Browser call log and TranscripTonic payload to transcript mapping.
+- mc-meet's decoder for Meet's data channel frames. Google publishes no schema.
 - The calendar match rule: same Meet code, then largest overlap, then Meet link, then the
   account listed first.
 - The note template and the extraction prompt.

@@ -52,17 +52,3 @@ Meet also flags bots as risky and defaults the admit prompt to Deny. The bot wro
 | Or Claude Haiku 5.5 extraction through the API | About $0.15 to $0.90 |
 | Google Calendar API | $0 |
 | Storage on personal Google Drive | $0 |
-
-## Background research
-
-The research behind these choices lives in the vault, at
-`~/knowledge/areas/infrastructure/meeting-recording/local-capture/`:
-
-- `01-recommendation.md`: tool picks and why
-- `02-capture-tools.md`: about 16 capture tools compared
-- `04-stt-and-llm-costs.md`: speech-to-text speeds and prices
-- `05-cheap-open-llms.md`: LLM options for extraction
-- `06-ai-extraction.md`: what extraction writes, note shape
-- `07-cross-platform-adapters.md`: adapter design, common transcript format
-- `09-video-audio-recording.md`: OBS, storage, retention
-- `10-desktop-app-plan.md`: the detailed build plan this repo follows

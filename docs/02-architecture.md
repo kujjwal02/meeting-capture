@@ -12,7 +12,7 @@ through, then each stage on its own.
 ```mermaid
 flowchart LR
     CALL["Call apps<br/>Meet, Teams, Zoom, Slack"]
-    TT["TranscripTonic<br/>in Chrome"]
+    EXTN["mc-meet<br/>in Chrome"]
     APP["meeting-capture<br/>tray app"]
     EXT["Google Calendar, LLM API,<br/>Soniox"]
     CC["Claude Code CLI<br/>local process"]
@@ -20,7 +20,7 @@ flowchart LR
     MEDIA[("Media folder<br/>synced to Drive")]
 
     CALL -->|mic and system audio| APP
-    TT -->|captions webhook| APP
+    EXTN -->|native messaging| APP
     APP <-->|HTTPS| EXT
     APP <-->|stdin, stdout| CC
     APP -->|notes| VAULT
@@ -78,32 +78,31 @@ rerun over an edited note replaces only the sections between the app's `%% mc:be
 `%% mc:end %%` markers. When the user edited inside a section or broke a marker, the job fails and
 names the note, and the tray offers "Overwrite my edits".
 
-Captions from TranscripTonic are already a transcript, so their job passes `Transcribed` without
-running STT.
+Captions from mc-meet and Slack huddles are already a transcript, so their job passes
+`Transcribed` without running STT.
 
 ## 1. Capture
 
 Two inputs, either or both per call.
 
-### Captions (phase 1)
+### Meet captions (phase 1b)
 
 ```mermaid
 flowchart LR
-    TT["TranscripTonic"] -->|POST 127.0.0.1:47615| RCV["caption-receiver"]
-    RCV -->|raw payload| DISK[("payload file")]
-    RCV -->|transcript, via channel| APP["app"]
-    APP -->|new job: Captured| JOBS[("jobs")]
+    EXTN["mc-meet in Chrome"] -->|native messaging| HOST["app binary<br/>in host mode"]
+    HOST -->|Unix socket or named pipe| APP["app"]
+    APP -->|one JSON line per event| LOG[("browser call log")]
+    APP -->|new job at call end| JOBS[("jobs")]
 ```
 
-- `caption-receiver` saves the raw payload before parsing, so a parser bug never loses a meeting.
-  The payload is synced to disk under a unique name before the reply, because TranscripTonic never
-  re-posts a meeting it saw succeed.
-- Any web page in the browser can POST to 127.0.0.1. The receiver rejects a request whose `Origin`
-  is not TranscripTonic's extension, whose `Host` is not the receiver, or whose body is not
-  `application/json`. Local tools such as curl send no `Origin` and pass.
-- It parses the payload into a `sources` transcript and hands it to the app. It does not touch the
-  job store. It replies 200 only after the app has recorded the meeting; otherwise TranscripTonic
-  gets an error and offers a retry.
+- The extension reads captions, chat and the participant list from Meet's data channels, with a
+  DOM fallback. It queues each event until the app acks it.
+- Chrome starts the app binary in host mode, which relays frames to the running app and starts
+  it when it is not running.
+- The app appends each event to the call's log before the ack, so the log is complete before
+  anything parses it. At call end it parses the log and records the meeting. A rejoin of the same
+  meeting within 10 minutes goes into the same log.
+- [mc-meet](09-meet-extension.md) has the protocol, the session rules and the install steps.
 
 ### Slack huddle captions (phase 1)
 
@@ -186,14 +185,13 @@ Each arrow is a Cargo dependency. Phase 1 crates:
 
 ```mermaid
 flowchart TB
-    APP["meeting-capture"] --> RCV["caption-receiver"]
+    APP["meeting-capture"] --> NH["native-host"]
     APP --> PIPE["pipeline"]
     APP --> JOBS["jobs"]
     CLI["cli (mc)"] --> PIPE
     CLI --> JOBS
     PIPE --> SRC["sources"]
     PIPE --> JOBS
-    RCV --> SRC
     APP --> HC["huddle-captions"]
     HC --> SRC
 ```
@@ -208,7 +206,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 
 | Component | Phase | Job | Built on |
 |---|---|---|---|
-| caption-receiver | 1 | Accept TranscripTonic's webhook; fallback watches Downloads for its `.txt` | `axum` |
+| native-host | 1b | Host mode for Chrome native messaging, the app socket, frame codecs, host manifest registration | `tokio`; adapted from Anarlog `crates/chrome-native-host` |
 | huddle-captions | 1 | Read Slack huddle captions from the Slack desktop app, write the huddle log, report health | Mac: accessibility API via `objc2-application-services` |
 | sources | 1 | Turn each input into the common transcript format | Captions, own stems, dropped audio files |
 | pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `minijinja`, `toml`, `directories` |
@@ -248,7 +246,7 @@ meeting_url: https://meet.google.com/abc-defg-hij
 title: Weekly sync            # what the call app showed; null if none
 speaker_naming: real | me-vs-them | diarized
 my_speaker: You               # the label the local user's lines carry; null if unknown
-attendees:                    # people the call app showed; empty for TranscripTonic
+attendees:                    # people who joined; empty for TranscripTonic
   - {name: "Ujjwal Kumar", is_self: true, platform_id: U0123ABCDEF}
 segments:
   - {start_s: 0.0, end_s: 4.2, speaker: "Ujjwal", text: "..."}
@@ -257,10 +255,9 @@ chat_messages:
 ```
 
 - `start_s` and `end_s` are seconds from `started_at`.
-- TranscripTonic records only when a caption block starts. A block ends where the next one starts,
-  and the last one ends at `ended_at`.
-- TranscripTonic posts to `http://127.0.0.1:47615/transcriptonic`. A simple body is rejected with
-  HTTP 422; only the advanced body carries ISO times and per-speaker blocks.
+- mc-meet captions start when an utterance first appears and end at its last update.
+- TranscripTonic payloads, from earlier versions, record only when a caption block starts. A block
+  ends where the next one starts, and the last one ends at `ended_at`.
 
 ## Platform notes
 

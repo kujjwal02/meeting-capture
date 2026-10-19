@@ -22,18 +22,17 @@ on, so no bot joins and nobody has to admit one.
 
 ## How it works
 
-1. During a Google Meet call, the [TranscripTonic](https://github.com/vivek-nexus/transcriptonic)
-   Chrome extension records the captions with real speaker names. When the call ends, it posts them
-   to the app on `127.0.0.1`.
+1. During a Google Meet call, the mc-meet Chrome extension in `extension/` sends the captions, chat
+   and the people who joined to the app as they happen, through Chrome native messaging.
 2. During a Slack huddle, the app reads Slack's live captions through the macOS Accessibility API.
-3. The app matches the call to a Google Calendar event, for the title and attendees.
+3. The app matches the call to a Google Calendar event, for the title and the invite list.
 4. An LLM extracts the summary, decisions, action items, open questions and your commitments. Each
    item links to the transcript line it came from.
 5. The app writes `<vault>/areas/meetings/YYYY/MM/YYYY-MM-DD-HHMM-<title-slug>.md`. If you edit
    the note, a later rerun keeps your edits.
 
-The tray menu shows whether the receiver is listening and the last 5 meetings with their state. You
-can open a note or retry a failed meeting from there.
+The tray menu shows the current call, whether mc-meet is connected, and the last 5 meetings with
+their state. You can open a note or retry a failed meeting from there.
 
 ## Privacy
 
@@ -49,8 +48,7 @@ The app sends no telemetry. Logs are written locally to `logs/app.log` in the ap
 
 ## Install
 
-Requirements: a Mac with Apple silicon, Google Chrome with TranscripTonic for Meet calls, and Slack
-for huddles.
+Requirements: a Mac with Apple silicon, Google Chrome for Meet calls, and Slack for huddles.
 
 ```sh
 brew trust --tap kujjwal02/tap
@@ -66,8 +64,8 @@ curl -fsSL https://raw.githubusercontent.com/kujjwal02/meeting-capture/main/scri
 The app is self-signed and not notarized. Both commands install it without the "Apple could not
 verify" prompt that a browser download gets.
 
-The [install guide](docs/08-install.md) covers the DMG by hand, first-time setup, upgrades and
-removal.
+Then load the mc-meet extension: see [mc-meet](docs/09-meet-extension.md#install). The
+[install guide](docs/08-install.md) covers the DMG by hand, first-time setup, upgrades and removal.
 
 ## Configure
 
@@ -79,8 +77,7 @@ Open Settings from the tray menu. It writes `settings.toml` in
 | Google accounts | none | Calendar match. Needs your own OAuth client: see [Google setup](docs/06-google-setup.md). |
 | LLM provider | none | `claude-code` (your signed-in Claude plan), `anthropic`, or any `openai-compatible` endpoint with JSON-schema output. See [LLM extraction](docs/07-llm-extraction.md). |
 | `vault_dir` | `~/knowledge` | Where notes are written. |
-| `my_name` | none | Replaces TranscripTonic's "You" in transcripts. |
-| `receiver_port` | `47615` | Port TranscripTonic posts to: `http://127.0.0.1:47615/transcriptonic`. |
+| `my_name` | none | Replaces "You" in transcripts saved from TranscripTonic, which earlier versions used. |
 | `time_zone` | device zone | IANA name such as `Asia/Kolkata`, used in note names, dates and times. |
 
 To replace the built-in note template, add `note.md.j2` to the same folder. Quit and reopen the app
@@ -94,7 +91,7 @@ after a change.
 | Command | Does |
 | --- | --- |
 | `mc list` | Shows recent meetings and their state. |
-| `mc ingest <payload.json>` | Adds a saved TranscripTonic body. |
+| `mc ingest <file>` | Adds a saved input: a browser call log, a Slack huddle log or a TranscripTonic body (`--kind`). |
 | `mc retry <id>` | Resumes a failed meeting. |
 | `mc reprocess <id>` | Reruns every step. It keeps a note you edited; `--discard-edits` overwrites it. |
 
@@ -125,8 +122,8 @@ release within 6 hours.
 
 To keep a dev run away from your real job store, set `MEETING_CAPTURE_HOME` to a scratch folder. The
 app then reads `config/settings.toml` and writes `data/` inside it. It also runs next to the
-installed app: the single-instance check is off, so give it its own `receiver_port`. A Unix socket
-path holds at most 104 bytes, so keep the folder path short, or relative to the working folder.
+installed app, since the single-instance check is off. A Unix socket path holds at most 104 bytes,
+so keep the folder path short, or relative to the working folder.
 
 ## Documentation
 
@@ -138,6 +135,7 @@ path holds at most 104 bytes, so keep the folder path short, or relative to the 
 - [Google setup](docs/06-google-setup.md): the OAuth client for calendar sign-in
 - [LLM extraction](docs/07-llm-extraction.md): prompt, quote check, providers, retries, note sections
 - [Install](docs/08-install.md): install, upgrade, uninstall
+- [mc-meet](docs/09-meet-extension.md): the Meet extension and its link to the app
 
 ## Contributing
 
@@ -147,7 +145,7 @@ Large features may not fit the [roadmap](docs/03-roadmap.md), so open an issue f
 
 ## Acknowledgements
 
-[TranscripTonic](https://github.com/vivek-nexus/transcriptonic) records the Google Meet captions.
+mc-meet's DOM caption reader is adapted from [TranscripTonic](https://github.com/vivek-nexus/transcriptonic).
 The app is built with [Tauri](https://tauri.app) and [rig](https://github.com/0xPlaygrounds/rig).
 
 ## License
