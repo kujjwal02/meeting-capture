@@ -14,7 +14,7 @@ flowchart LR
     CALL["Call apps<br/>Meet, Teams, Zoom, Slack"]
     TT["TranscripTonic<br/>in Chrome"]
     APP["meeting-capture<br/>tray app"]
-    EXT["Google Calendar, LLM API,<br/>Soniox, Meet REST API"]
+    EXT["Google Calendar, LLM API,<br/>Soniox"]
     CC["Claude Code CLI<br/>local process"]
     VAULT[("~/knowledge<br/>meeting notes")]
     MEDIA[("Media folder<br/>synced to Drive")]
@@ -146,7 +146,6 @@ flowchart LR
 flowchart LR
     CAP["captions"] --> SRC["sources"]
     STEMS["WAV stems"] --> STT["stt"] --> SRC
-    API["Meet REST API"] --> SRC
     FILE["dropped audio file"] --> STT
     SRC --> T["common transcript"]
 ```
@@ -211,7 +210,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 |---|---|---|---|
 | caption-receiver | 1 | Accept TranscripTonic's webhook; fallback watches Downloads for its `.txt` | `axum` |
 | huddle-captions | 1 | Read Slack huddle captions from the Slack desktop app, write the huddle log, report health | Mac: accessibility API via `objc2-application-services` |
-| sources | 1 | Turn each input into the common transcript format | Captions, own stems, Meet REST API, dropped audio files |
+| sources | 1 | Turn each input into the common transcript format | Captions, own stems, dropped audio files |
 | pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `minijinja`, `toml`, `directories` |
 | jobs | 1 | One row per meeting with a closed state enum and the extraction retry schedule. Runs a meeting's steps under its lease: one run per meeting across processes, renewed from a second thread, given back however the run ends | `rusqlite`, `tracing` |
 | cli | 1 | `mc`: rerun any job step or ingest a file, without Tauri | `clap` |

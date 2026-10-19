@@ -6,15 +6,21 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 |---|---|---|---|---|
 | 0 | Skeleton | Workspace with crate stubs and a tray-icon Tauri app, pinned toolchain, rustfmt, clippy workspace lints, cargo-deny, cargo-shear, taplo, typos, biome, rumdl, lefthook hooks, `just check` | `just check` passes on the Mac and the PC; a misformatted file blocks a commit; a GPL crate fails `cargo deny check` | 2 |
 | 1 | Tray app and captions pipeline | Tauri tray app with autostart and no Dock icon, caption receiver, Slack huddle captions on the Mac, job store, Google sign-in for work and personal calendars, calendar match, LLM extraction, vault writer, `mc` CLI | 5 real Meet calls and 3 Slack huddles write correct notes with no manual step; the tray lists them; a calendar sign-in still works after 8 days | 6 |
-| 2 | Call detection | Start and end events, tray state | Meet, Teams, Zoom and a Slack huddle each log start and end within 5 s, on both OSes | 2 |
+| 1b | mc-meet extension | Our own Meet extension: captions, chat and roster from Meet's data channels with a DOM fallback, native messaging to the app, one event log per call, attendees who joined. Replaces TranscripTonic and the webhook receiver. [Spec](09-meet-extension.md) | 3 Meet calls, one with a second Meet tab, one browser restart and one app quit mid-call, each give one note whose attendees joined the call | 8 |
+| 2 | Call detection | Start and end events, tray state. The extension's `call_started` and `call_ended` cover Meet in the browser | Meet, Teams, Zoom and a Slack huddle each log start and end within 5 s, on both OSes | 2 |
 | 3 | Mac capture | Tap and mic stems, recovery of orphan WAVs at launch | 3 calls, one with AirPods connected mid-call, no gap over 1 s, app under 5% CPU | 5 |
 | 4 | Local STT | Parakeet, VAD, remote diarization, caption-name merge | A 1 h call transcribes in under 10 min on the M2; names match captions on 3 Meet calls | 4 |
 | 5 | Windows capture | WASAPI loopback, mic, Windows mic detection | Phase 3 checks pass on the PC | 4 |
-| 6 | Extra sources | Soniox routing, Meet REST API, dropped audio files, calendar from a secret iCal address | A Hinglish call gets a Soniox transcript; the Meet API fills a missed call; an iCal address matches a call with no Google sign-in | 3 |
+| 6 | Extra sources | Soniox routing, dropped audio files, calendar from a secret iCal address | A Hinglish call gets a Soniox transcript; an iCal address matches a call with no Google sign-in | 3 |
 | 7 | Recording | OBS start and stop, audio archive, Drive folder | Video and audio for 3 calls land in the Drive folder, none in the vault | 2 |
 | 8 | Hardening | Tests, model download with checksum, commitment review | Two weeks without a lost meeting | 4 |
 
-Phase 1 is useful on its own: with TranscripTonic it covers most Meet calls.
+Phase 1 is useful on its own: with TranscripTonic it covers most Meet calls. Phase 1b replaces
+TranscripTonic, which split a call into two notes when a second Meet tab opened and listed
+invitees as attendees.
+
+The Meet REST API is out. On Business Starter it gives no transcripts or recordings, and the
+extension already sees every call the user joins.
 
 Progress is tracked in the [checklist](05-checklist.md).
 
