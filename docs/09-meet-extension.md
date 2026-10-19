@@ -77,7 +77,7 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `type` | Fields | When |
 | --- | --- | --- |
 | `hello` | `protocol` (integer, now 1), `extension_version` | First message on each port. |
-| `event` | `seq`, `session_id`, `event` | Each call event. `seq` grows by one per event for the whole install and survives a worker restart. |
+| `event` | `seq`, `session_id`, `event` | Each call event. `seq` grows by one per event for the whole install and survives a worker restart. A new install starts it at the install time in microseconds, so a reinstall mid-call never repeats a `seq` in the session it resumes. |
 
 `event.kind` is one of:
 
@@ -135,7 +135,9 @@ could not write gets no `ack`.
 - When the page unloads (reload, navigation, crash), the worker waits 5 minutes. If the same tab
   resumes the session, the call goes on. Otherwise the worker ends it `page_unload`, with `at` set
   to the unload time. A new session in that tab ends the old one at once.
-- After a browser restart, open sessions get the same 5-minute wait.
+- When the worker starts and a session's tab no longer exists, the session gets the same 5-minute
+  wait. This covers a browser restart or crash, and a session left open while the extension was
+  off.
 - The worker sets the tab to `autoDiscardable: false` while the call runs.
 
 ## Extension internals
