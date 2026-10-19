@@ -61,9 +61,9 @@ store.
    Settings, Privacy & Security, Accessibility.
 2. Load a Google OAuth client and sign in. Follow [Google setup](06-google-setup.md).
 3. Pick the LLM provider in Settings. See [LLM extraction](07-llm-extraction.md).
-4. Install the TranscripTonic Chrome extension. Set its webhook to
-   `http://127.0.0.1:47615/transcriptonic` and choose the "advanced" body.
-5. Take a Meet call. The note appears in `~/knowledge` after the call ends.
+4. Load the mc-meet extension. Follow [mc-meet](09-meet-extension.md#install).
+5. Take a Meet call. The note appears in the vault after the call ends, when the call had at least
+   3 caption lines.
 
 ## Upgrade
 
@@ -88,6 +88,10 @@ on again does nothing. Remove it, then allow the new prompt:
 tccutil reset Accessibility com.ujjwalkumar.meetingcapture
 ```
 
+From a version that took Meet captions from TranscripTonic, load mc-meet, then remove
+TranscripTonic from `chrome://extensions`. The app no longer listens on port 47615.
+Meetings TranscripTonic recorded keep their notes, and `mc reprocess` still reruns them.
+
 Settings, sign-ins and the job store stay in `~/Library/Application Support/
 com.ujjwalkumar.meetingcapture`. The Accessibility grant survives an upgrade while the signing
 identity stays the same.
@@ -109,8 +113,11 @@ and each Mac needs a manual install.
 ## Uninstall
 
 1. Turn off "Start at login" in the tray.
-2. Remove the app. With Homebrew, run `brew uninstall --cask meeting-capture`. Otherwise quit the
+2. Remove mc-meet from `chrome://extensions`, and delete `com.meetingcapture.app.json` from
+   `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/`. The app writes that file
+   for each Chromium browser it finds, so check the same folder of Brave, Edge and Chromium too.
+3. Remove the app. With Homebrew, run `brew uninstall --cask meeting-capture`. Otherwise quit the
    app and delete `/Applications/Meeting Capture.app`.
-3. To remove settings, sign-ins, the job store and logs, run
+4. To remove settings, sign-ins, the job store and logs, run
    `brew uninstall --zap --cask meeting-capture`, or delete
    `~/Library/Application Support/com.ujjwalkumar.meetingcapture`. Notes in the vault stay.

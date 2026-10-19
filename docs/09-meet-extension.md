@@ -2,7 +2,7 @@
 
 mc-meet is our Chrome extension for Google Meet. It reads captions, chat and the participant
 list in each call you join, and streams them to the tray app as they happen. The app writes one
-note per call. It replaces TranscripTonic and the webhook receiver.
+note per call.
 
 ## Parts
 
@@ -223,5 +223,4 @@ extension's protocol is older than the app's.
 - Host relay: Anarlog's `crates/chrome-native-host`, MIT, <https://github.com/fastrepl/anarlog>,
   commit `6fd155aa1af39ef652b767133caccb280de750f6`.
 - Data channel layout: our own decoder. Field numbers and their sources are in
-  `extension/PROTOCOL-NOTES.md`. Research notes in
-  `~/knowledge/areas/infrastructure/meeting-recording/local-capture/how-tools-work/`.
+  `extension/PROTOCOL-NOTES.md`.

@@ -9,7 +9,7 @@ Sources:
   `T:<line>`, a line in the file after Prettier.
 - Attendee, its `meet_payload.js` (Elastic License 2.0; read for facts only). Cited as
   `A:<line>`.
-- Fireflies notes in `~/knowledge/areas/infrastructure/meeting-recording/local-capture/how-tools-work/meet-extensions.md`.
+- Notes on how the Fireflies extension reads Meet. Cited as "Fireflies note".
 - Frames captured in a live two-account call on 2026-10-19. Cited as "live frame".
 
 ## Frames

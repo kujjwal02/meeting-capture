@@ -15,9 +15,9 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 | 7 | Recording | OBS start and stop, audio archive, Drive folder | Video and audio for 3 calls land in the Drive folder, none in the vault | 2 |
 | 8 | Hardening | Tests, model download with checksum, commitment review | Two weeks without a lost meeting | 4 |
 
-Phase 1 is useful on its own: with TranscripTonic it covers most Meet calls. Phase 1b replaces
-TranscripTonic, which split a call into two notes when a second Meet tab opened and listed
-invitees as attendees.
+Phase 1 took Meet captions from TranscripTonic's webhook. Phase 1b replaced it with mc-meet,
+because TranscripTonic split a call into two notes when a second Meet tab opened, and the calendar
+invite list stood in for the people who joined.
 
 The Meet REST API is out. On Business Starter it gives no transcripts or recordings, and the
 extension already sees every call the user joins.
@@ -42,10 +42,8 @@ Progress is tracked in the [checklist](05-checklist.md).
 - The app runs in the background, tray only (`ActivationPolicy::Accessory` on macOS), and starts
   at login once "Start at login" is on. Plugins: `autostart`, `single-instance`, `opener`, and
   `notification` from build step 5.
-- The axum receiver listens on `127.0.0.1:47615` inside the app and saves the raw TranscripTonic
-  payload before parsing. TranscripTonic sends the "advanced" webhook body.
-- TranscripTonic v3.4.3 reaches `http://127.0.0.1:47615/transcriptonic` from Chrome (live test on
-  2026-10-17), so phase 1 needs no Downloads watcher.
+- Meet captions came from TranscripTonic's "advanced" webhook body, saved raw before parsing.
+  Phase 1b removed the receiver. The parser stays, so stored payloads still reprocess.
 - TranscripTonic names the local user "You". The pipeline replaces it with the user's name from
   settings.
 - A Meet call with no calendar event arrives titled "Meet – abc-defg-hij". The parser turns the
@@ -81,8 +79,8 @@ Progress is tracked in the [checklist](05-checklist.md).
   listed first. Sign in with akaiketech.com first, so it wins ties.
 - All-day events, declined events, focus time, out of office and working location never match.
 - A network failure fails the run, which keeps the calendar title once retried.
-- If no account matches or a token is revoked, the note is still written with the TranscripTonic
-  title and no attendees, and the tray shows "sign in again".
+- If no account matches or a token is revoked, the note is still written with the title Meet
+  showed, and the tray shows "sign in again".
 
 ### Build order
 
@@ -97,8 +95,7 @@ Progress is tracked in the [checklist](05-checklist.md).
 ### Slack huddle captions
 
 - The `huddle-captions` crate reads the huddle window of the Slack desktop app on the Mac: caption
-  rows with speaker names, participant tiles and the caption language. Research and live tests:
-  `~/knowledge/areas/infrastructure/meeting-recording/local-capture/slack-huddles/`.
+  rows with speaker names, participant tiles and the caption language.
 - It needs the Accessibility permission. Slack's own preference "Automatically turn on captions
   when you're in a huddle" turns captions on; the app then presses the huddle's Captions tab. The
   app cannot turn captions on itself: that menu opens only on a real mouse hover.
