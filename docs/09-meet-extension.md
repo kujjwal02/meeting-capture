@@ -23,6 +23,7 @@ flowchart LR
 
 | Part | Where | Job |
 | --- | --- | --- |
+| Call events | `extension/call-events.js`, MAIN world, isolated world and service worker | Builds every event the extension sends, one function per `kind`, in the shapes below. |
 | Page hook | `extension/page-hook.js` and `extension/page/wire.js`, MAIN world, `document_start` | Wraps `RTCPeerConnection` and decodes Meet's `collections`, `captions`, `captions_v2` and `meet_messages` data channels. Opens the two caption channels itself. |
 | Content script | `extension/content/`, isolated world | Finds call start and end, reads the DOM when the channels give nothing, and owns the call session for its tab. |
 | Service worker | `extension/background.js` | Holds the native port, numbers and queues events, resends after a reconnect. |
@@ -79,7 +80,7 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `hello` | `protocol` (integer, now 1), `extension_version` | First message on each port. |
 | `event` | `seq`, `session_id`, `event` | Each call event. `seq` grows by one per event for the whole install and survives a worker restart. A new install starts it at the install time in microseconds, so a reinstall mid-call never repeats a `seq` in the session it resumes. |
 
-`event.kind` is one of:
+`event.kind` is one of the kinds below. `extension/call-events.js` builds each of them.
 
 | `kind` | Fields |
 | --- | --- |
@@ -94,8 +95,10 @@ unknown fields are ignored on both sides, so either side can be newer.
   appeared, so every version of one utterance has the same `at`. A `caption` with a higher
   `version` for the same `device_id` and `utterance_id` replaces the earlier text. The extension
   sends a new version only when the version grows or the text changes.
-- `speaker` is empty when the device had no name yet. The app then takes the name for
-  `device_id` from the roster. `sender` on `chat` follows the same rule.
+- `speaker` is empty when the device had no name yet. The parser then takes the name for
+  `device_id` from the attendee list, which holds the first name any `roster` in the log gave
+  that device. A roster that arrives late still names the earlier lines. `sender` on `chat`
+  follows the same rule. A `chat` with no `device_id` keeps an empty `sender`.
 - The DOM source has no device or utterance IDs. It uses the speaker name as `device_id`, and
   `dom-<page token>-<turn number>` as `utterance_id`. The page token keeps IDs unique after a
   reload.

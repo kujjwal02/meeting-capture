@@ -8,6 +8,7 @@ to the meeting-capture app over native messaging. The design is in `docs/09-meet
 | File | Runs in | Job |
 | --- | --- | --- |
 | `manifest.json` | | MV3 manifest. Its `key` pins the ID `pbpjeihgfeefjehjnjknnefomhkblcfk`. |
+| `call-events.js` | Both Meet tab worlds and the service worker | Builds each call event in its wire shape. |
 | `page/wire.js` | Meet page, MAIN world | Protobuf decoder and Meet frame reader. |
 | `page-hook.js` | Meet page, MAIN world | Wraps `RTCPeerConnection` and `fetch`, opens the caption channels. |
 | `content/selectors.js` | Meet tab, isolated world | Every DOM selector, in one table. |

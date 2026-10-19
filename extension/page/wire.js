@@ -1,8 +1,11 @@
-// Protobuf wire decoder and Meet frame reader. Runs in the Meet page (MAIN world) before
-// page-hook.js, and in Node for the fixture script. It touches no DOM and no network.
+// Protobuf wire decoder and Meet frame reader. Runs in the Meet page (MAIN world) after
+// call-events.js and before page-hook.js, and in Node for the fixture script, which loads
+// call-events.js first. It touches no DOM and no network.
 // Field numbers and their sources are in extension/PROTOCOL-NOTES.md.
 (() => {
   if (globalThis.mcMeetWire) return;
+
+  const callEvents = globalThis.mcMeetCallEvents;
 
   class WireError extends Error {}
 
@@ -406,7 +409,6 @@
     let lastRoster;
     let captionsV2Seen = false;
 
-    const iso = (ms) => new Date(ms).toISOString();
     const nameOf = (deviceId) => devices.get(deviceId)?.name ?? "";
 
     function parseFailures() {
@@ -444,17 +446,19 @@
     function emitRosterIfChanged() {
       const participants = [...devices.entries()]
         .filter(([, d]) => !d.parentDeviceId && d.name && !ABSENT_STATUSES.has(d.status))
-        .map(([deviceId, d]) => ({
-          device_id: deviceId,
-          name: d.name,
-          is_self: deviceId === selfDeviceId,
-        }))
+        .map(([deviceId, d]) =>
+          callEvents.rosterParticipant({
+            deviceId,
+            name: d.name,
+            isSelf: deviceId === selfDeviceId,
+          }),
+        )
         .sort((a, b) => (a.device_id < b.device_id ? -1 : a.device_id > b.device_id ? 1 : 0));
       if (participants.length === 0) return;
       const key = JSON.stringify(participants);
       if (key === lastRosterKey) return;
       lastRosterKey = key;
-      lastRoster = { kind: "roster", at: iso(now()), participants };
+      lastRoster = callEvents.roster({ atMs: now(), participants });
       emit(lastRoster);
     }
 
@@ -469,7 +473,7 @@
         if (p.isSelf) selfDeviceId = p.deviceId;
         if (p.deviceId === selfDeviceId && p.status === REMOVED_STATUS && !selfRemoved) {
           selfRemoved = true;
-          emit({ kind: "self_removed", at: iso(now()) });
+          emit({ kind: "self_removed", at: new Date(now()).toISOString() });
         }
       }
       emitRosterIfChanged();
@@ -481,15 +485,16 @@
         if (chatIds.has(chat.messageId)) continue;
         chatIds.add(chat.messageId);
         if (chatIds.size > MAX_CHATS) chatIds.delete(chatIds.values().next().value);
-        emit({
-          kind: "chat",
-          at: iso(chatTime(chat.sentMs, arrivedMs)),
-          message_id: chat.messageId,
-          device_id: chat.deviceId,
-          sender: nameOf(chat.deviceId),
-          text: chat.text,
-          source: "channel",
-        });
+        emit(
+          callEvents.chat({
+            atMs: chatTime(chat.sentMs, arrivedMs),
+            messageId: chat.messageId,
+            deviceId: chat.deviceId,
+            sender: nameOf(chat.deviceId),
+            text: chat.text,
+            source: "channel",
+          }),
+        );
       }
     }
 
@@ -512,16 +517,17 @@
       const firstAtMs = known?.firstAtMs ?? now();
       utterances.set(key, { version, text: caption.text, firstAtMs });
       if (utterances.size > MAX_UTTERANCES) utterances.delete(utterances.keys().next().value);
-      emit({
-        kind: "caption",
-        at: iso(firstAtMs),
-        device_id: caption.deviceId,
-        utterance_id: utteranceId,
-        version,
-        speaker: nameOf(caption.deviceId),
-        text: caption.text,
-        source: "channel",
-      });
+      emit(
+        callEvents.caption({
+          atMs: firstAtMs,
+          deviceId: caption.deviceId,
+          utteranceId,
+          version,
+          speaker: nameOf(caption.deviceId),
+          text: caption.text,
+          source: "channel",
+        }),
+      );
     }
 
     // Decodes one data channel frame. Returns { ack } for a captions_v2 caption, so the
