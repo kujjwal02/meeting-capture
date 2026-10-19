@@ -77,10 +77,11 @@ impl CallLog {
         seq: Option<u64>,
         event: &serde_json::Value,
         is_last: bool,
+        received_at: Timestamp,
     ) -> std::io::Result<()> {
         let mut text = serde_json::to_string(&LoggedLine {
             seq,
-            received_at: Timestamp::now(),
+            received_at,
             event,
         })
         .map_err(std::io::Error::other)?;
@@ -102,9 +103,14 @@ impl CallLog {
     }
 
     /// Appends the app's own `call_ended` line, at the time of the last event.
-    pub(super) fn end(&mut self, at: Timestamp, reason: EndReason) -> std::io::Result<()> {
+    pub(super) fn end(
+        &mut self,
+        at: Timestamp,
+        reason: EndReason,
+        received_at: Timestamp,
+    ) -> std::io::Result<()> {
         let ended = serde_json::json!({ "kind": "call_ended", "at": at, "reason": reason });
-        self.append(None, &ended, true)
+        self.append(None, &ended, true, received_at)
     }
 }
 

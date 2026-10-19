@@ -146,12 +146,14 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             (None, Some(error.to_string()))
         }
     };
+    let browser_calls =
+        browser_calls::BrowserCalls::new(settings_store.app_dirs().browser_call_log_dir());
     app.manage(AppState {
         pipeline: pipeline.clone(),
         pipeline_error,
         settings: settings_store,
         huddle_status: Mutex::new(huddles::HuddleStatus::Idle),
-        browser_calls: browser_calls::BrowserCalls::default(),
+        browser_calls,
         updates: updates::Updates::default(),
     });
     tray::create(app.handle())?;

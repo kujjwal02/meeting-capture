@@ -221,5 +221,5 @@ fn finish_log(log_path: &Path) -> std::io::Result<()> {
     }
     let last_at = summary.last_at.unwrap_or(last.received_at);
     let (mut log, _) = CallLog::reopen(log_path)?;
-    log.end(last_at, EndReason::AppRestarted)
+    log.end(last_at, EndReason::AppRestarted, Timestamp::now())
 }
