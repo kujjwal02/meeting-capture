@@ -14,7 +14,8 @@ to the meeting-capture app over native messaging. The design is in `docs/09-meet
 | `content/selectors.js` | Meet tab, isolated world | Every DOM selector, in one table. |
 | `content/dom-readers.js` | Meet tab, isolated world | DOM caption and participant fallbacks. Adapted from TranscripTonic. |
 | `content/main.js` | Meet tab, isolated world | Call start and end, session, caption source, health. |
-| `background.js` | Service worker | Native port, event numbers, queue, resend. |
+| `session-rules.js` | Service worker, or plain Node | Session rules and event numbers, with no `chrome.*` calls. |
+| `background.js` | Service worker | Storage, native port, queue, resend. Runs the effects `session-rules.js` returns. |
 | `PROTOCOL-NOTES.md` | | Field numbers the decoder relies on, with sources. |
 
 ## Load it unpacked
