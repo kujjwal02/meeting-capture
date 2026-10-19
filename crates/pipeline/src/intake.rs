@@ -50,6 +50,22 @@ pub enum IntakeError {
     Store(#[from] StoreError),
 }
 
+/// Why two meetings could not be merged.
+#[derive(Debug, thiserror::Error)]
+pub enum MergeError {
+    #[error("meeting {id} is a {kind}; only TranscripTonic meetings can be merged")]
+    NotMergeable { id: MeetingId, kind: &'static str },
+    #[error(transparent)]
+    Input(#[from] InputError),
+    #[error("could not save the merged payload in {folder}: {source}")]
+    Save {
+        folder: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+}
+
 impl Pipeline {
     /// Parses an input file as `kind`, copies it into the app folder for its kind when it is not
     /// there yet, and records the meeting, however short a huddle is. A payload from outside the
@@ -92,6 +108,51 @@ impl Pipeline {
         }
         let id = self.record(kind, log_path, &input, &transcript)?;
         Ok(Intake::Recorded(id))
+    }
+
+    /// Joins two meetings TranscripTonic filed for one call into `kept`, which keeps its note
+    /// path. The merged payload is saved as a new payload, `dropped` leaves the store, and `kept`
+    /// runs again. Returns the note path `dropped` held; the caller removes that note.
+    ///
+    /// # Errors
+    ///
+    /// Returns `MergeError::NotMergeable` for a meeting from another source, and the other
+    /// `MergeError`s when a payload cannot be read, merged or saved.
+    pub fn merge(
+        &self,
+        kept: MeetingId,
+        dropped: MeetingId,
+    ) -> Result<Option<PathBuf>, MergeError> {
+        let mut payloads = Vec::with_capacity(2);
+        for id in [kept, dropped] {
+            let meeting = self.store.get(id)?;
+            match meeting.input_kind {
+                InputKind::TranscriptonicPayload => {}
+                InputKind::SlackHuddleLog => {
+                    return Err(MergeError::NotMergeable {
+                        id,
+                        kind: "Slack huddle",
+                    });
+                }
+            }
+            payloads.push(read_input(&meeting.input_path)?);
+        }
+        let merged = sources::transcriptonic::merge_payloads(&payloads[0], &payloads[1])
+            .map_err(InputError::from)?;
+        let transcript = parse(InputKind::TranscriptonicPayload, &merged)?;
+        let payload_dir = self.app_dirs.payload_dir();
+        let payload_path =
+            sources::transcriptonic::save_payload(&payload_dir, &merged).map_err(|source| {
+                MergeError::Save {
+                    folder: payload_dir.clone(),
+                    source,
+                }
+            })?;
+        let dropped_note = self
+            .store
+            .merge(kept, dropped, &payload_path, transcript.started_at)?;
+        tracing::info!(meeting.id = %kept, meeting.dropped_id = %dropped, "meetings merged");
+        Ok(dropped_note)
     }
 
     fn record(

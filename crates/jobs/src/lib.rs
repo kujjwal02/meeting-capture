@@ -441,6 +441,54 @@ impl JobStore {
         }
     }
 
+    /// Joins two records of one call: deletes `dropped`, then gives `kept` the merged input and
+    /// start time and sends it back to `Captured`, as `rewind` does. One transaction, so the
+    /// start time `dropped` held is free for `kept`. Returns the note path `dropped` held, which
+    /// the caller removes.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::NotFound` when either meeting is unknown.
+    pub fn merge(
+        &self,
+        kept: MeetingId,
+        dropped: MeetingId,
+        input_path: &Path,
+        started_at: Timestamp,
+    ) -> Result<Option<PathBuf>, StoreError> {
+        let mut connection = self.connection();
+        let transaction = connection.transaction()?;
+        let dropped_note: Option<String> = transaction
+            .query_row(
+                "DELETE FROM meetings WHERE id = ?1 RETURNING note_path",
+                [dropped.0],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound(dropped))?;
+        let updated = transaction.execute(
+            "UPDATE meetings SET input_path = ?2, started_at = ?3, finished_step = ?4,
+                input_revision = input_revision + 1,
+                failure = NULL, failure_kind = NULL, calendar_match_json = NULL,
+                extraction_json = NULL,
+                extraction_provider = NULL, extraction_attempts = 0, extraction_error = NULL,
+                next_extraction_at_ms = NULL, updated_at = ?5
+             WHERE id = ?1",
+            params![
+                kept.0,
+                input_path.to_string_lossy(),
+                started_at.to_string(),
+                Step::Captured.as_str(),
+                Timestamp::now().to_string()
+            ],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::NotFound(kept));
+        }
+        transaction.commit()?;
+        Ok(dropped_note.map(PathBuf::from))
+    }
+
     /// Schedules an extraction now for every written meeting that has none and no failure, such
     /// as notes written while no provider was set. Returns how many were scheduled.
     ///
