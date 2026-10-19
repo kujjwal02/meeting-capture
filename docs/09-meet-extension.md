@@ -23,7 +23,7 @@ flowchart LR
 
 | Part | Where | Job |
 | --- | --- | --- |
-| Call events | `extension/call-events.js`, MAIN world, isolated world and service worker | Builds every event the extension sends, one function per `kind`, in the shapes below. |
+| Call events | `extension/call-events.js`, isolated world and service worker | Builds every event the extension sends, one function per `kind`, in the shapes below. |
 | Page hook | `extension/page-hook.js` and `extension/page/wire.js`, MAIN world, `document_start` | Wraps `RTCPeerConnection` and decodes Meet's `collections`, `captions`, `captions_v2` and `meet_messages` data channels. Opens the two caption channels itself. |
 | Content script | `extension/content/`, isolated world | Finds call start and end, reads the DOM when the channels give nothing, and owns the call session for its tab. |
 | Session rules | `extension/session-rules.js`, service worker | Decides what each tab message, tab change and alarm does to the worker's sessions. Numbers events. Makes no `chrome.*` calls and reads no clock, so it also runs in Node. |

@@ -252,12 +252,30 @@
     send(callEvents.roster({ atMs: Date.now(), participants }));
   }
 
+  // The page hook reads frames in the MAIN world, which has no call-events.js.
+  function eventFromReading(reading) {
+    switch (reading?.kind) {
+      case "caption":
+        return callEvents.caption(reading);
+      case "chat":
+        return callEvents.chat(reading);
+      case "roster":
+        return callEvents.roster({
+          atMs: reading.atMs,
+          participants: reading.participants.map(callEvents.rosterParticipant),
+        });
+    }
+    // A reading from a newer page hook than this content script.
+    return undefined;
+  }
+
   function onPageMessage(message) {
     if (message?.t === "hook_state") {
       const channelsOpenedAtMs = message.caption_channels_opened_at;
       follow(captionSource.decide({ kind: "hook_state", channelsOpenedAtMs }));
-    } else if (message?.t === "event") {
-      onReaderEvent("channel", message.event);
+    } else if (message?.t === "reading") {
+      const event = eventFromReading(message.reading);
+      if (event) onReaderEvent("channel", event);
     } else if (message?.t === "notice") {
       onPageNotice(message.notice);
     } else if (message?.t === "caption_channel_failed") {
@@ -308,7 +326,8 @@
       leaveMissingSinceMs ??= nowMs;
       if (nowMs - leaveMissingSinceMs >= LEAVE_GRACE_MS) endCall(isSelfRemoved ? "kicked" : "left");
     }
-    if (!call) return;
+    // While the leave grace runs, the call controls are gone and would read as captions off.
+    if (!call || !isInCall) return;
     if (nowMs - call.last_seen_ms >= 5000) storeSession();
 
     const decision = captionSource.decide({ kind: "tick", atMs: nowMs });
