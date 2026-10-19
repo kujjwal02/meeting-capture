@@ -16,6 +16,13 @@ checks the call log and the note. It runs on macOS only.
 Set `MEET_E2E_HOST_PROFILE` or `MEET_E2E_GUEST_PROFILE` to use other profiles. Set
 `MEET_E2E_DIR` to move the work folder from `~/.cache/meeting-capture-e2e`.
 
+The run puts the dev binary in `Meeting Capture Dev.app` (bundle id
+`com.ujjwalkumar.meetingcapture.dev`), so macOS lists it apart from the installed app. It signs the
+bundle with the `Meeting Capture Dev` identity, so the Accessibility grant survives rebuilds. Create
+the identity once with
+`scripts/create-signing-cert.sh "Meeting Capture Dev" ~/.tauri/meeting-capture-dev-signing.p12`, or
+set `MEET_E2E_SIGNING_IDENTITY` to use another.
+
 ## What it does
 
 1. Copies the dev binary into the work folder and starts it with its own home and vault.

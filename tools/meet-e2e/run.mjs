@@ -24,6 +24,10 @@ const appBinary = process.argv[2] ?? join(repoDir, "target", "debug", "meeting-c
 const workDir = process.env.MEET_E2E_DIR ?? join(homedir(), ".cache", "meeting-capture-e2e");
 const hostProfile = process.env.MEET_E2E_HOST_PROFILE ?? "mcdev";
 const guestProfile = process.env.MEET_E2E_GUEST_PROFILE ?? "default";
+// Its own name and bundle id, so macOS lists the test build apart from the installed app.
+const devAppName = "Meeting Capture Dev";
+const devBundleId = "com.ujjwalkumar.meetingcapture.dev";
+const signingIdentity = process.env.MEET_E2E_SIGNING_IDENTITY ?? devAppName;
 const homeDir = join(workDir, "home");
 const vaultDir = join(workDir, "vault");
 const logDir = join(homeDir, "data", "browser-calls");
@@ -186,8 +190,22 @@ function startApp() {
   const settingsPath = join(homeDir, "config", "settings.toml");
   if (!existsSync(settingsPath))
     writeFileSync(settingsPath, `vault_dir = ${JSON.stringify(vaultDir)}\n`);
-  const binary = join(workDir, "meeting-capture");
+  const bundle = join(workDir, `${devAppName}.app`);
+  const binary = join(bundle, "Contents", "MacOS", "meeting-capture");
+  mkdirSync(dirname(binary), { recursive: true });
+  writeFileSync(join(bundle, "Contents", "Info.plist"), devInfoPlist());
   copyFileSync(appBinary, binary);
+  // The linker's ad-hoc signature changes with each build, so macOS asks for Accessibility again
+  // on every run. A stable identity keeps the grant across builds.
+  try {
+    execFileSync("codesign", ["--force", "--sign", signingIdentity, bundle], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+  } catch (error) {
+    step(
+      `could not sign the dev app with "${signingIdentity}", so macOS may ask for Accessibility: ${String(error.stderr).trim()}`,
+    );
+  }
   const wrapper = join(workDir, "host.sh");
   writeFileSync(
     wrapper,
@@ -200,6 +218,28 @@ function startApp() {
     detached: true,
   });
   return { app, binary, wrapper };
+}
+
+function devInfoPlist() {
+  const entries = {
+    CFBundleExecutable: "meeting-capture",
+    CFBundleIdentifier: devBundleId,
+    CFBundleName: devAppName,
+    CFBundleDisplayName: devAppName,
+    CFBundlePackageType: "APPL",
+  };
+  const keys = Object.entries(entries)
+    .map(([key, value]) => `  <key>${key}</key>\n  <string>${value}</string>\n`)
+    .join("");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+${keys}  <key>LSUIElement</key>
+  <true/>
+</dict>
+</plist>
+`;
 }
 
 // The Chrome data folder of the browser behind a devtools address. patchrome starts Chrome on
@@ -367,12 +407,14 @@ try {
   pressIfShown("guest", /^Turn off microphone$/);
   pressIfShown("guest", /^Turn off camera$/);
   await press("guest", /^(Ask to join|Join now)$/);
-  // Meet shows Admit in a toast or in the People panel, depending on the layout.
+  // Meet shows Admit in a toast or in the People panel, depending on the layout. "Admit one
+  // guest" only opens the panel.
   let isPeopleOpen = false;
   const admit = await until("the host sees the guest waiting", 45000, () => {
-    const button = findButton("host", /^Admit\b/);
-    if (button || isPeopleOpen) return button;
-    pressIfShown("host", /^People$/);
+    const button = findButton("host", /^Admit(?! (one guest|\d+ guests)$)\b/);
+    if (button) return button;
+    pressIfShown("host", /^Admit (one guest|\d+ guests)$/);
+    if (!isPeopleOpen) pressIfShown("host", /^People$/);
     isPeopleOpen = true;
   });
   patchrome("host", "click", `@${admit.ref}`);
