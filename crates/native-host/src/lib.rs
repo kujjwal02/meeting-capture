@@ -134,7 +134,7 @@ async fn connect_or_start_app(socket: &Path) -> Option<socket::HostEnd> {
 // Detached and with no stdio, so the app outlives this process and never writes into Chrome's
 // pipe.
 fn start_app() -> io::Result<()> {
-    let executable = std::env::current_exe()?;
+    let executable = std::fs::canonicalize(std::env::current_exe()?)?;
     #[cfg(target_os = "macos")]
     if let Some(bundle) = executable.ancestors().find(|folder| {
         folder
