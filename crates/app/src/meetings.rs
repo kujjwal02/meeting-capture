@@ -6,7 +6,6 @@ use std::time::Duration;
 use jobs::{FailureCause, FailureKind, JobState, Meeting, MeetingId, RunOutcome};
 use pipeline::{Pipeline, PipelineError};
 use tauri::AppHandle;
-use tauri_plugin_notification::NotificationExt as _;
 
 // Picks up meetings a crash, a quit or a store error left unfinished. A dead process's lease
 // expires after the jobs lease expiry, so a sweep soon after launch can still find one held.
@@ -85,15 +84,7 @@ fn notify_outcome(app: &AppHandle, pipeline: &Pipeline, meeting: &Meeting) {
                 },
         } => return,
     };
-    let shown = app
-        .notification()
-        .builder()
-        .title(heading)
-        .body(body)
-        .show();
-    if let Err(error) = shown {
-        tracing::warn!(exception.message = %error, "could not show the notification");
-    }
+    crate::notify(app, heading, &body);
 }
 
 pub(crate) fn retry_failed(app: &AppHandle, pipeline: &Pipeline) {

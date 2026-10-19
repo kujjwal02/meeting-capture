@@ -6,12 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use huddle_captions::{HuddleHealth, Notice, WatchPaths, WatchSettings};
-use jobs::InputKind;
-use pipeline::{InputError, Intake, IntakeError, Pipeline};
+use pipeline::Pipeline;
 use tauri::{AppHandle, Manager as _};
-use tauri_plugin_notification::NotificationExt as _;
 
 use crate::AppState;
+use crate::finished_logs::{self, LogSource};
+use crate::notify;
 
 /// What the tray shows for Slack huddles.
 #[derive(Debug, Clone)]
@@ -34,7 +34,16 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
     match huddle_captions::finish_open_logs(&paths.log_dir) {
         Ok(logs) => {
             let (app, pipeline) = (app.clone(), Arc::clone(pipeline));
-            tauri::async_runtime::spawn_blocking(move || record_left_over(&app, &pipeline, logs));
+            tauri::async_runtime::spawn_blocking(move || {
+                let min_call_seconds = min_huddle_seconds(&app);
+                finished_logs::record_left_over(
+                    &app,
+                    &pipeline,
+                    LogSource::SlackHuddle,
+                    logs,
+                    min_call_seconds,
+                );
+            });
         }
         Err(error) => {
             tracing::error!(exception.message = %error, "could not read the huddle log folder");
@@ -57,20 +66,6 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
         huddle_captions::spawn(paths, settings, move |notice| reporter.report(notice))
     {
         tracing::error!(exception.message = %error, "could not start the Slack huddle watcher");
-    }
-}
-
-// Logs the last run did not turn into meetings: the app quit or crashed during the huddle, or
-// before its note.
-fn record_left_over(app: &AppHandle, pipeline: &Pipeline, logs: Vec<PathBuf>) {
-    for log_path in logs {
-        match pipeline.store().has_input(&log_path) {
-            Ok(true) => {}
-            Ok(false) => record_and_run(app, pipeline, &log_path),
-            Err(error) => {
-                tracing::error!(exception.message = %error, "could not check a huddle log");
-            }
-        }
     }
 }
 
@@ -138,58 +133,16 @@ impl Reporter {
 }
 
 fn record_and_run(app: &AppHandle, pipeline: &Pipeline, log_path: &Path) {
-    let _span = tracing::info_span!("huddle.record", file.path = %log_path.display()).entered();
-    // Read for each huddle, so a new setting applies to the next one without a restart.
-    let min_huddle_seconds = app.state::<AppState>().settings.slack().min_huddle_seconds;
-    let taken_in =
-        pipeline.take_in_unless_short(InputKind::SlackHuddleLog, log_path, min_huddle_seconds);
-    match taken_in {
-        Ok(Intake::Recorded(id)) => {
-            crate::tray::refresh(app);
-            crate::meetings::run(app, pipeline, id);
-        }
-        // Its log stays, and `mc ingest` can still write its note.
-        Ok(Intake::TooShort) => {}
-        Err(IntakeError::Input(error)) => {
-            tracing::error!(exception.message = %error, "could not read a huddle log");
-            // The banner has little room, and the span already names the file.
-            let cause = match &error {
-                InputError::Read { source, .. } => source.to_string(),
-                InputError::ParseTranscriptonic(_)
-                | InputError::ParseSlackHuddle(_)
-                | InputError::ParseBrowserCall(_) => error.to_string(),
-            };
-            notify(app, "Slack huddle not recorded", &cause);
-            set_aside(log_path);
-        }
-        Err(error @ (IntakeError::Copy { .. } | IntakeError::Store(_))) => {
-            tracing::error!(exception.message = %error, "could not record a huddle");
-            notify(app, "Slack huddle not recorded", &error.to_string());
-        }
-    }
+    finished_logs::record_and_run(
+        app,
+        pipeline,
+        LogSource::SlackHuddle,
+        log_path,
+        min_huddle_seconds(app),
+    );
 }
 
-pub(crate) fn notify(app: &AppHandle, heading: &str, body: &str) {
-    if let Err(error) = app
-        .notification()
-        .builder()
-        .title(heading)
-        .body(body)
-        .show()
-    {
-        tracing::warn!(exception.message = %error, "could not show the notification");
-    }
-}
-
-// Renames a log that cannot be read out of the `.jsonl` set, so the next launch does not report it
-// again. The file stays for a look by hand.
-pub(crate) fn set_aside(log_path: &Path) {
-    let unreadable = log_path.with_extension("jsonl.unreadable");
-    if let Err(error) = std::fs::rename(log_path, &unreadable) {
-        tracing::warn!(
-            file.path = %log_path.display(),
-            exception.message = %error,
-            "could not set aside an unreadable log"
-        );
-    }
+// Read for each huddle, so a new setting applies to the next one without a restart.
+fn min_huddle_seconds(app: &AppHandle) -> u32 {
+    app.state::<AppState>().settings.slack().min_huddle_seconds
 }

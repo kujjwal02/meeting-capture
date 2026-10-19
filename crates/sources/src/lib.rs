@@ -1,5 +1,7 @@
-//! Turns each input into the common transcript format.
+//! Turns each input into the common transcript format, and writes the logs the app records
+//! calls in.
 
+pub mod append_log;
 pub mod browser_call;
 pub mod slack_huddle;
 pub mod transcriptonic;

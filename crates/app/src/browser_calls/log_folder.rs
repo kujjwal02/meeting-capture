@@ -1,5 +1,4 @@
-//! The folder of browser call logs: how a log is named and found, the rejoin index, and logs set
-//! aside as unreadable. Only this module knows the folder's layout.
+//! The folder of browser call logs: how a log is named and found, and the rejoin index.
 
 use std::fs::File;
 use std::io::Write as _;
@@ -8,9 +7,10 @@ use std::path::{Path, PathBuf};
 use jiff::civil::DateTime;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
+use sources::append_log;
 use sources::browser_call::{self, EndReason, LogSummary};
 
-use super::call_log::CallLog;
+use super::call_log::{CallLog, LoggedLine, ended_event};
 
 const LOG_EXTENSION: &str = "jsonl";
 /// A rejoin file names the log its session joined.
@@ -37,12 +37,7 @@ impl LogFolder {
         started_at: Timestamp,
         session_id: &str,
     ) -> std::io::Result<CallLog> {
-        std::fs::create_dir_all(&self.dir)?;
-        let log = CallLog::create(&self.dir.join(log_file_name(started_at, session_id)))?;
-        // The new folder entry must reach the disk, or a crash can lose the whole log.
-        #[cfg(unix)]
-        File::open(&self.dir)?.sync_all()?;
-        Ok(log)
+        CallLog::create(&self.dir, &log_file_name(started_at, session_id))
     }
 
     /// The log of `session_id`, if there is one: the log it rejoined, else its own.
@@ -51,7 +46,7 @@ impl LogFolder {
             return Ok(Some(log_path));
         }
         let suffix = format!("-{session_id}.{LOG_EXTENSION}");
-        Ok(self.log_paths()?.into_iter().find(|path| {
+        Ok(append_log::log_paths(&self.dir)?.into_iter().find(|path| {
             path.file_name()
                 .is_some_and(|name| name.to_string_lossy().ends_with(&suffix))
         }))
@@ -129,7 +124,7 @@ impl LogFolder {
     // skipped.
     fn logs_started_since(&self, earliest: Timestamp) -> std::io::Result<Vec<PathBuf>> {
         let mut logs = Vec::new();
-        for path in self.log_paths()?.into_iter().rev() {
+        for path in append_log::log_paths(&self.dir)?.into_iter().rev() {
             let Some(started_at) = name_started_at(&path) else {
                 continue;
             };
@@ -144,7 +139,7 @@ impl LogFolder {
     /// Ends each log whose last event is not a `call_ended`, at the time of its last event. The
     /// app quit or crashed during those calls. Returns every log path, oldest first.
     pub(super) fn finish_open_logs(&self) -> std::io::Result<Vec<PathBuf>> {
-        let paths = self.log_paths()?;
+        let paths = append_log::log_paths(&self.dir)?;
         for path in &paths {
             if let Err(error) = finish_log(path) {
                 tracing::warn!(
@@ -155,35 +150,6 @@ impl LogFolder {
             }
         }
         Ok(paths)
-    }
-
-    // Sorted by name, which sorts the app's logs by start time.
-    fn log_paths(&self) -> std::io::Result<Vec<PathBuf>> {
-        let entries = match std::fs::read_dir(&self.dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(error),
-        };
-        let mut paths: Vec<PathBuf> = entries
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|found| found == LOG_EXTENSION))
-            .collect();
-        paths.sort();
-        Ok(paths)
-    }
-}
-
-/// Renames a log intake could not read, so nothing lists, rejoins or reopens it, and it stays
-/// for a look.
-pub(super) fn set_aside(log_path: &Path) {
-    let unreadable = log_path.with_extension(format!("{LOG_EXTENSION}.unreadable"));
-    if let Err(error) = std::fs::rename(log_path, &unreadable) {
-        tracing::warn!(
-            file.path = %log_path.display(),
-            exception.message = %error,
-            "could not set aside an unreadable log"
-        );
     }
 }
 
@@ -210,16 +176,19 @@ fn read_summary(log_path: &Path) -> std::io::Result<LogSummary> {
 }
 
 fn finish_log(log_path: &Path) -> std::io::Result<()> {
-    let contents = std::fs::read(log_path)?;
-    let lines = browser_call::read_lines(&contents).map_err(std::io::Error::other)?;
-    let Some(last) = lines.last() else {
-        return Ok(());
-    };
-    let summary = browser_call::summarize(&lines);
-    if summary.has_ended {
-        return Ok(());
-    }
-    let last_at = summary.last_at.unwrap_or(last.received_at);
-    let (mut log, _) = CallLog::reopen(log_path)?;
-    log.end(last_at, EndReason::AppRestarted, Timestamp::now())
+    append_log::finish(log_path, |lines: &[browser_call::LogLine]| {
+        let last = lines.last()?;
+        let summary = browser_call::summarize(lines);
+        if summary.has_ended {
+            return None;
+        }
+        Some(LoggedLine {
+            seq: None,
+            received_at: Timestamp::now(),
+            event: ended_event(
+                summary.last_at.unwrap_or(last.received_at),
+                EndReason::AppRestarted,
+            ),
+        })
+    })
 }

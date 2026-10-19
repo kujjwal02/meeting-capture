@@ -10,10 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use jobs::InputKind;
 use native_host::frames::{LengthOrder, read_frame, write_frame};
 use native_host::socket::{AppEnd, CallListener};
-use pipeline::{InputError, Intake, IntakeError, Pipeline};
+use pipeline::Pipeline;
 use serde::{Deserialize, Serialize};
 use sources::browser_call::HealthSource;
 use tauri::{AppHandle, Manager as _};
@@ -23,6 +22,7 @@ use tracing::Instrument as _;
 use self::call_book::{CallBook, EventError, Logged, Now};
 use self::log_folder::LogFolder;
 use crate::AppState;
+use crate::finished_logs::{self, LogSource};
 
 /// The protocol this app speaks. An extension that says an older one gets a tray warning.
 const PROTOCOL: u32 = 1;
@@ -113,7 +113,7 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
         Ok(log_paths) => {
             let (app, pipeline) = (app.clone(), Arc::clone(pipeline));
             tauri::async_runtime::spawn_blocking(move || {
-                record_left_over(&app, &pipeline, log_paths);
+                finished_logs::record_left_over(&app, &pipeline, LogSource::MeetCall, log_paths, 0);
             });
         }
         Err(error) => {
@@ -157,20 +157,6 @@ fn register_host(data_dir: &Path) {
         }
         Err(error) => {
             tracing::error!(exception.message = %error, "could not register the native host");
-        }
-    }
-}
-
-// Logs the last run did not turn into meetings: the app quit or crashed during the call, or
-// before its note.
-fn record_left_over(app: &AppHandle, pipeline: &Pipeline, log_paths: Vec<PathBuf>) {
-    for log_path in log_paths {
-        match pipeline.store().has_input(&log_path) {
-            Ok(true) => {}
-            Ok(false) => record_and_run(app, pipeline, &log_path),
-            Err(error) => {
-                tracing::error!(exception.message = %error, "could not check a browser call log");
-            }
         }
     }
 }
@@ -369,33 +355,7 @@ async fn end_idle_calls(app: AppHandle, pipeline: Arc<Pipeline>) {
     }
 }
 
+// No minimum length: the caption count alone tells a real call from a misclick.
 fn record_and_run(app: &AppHandle, pipeline: &Pipeline, log_path: &Path) {
-    let _span =
-        tracing::info_span!("browser_call.record", file.path = %log_path.display()).entered();
-    // No minimum length: the caption count alone tells a real call from a misclick.
-    let taken_in = pipeline.take_in_unless_short(InputKind::BrowserCallLog, log_path, 0);
-    match taken_in {
-        Ok(Intake::Recorded(id)) => {
-            crate::tray::refresh(app);
-            crate::meetings::run(app, pipeline, id);
-        }
-        // Its log stays, and `mc ingest` can still write its note.
-        Ok(Intake::TooShort) => {}
-        Err(IntakeError::Input(error)) => {
-            tracing::error!(exception.message = %error, "could not read a browser call log");
-            // The banner has little room, and the span already names the file.
-            let cause = match &error {
-                InputError::Read { source, .. } => source.to_string(),
-                InputError::ParseTranscriptonic(_)
-                | InputError::ParseSlackHuddle(_)
-                | InputError::ParseBrowserCall(_) => error.to_string(),
-            };
-            crate::huddles::notify(app, "Meet call not recorded", &cause);
-            log_folder::set_aside(log_path);
-        }
-        Err(error @ (IntakeError::Copy { .. } | IntakeError::Store(_))) => {
-            tracing::error!(exception.message = %error, "could not record a browser call");
-            crate::huddles::notify(app, "Meet call not recorded", &error.to_string());
-        }
-    }
+    finished_logs::record_and_run(app, pipeline, LogSource::MeetCall, log_path, 0);
 }
