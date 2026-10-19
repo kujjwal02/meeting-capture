@@ -58,6 +58,7 @@ toml = "1.1"
 caption-receiver = { path = "crates/caption-receiver" }
 huddle-captions = { path = "crates/huddle-captions" }
 jobs = { path = "crates/jobs" }
+native-host = { path = "crates/native-host" }
 pipeline = { path = "crates/pipeline" }
 sources = { path = "crates/sources" }
 

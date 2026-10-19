@@ -124,7 +124,9 @@ updates the [Homebrew cask](https://github.com/kujjwal02/homebrew-tap). Installe
 release within 6 hours.
 
 To keep a dev run away from your real job store, set `MEETING_CAPTURE_HOME` to a scratch folder. The
-app then reads `config/settings.toml` and writes `data/` inside it.
+app then reads `config/settings.toml` and writes `data/` inside it. It also runs next to the
+installed app: the single-instance check is off, so give it its own `receiver_port`. A Unix socket
+path holds at most 104 bytes, so keep the folder path short, or relative to the working folder.
 
 ## Documentation
 

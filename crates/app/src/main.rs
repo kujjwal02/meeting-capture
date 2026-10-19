@@ -1,9 +1,11 @@
-//! Tray app with no Dock icon and no window. Receives TranscripTonic's webhook and runs the
-//! pipeline for each meeting. Starts at login once "Start at login" is on.
+//! Tray app with no Dock icon and no window. Receives TranscripTonic's webhook and mc-meet's call
+//! events, and runs the pipeline for each meeting. Starts at login once "Start at login" is on.
+//! Started by a browser with an extension origin as its argument, it runs host mode instead.
 
 // Release builds on Windows would otherwise open a console window next to the tray icon.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod browser_calls;
 mod huddles;
 mod launch;
 mod meetings;
@@ -11,6 +13,7 @@ mod settings_window;
 mod tray;
 mod updates;
 
+use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pipeline::Pipeline;
@@ -33,6 +36,7 @@ pub(crate) struct AppState {
     /// to load.
     pub settings: Arc<SettingsStore>,
     pub huddle_status: Mutex<huddles::HuddleStatus>,
+    pub browser_calls: browser_calls::BrowserCalls,
     pub updates: updates::Updates,
 }
 
@@ -75,12 +79,47 @@ pub(crate) fn set_listener(app: &AppHandle, listener: Listener) {
     tray::refresh(app);
 }
 
-fn main() -> tauri::Result<()> {
-    let app = tauri::Builder::default()
+// The env var `AppDirs::locate` reads. A dev run with its own home is a separate instance.
+const HOME_OVERRIDE_VAR: &str = "MEETING_CAPTURE_HOME";
+
+fn main() -> ExitCode {
+    // First, before anything can write to stdout: in host mode stdout carries frames to Chrome.
+    let first_argument = std::env::args().nth(1);
+    if native_host::is_host_mode(first_argument.as_deref()) {
+        return run_host_mode(first_argument.as_deref().unwrap_or_default());
+    }
+    match run_tray_app() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("the tray app stopped: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_host_mode(origin: &str) -> ExitCode {
+    let app_dirs = match AppDirs::locate() {
+        Ok(app_dirs) => app_dirs,
+        Err(error) => {
+            eprintln!("host mode: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(error) = init_host_logging(&app_dirs) {
+        eprintln!("host mode: could not open its log file: {error}");
+    }
+    native_host::run(origin, app_dirs.browser_call_socket())
+}
+
+fn run_tray_app() -> tauri::Result<()> {
+    let mut builder = tauri::Builder::default();
+    if std::env::var_os(HOME_OVERRIDE_VAR).is_none() {
         // Registered first, so a second launch exits before it binds the port.
-        .plugin(tauri_plugin_single_instance::init(|_, _, _| {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|_, _, _| {
             tracing::info!("a second launch was refused; the tray app is already running");
-        }))
+        }));
+    }
+    let app = builder
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -147,6 +186,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         listener: Mutex::new(listener.clone()),
         settings: settings_store,
         huddle_status: Mutex::new(huddles::HuddleStatus::Idle),
+        browser_calls: browser_calls::BrowserCalls::default(),
         updates: updates::Updates::default(),
     });
     tray::create(app.handle())?;
@@ -155,6 +195,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         Some((pipeline, port)) => {
             check_google_accounts(app.handle().clone());
             huddles::start(app.handle(), &pipeline);
+            browser_calls::start(app.handle(), &pipeline);
             meetings::start(app.handle().clone(), pipeline, port);
         }
         None => set_listener(app.handle(), listener),
@@ -172,6 +213,7 @@ pub(crate) fn check_google_accounts(app: AppHandle) {
 }
 
 pub(crate) const LOG_FILE_NAME: &str = "app.log";
+const HOST_LOG_FILE_NAME: &str = "native-host.log";
 
 // JSON lines in the app's log folder. A tray app has no terminal to write to.
 fn init_logging(app_dirs: &AppDirs) -> std::io::Result<()> {
@@ -189,5 +231,20 @@ fn init_logging(app_dirs: &AppDirs) -> std::io::Result<()> {
         tracing::error!(exception.message = %panic, "panic");
         default_hook(panic);
     }));
+    Ok(())
+}
+
+// JSON lines in their own file: several hosts can run at once, one per Chrome profile, next to
+// the tray app.
+fn init_host_logging(app_dirs: &AppDirs) -> std::io::Result<()> {
+    std::fs::create_dir_all(app_dirs.log_dir())?;
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(app_dirs.log_dir().join(HOST_LOG_FILE_NAME))?;
+    tracing_subscriber::fmt()
+        .json()
+        .with_writer(Mutex::new(log_file))
+        .init();
     Ok(())
 }

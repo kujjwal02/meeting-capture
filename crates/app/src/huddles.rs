@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use huddle_captions::{HuddleHealth, Notice, WatchPaths, WatchSettings};
+use jobs::InputKind;
 use pipeline::{InputError, Intake, IntakeError, Pipeline};
 use tauri::{AppHandle, Manager as _};
 use tauri_plugin_notification::NotificationExt as _;
@@ -140,7 +141,8 @@ fn record_and_run(app: &AppHandle, pipeline: &Pipeline, log_path: &Path) {
     let _span = tracing::info_span!("huddle.record", file.path = %log_path.display()).entered();
     // Read for each huddle, so a new setting applies to the next one without a restart.
     let min_huddle_seconds = app.state::<AppState>().settings.slack().min_huddle_seconds;
-    let taken_in = pipeline.take_in_huddle_log_unless_short(log_path, min_huddle_seconds);
+    let taken_in =
+        pipeline.take_in_unless_short(InputKind::SlackHuddleLog, log_path, min_huddle_seconds);
     match taken_in {
         Ok(Intake::Recorded(id)) => {
             crate::tray::refresh(app);
@@ -153,9 +155,9 @@ fn record_and_run(app: &AppHandle, pipeline: &Pipeline, log_path: &Path) {
             // The banner has little room, and the span already names the file.
             let cause = match &error {
                 InputError::Read { source, .. } => source.to_string(),
-                InputError::ParseTranscriptonic(_) | InputError::ParseSlackHuddle(_) => {
-                    error.to_string()
-                }
+                InputError::ParseTranscriptonic(_)
+                | InputError::ParseSlackHuddle(_)
+                | InputError::ParseBrowserCall(_) => error.to_string(),
             };
             notify(app, "Slack huddle not recorded", &cause);
             set_aside(log_path);
@@ -167,7 +169,7 @@ fn record_and_run(app: &AppHandle, pipeline: &Pipeline, log_path: &Path) {
     }
 }
 
-fn notify(app: &AppHandle, heading: &str, body: &str) {
+pub(crate) fn notify(app: &AppHandle, heading: &str, body: &str) {
     if let Err(error) = app
         .notification()
         .builder()
@@ -181,13 +183,13 @@ fn notify(app: &AppHandle, heading: &str, body: &str) {
 
 // Renames a log that cannot be read out of the `.jsonl` set, so the next launch does not report it
 // again. The file stays for a look by hand.
-fn set_aside(log_path: &Path) {
+pub(crate) fn set_aside(log_path: &Path) {
     let unreadable = log_path.with_extension("jsonl.unreadable");
     if let Err(error) = std::fs::rename(log_path, &unreadable) {
         tracing::warn!(
             file.path = %log_path.display(),
             exception.message = %error,
-            "could not set aside an unreadable huddle log"
+            "could not set aside an unreadable log"
         );
     }
 }

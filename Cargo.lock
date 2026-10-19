@@ -2643,10 +2643,13 @@ version = "0.2.0"
 dependencies = [
  "caption-receiver",
  "huddle-captions",
+ "jiff",
  "jobs",
+ "native-host",
  "pipeline",
  "serde",
  "serde_json",
+ "sources",
  "tauri",
  "tauri-build",
  "tauri-plugin-autostart",
@@ -2654,6 +2657,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tauri-plugin-updater",
+ "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -2762,6 +2766,17 @@ name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
+
+[[package]]
+name = "native-host"
+version = "0.2.0"
+dependencies = [
+ "directories",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "windows-registry",
+]
 
 [[package]]
 name = "native-tls"

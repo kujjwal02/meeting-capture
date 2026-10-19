@@ -23,7 +23,7 @@ flowchart LR
 
 | Part | Where | Job |
 | --- | --- | --- |
-| Page hook | `extension/page-hook.js`, MAIN world, `document_start` | Wraps `RTCPeerConnection` and decodes Meet's `collections`, `captions`, `captions_v2` and `meet_messages` data channels. |
+| Page hook | `extension/page-hook.js` and `extension/page/wire.js`, MAIN world, `document_start` | Wraps `RTCPeerConnection` and decodes Meet's `collections`, `captions`, `captions_v2` and `meet_messages` data channels. Opens the two caption channels itself. |
 | Content script | `extension/content/`, isolated world | Finds call start and end, reads the DOM when the channels give nothing, and owns the call session for its tab. |
 | Service worker | `extension/background.js` | Holds the native port, numbers and queues events, resends after a reconnect. |
 | Host mode | `crates/native-host`, run by the app binary | Chrome starts `meeting-capture chrome-extension://<id>/`. `main` sees the argument and relays frames between stdio and the app socket before Tauri starts. |
@@ -50,6 +50,9 @@ flowchart LR
   stale socket file at start.
 - Windows: named pipe `\\.\pipe\meeting-capture-<user name>`, remote clients rejected.
 - `MEETING_CAPTURE_HOME` moves the data folder for both the app and host mode, as it does for `mc`.
+  On Windows it adds `-<8 hex digits>` from the data folder's SHA-256 to the pipe name.
+- The app drops a connection whose first frame is not `host_hello` with the extension's origin.
+- Host mode logs to `native-host.log` in the app's logs folder. Stdout carries only frames.
 - One socket connection per extension port. The app serves several at once: one per Chrome
   profile.
 
@@ -82,14 +85,28 @@ unknown fields are ignored on both sides, so either side can be newer.
 | --- | --- |
 | `call_started` | `at`, `platform` (`meet`), `meeting_code`, `title`, `tab_id` |
 | `caption` | `at`, `device_id`, `utterance_id`, `version`, `speaker`, `text`, `source` (`channel` or `dom`) |
-| `chat` | `at`, `message_id`, `sender`, `text`, `source` |
+| `chat` | `at`, `message_id`, `device_id` (channel only), `sender`, `text`, `source` |
 | `roster` | `at`, `participants`: list of `{device_id, name, is_self}`, the whole list each time it changes |
 | `health` | `at`, `source` (`channel`, `dom` or `none`), `captions_on`, `parse_failures`, `detail` |
-| `call_ended` | `at`, `reason` (`left`, `tab_closed`, `kicked`, `page_unload`) |
+| `call_ended` | `at`, `reason` (`left`, `tab_closed`, `kicked`, `page_unload`; the app writes `idle` and `app_restarted`) |
 
-A `caption` with a higher `version` for the same `device_id` and `utterance_id` replaces the earlier
-text. The DOM source has no device or utterance IDs: it uses the speaker name as `device_id` and
-a counter per speaker turn as `utterance_id`.
+- `caption`: `utterance_id` is a string and `version` an integer. `at` is when the utterance first
+  appeared, so every version of one utterance has the same `at`. A `caption` with a higher
+  `version` for the same `device_id` and `utterance_id` replaces the earlier text. The extension
+  sends a new version only when the version grows or the text changes.
+- `speaker` is empty when the device had no name yet. The app then takes the name for
+  `device_id` from the roster. `sender` on `chat` follows the same rule.
+- The DOM source has no device or utterance IDs. It uses the speaker name as `device_id`, and
+  `dom-<page token>-<turn number>` as `utterance_id`. The page token keeps IDs unique after a
+  reload.
+- Channel `device_id`s look like `spaces/<id>/devices/<id>`. Legacy `captions` frames get a `v1-`
+  prefix on `utterance_id`. They are dropped once a `captions_v2` frame has arrived.
+- `roster` lists the people in the call now: devices with status left (6), removed (7) or refused
+  (4) are dropped, and so are screen-share devices. The app unions every roster of the session.
+- `health` is sent at call start and whenever one of its fields changes. `detail` is null, or the
+  reason for the DOM fallback, or a parse-gap report: after 10 failed frames in a row on one
+  channel, it names the failure reasons and a skeleton of the last frame (tag and wire type tree
+  with lengths, no text). `parse_failures` counts failed frames on all channels.
 
 ### App to extension
 
@@ -101,7 +118,9 @@ a counter per speaker turn as `utterance_id`.
 
 The extension keeps each event in `chrome.storage.local` until its `ack`, and resends unacked
 events in `seq` order after `welcome`. The app ignores an event whose `seq` its log already has,
-and acks it again.
+and acks it again. An event with an invalid `session_id` (1 to 64 letters, digits or hyphens) or
+invalid fields for its `kind` is acked and dropped, since a resend cannot fix it. An event the app
+could not write gets no `ack`.
 
 ## Sessions
 
@@ -109,19 +128,56 @@ and acks it again.
   call starts, and keeps it in `sessionStorage` with the meeting code. A reload of the same
   meeting in the same tab within 5 minutes reuses the session. A second Meet tab never touches
   the first tab's session.
-- The page is in a call when the Leave call button exists. The call ends when that button is gone
-  for 3 s, on tab close, or on page unload.
-- The content script sets the tab to `autoDiscardable: false` through the worker while the call
-  runs.
+- The page is in a call when the Leave call button exists. The content script ends the call when
+  that button is gone for 3 s: `kicked` if the roster showed the local device as removed, else
+  `left`.
+- The worker ends the call `tab_closed` when the tab closes.
+- When the page unloads (reload, navigation, crash), the worker waits 5 minutes. If the same tab
+  resumes the session, the call goes on. Otherwise the worker ends it `page_unload`, with `at` set
+  to the unload time. A new session in that tab ends the old one at once.
+- After a browser restart, open sessions get the same 5-minute wait.
+- The worker sets the tab to `autoDiscardable: false` while the call runs.
+
+## Extension internals
+
+- Caption source. The hook opens `captions` and `captions_v2` on the peer connection that carries
+  `collections`, so captions flow without the captions button. When no caption arrives within 20 s
+  of that, or 10 caption frames in a row fail to decode with no good caption in the last 20 s, the
+  content script reads the caption region in the DOM. It clicks the captions button if captions are
+  off, at most 3 times. The first channel caption after that switches back to the channel and
+  stops the DOM reader.
+- Roster. From `collections` and the `SyncMeetingSpaceCollections` response. When neither gives a
+  roster 30 s into the call, the content script reads the People panel if it is open, else the
+  video tiles, every 10 s.
+- Chat. From `collections`, `meet_messages` and the `CreateMeetingMessage` response, deduplicated
+  by message name. There is no DOM chat reader.
+- Content script to worker. One port per tab. Each event carries a number `n` per session, kept in
+  `sessionStorage`. The worker stores the event, replies `stored`, and drops any `n` it has stored
+  before. The content script resends unstored events after a reconnect. It pings every 20 s. If
+  the worker already ended the session (the page came back after 5 minutes), it replies
+  `session_ended`, and the content script starts a new session.
+- Worker to app. The worker opens the native port when it has a call or queued events, and closes
+  it after the ack of the last `call_ended`. On a disconnect or `app_unavailable` it reconnects
+  after 1 s, doubling to 60 s, and an alarm retries every 30 s.
+- Extension update. The worker injects fresh content scripts into open Meet tabs. They resume the
+  tab's session. The old page hook keeps running until the tab reloads.
+- Permissions: `nativeMessaging`, `storage`, `unlimitedStorage` (a long call queued while the app
+  is down), `alarms`, `scripting` (the update injection), host `https://meet.google.com/*`.
 
 ## App rules
 
-- Log: `browser-calls/<started_at>-<session_id>.jsonl` in the data folder. Each line is
-  `{"seq":..,"received_at":..,"event":{..}}`, appended and flushed before the `ack`.
+- Log: `browser-calls/<started_at>-<session_id>.jsonl` in the data folder, `started_at` as
+  `20261019T115918.000Z`. Each line is `{"seq":..,"received_at":..,"event":{..}}`, appended and
+  flushed before the `ack`. The event is stored as received, unknown fields included.
 - The call ends on `call_ended`, or 5 minutes after the last event once no port has the session
-  open. Then intake reads the log as `InputKind::BrowserCallLog`.
+  open. Then intake reads the log as `InputKind::BrowserCallLog`. For the second case the app
+  appends its own `call_ended` line, with reason `idle` and no `seq`.
+- An event for a session whose log already ended reopens that log. The call ends again by the
+  same rules, and intake updates the same meeting and note.
 - A call with fewer than 3 caption lines writes no note, as for huddles. The log stays.
-- At start, the app closes each log with no end line from a previous run and takes it in.
+- At start, the app closes each log with no end line from a previous run and takes it in. The
+  end line is a `call_ended` with reason `app_restarted` and no `seq`, at the time of the last
+  event.
 - Attendees are every participant in any `roster` event, the local user included. Speakers and
   chat senders join the list when no roster arrived.
 - The tray shows: extension connected or not, the current call, the caption source (channel or
@@ -142,5 +198,6 @@ extension's protocol is older than the app's.
   `0cb5eb5667759cd9cd0bb98d1ce6bdb763a30151`. The licence is in `extension/content/LICENSE-transcriptonic`.
 - Host relay: Anarlog's `crates/chrome-native-host`, MIT, <https://github.com/fastrepl/anarlog>,
   commit `6fd155aa1af39ef652b767133caccb280de750f6`.
-- Data channel layout: our own decoder. Research notes in
+- Data channel layout: our own decoder. Field numbers and their sources are in
+  `extension/PROTOCOL-NOTES.md`. Research notes in
   `~/knowledge/areas/infrastructure/meeting-recording/local-capture/how-tools-work/`.

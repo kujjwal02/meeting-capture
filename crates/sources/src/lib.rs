@@ -1,5 +1,6 @@
 //! Turns each input into the common transcript format.
 
+pub mod browser_call;
 pub mod slack_huddle;
 pub mod transcriptonic;
 
@@ -66,6 +67,8 @@ pub enum Source {
     MeetApi,
     AudioFile,
     SlackHuddle,
+    /// The mc-meet Chrome extension.
+    MeetExtension,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
