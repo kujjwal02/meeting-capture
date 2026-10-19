@@ -6,6 +6,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser_calls;
+mod finished_logs;
 mod huddles;
 mod launch;
 mod meetings;
@@ -20,6 +21,7 @@ use pipeline::Pipeline;
 use pipeline::settings::{AppDirs, SettingsStore};
 use tauri::{AppHandle, Manager, RunEvent};
 use tauri_plugin_autostart::MacosLauncher;
+use tauri_plugin_notification::NotificationExt as _;
 
 pub(crate) struct AppState {
     /// `None` when the settings or the job store failed to load. `pipeline_error` says why.
@@ -174,6 +176,19 @@ pub(crate) fn check_google_accounts(app: AppHandle) {
         app.state::<AppState>().settings.google().check();
         tray::refresh(&app);
     });
+}
+
+/// Shows a system notification. A failure is only logged: the tray still shows the state.
+pub(crate) fn notify(app: &AppHandle, heading: &str, body: &str) {
+    if let Err(error) = app
+        .notification()
+        .builder()
+        .title(heading)
+        .body(body)
+        .show()
+    {
+        tracing::warn!(exception.message = %error, "could not show the notification");
+    }
 }
 
 pub(crate) const LOG_FILE_NAME: &str = "app.log";

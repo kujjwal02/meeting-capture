@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::append_log::InvalidLine;
 use crate::{Attendee, ChatMessage, Platform, Segment, Source, SpeakerNaming, Transcript};
 
 /// One line of the log. The app's own lines, such as the end it writes for an idle call, have no
@@ -267,26 +268,8 @@ pub enum ParseError {
 ///
 /// Returns `ParseError::InvalidLine` naming the first bad line other than a torn last one.
 pub fn read_lines(log: &[u8]) -> Result<Vec<LogLine>, ParseError> {
-    let text = String::from_utf8_lossy(log);
-    let is_torn = !text.is_empty() && !text.ends_with('\n');
-    let raw_lines: Vec<&str> = text.lines().collect();
-    let mut lines = Vec::with_capacity(raw_lines.len());
-    for (index, raw) in raw_lines.iter().enumerate() {
-        if raw.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str(raw) {
-            Ok(line) => lines.push(line),
-            Err(_) if is_torn && index + 1 == raw_lines.len() => {}
-            Err(source) => {
-                return Err(ParseError::InvalidLine {
-                    line: index + 1,
-                    source,
-                });
-            }
-        }
-    }
-    Ok(lines)
+    crate::append_log::read_lines(log)
+        .map_err(|InvalidLine { line, source }| ParseError::InvalidLine { line, source })
 }
 
 /// Parses a browser call log into a transcript.
