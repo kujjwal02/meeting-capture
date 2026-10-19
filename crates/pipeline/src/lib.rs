@@ -320,7 +320,10 @@ impl Pipeline {
         Prompt::new(
             transcript,
             self.settings.my_name.as_deref(),
-            &render::attendees(transcript, calendar_match),
+            &render::attendees(transcript, self.settings.my_name.as_deref())
+                .into_iter()
+                .chain(render::invited(calendar_match))
+                .collect::<Vec<_>>(),
             &llm.glossary,
         )
     }

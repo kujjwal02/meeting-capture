@@ -18,10 +18,68 @@ pub struct CalendarMatch {
 pub struct CalendarEvent {
     /// `None` for an event with no title.
     pub title: Option<String>,
-    pub attendees: Vec<String>,
+    /// Everyone the event invites, rooms left out. Matches stored before the split from the
+    /// people who joined call this `attendees`.
+    #[serde(alias = "attendees")]
+    pub invited: Vec<Invitee>,
     /// The signed-in account whose calendar holds the event.
     pub account: String,
     pub event_id: String,
+}
+
+/// A person the event invites. Being invited says nothing about joining the call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(from = "StoredInvitee")]
+pub struct Invitee {
+    /// The display name, else the email.
+    pub name: String,
+    /// `None` on matches stored before responses were kept.
+    pub response: Option<InviteResponse>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum InviteResponse {
+    NeedsAction,
+    Declined,
+    Tentative,
+    Accepted,
+    Unrecognised,
+}
+
+impl From<ResponseStatus> for InviteResponse {
+    fn from(status: ResponseStatus) -> Self {
+        match status {
+            ResponseStatus::NeedsAction => Self::NeedsAction,
+            ResponseStatus::Declined => Self::Declined,
+            ResponseStatus::Tentative => Self::Tentative,
+            ResponseStatus::Accepted => Self::Accepted,
+            ResponseStatus::Unrecognised => Self::Unrecognised,
+        }
+    }
+}
+
+// Older matches stored each invitee as a bare name.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredInvitee {
+    Name(String),
+    Invitee {
+        name: String,
+        response: Option<InviteResponse>,
+    },
+}
+
+impl From<StoredInvitee> for Invitee {
+    fn from(stored: StoredInvitee) -> Self {
+        match stored {
+            StoredInvitee::Name(name) => Self {
+                name,
+                response: None,
+            },
+            StoredInvitee::Invitee { name, response } => Self { name, response },
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -287,12 +345,17 @@ impl Candidate {
     }
 
     fn into_event(self, accounts: &[AccountStatus]) -> CalendarEvent {
-        let attendees = self
+        let invited = self
             .event
             .attendees
             .into_iter()
             .filter(|attendee| !attendee.resource)
-            .filter_map(|attendee| attendee.display_name.or(attendee.email))
+            .filter_map(|attendee| {
+                Some(Invitee {
+                    name: attendee.display_name.or(attendee.email)?,
+                    response: attendee.response_status.map(InviteResponse::from),
+                })
+            })
             .collect();
         CalendarEvent {
             title: self
@@ -300,7 +363,7 @@ impl Candidate {
                 .summary
                 .map(|summary| summary.split_whitespace().collect::<Vec<_>>().join(" "))
                 .filter(|summary| !summary.is_empty()),
-            attendees,
+            invited,
             account: accounts[self.account_rank].email.clone(),
             event_id: self.event.id,
         }

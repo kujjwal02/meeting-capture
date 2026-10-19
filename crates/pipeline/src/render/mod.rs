@@ -60,6 +60,8 @@ struct Frontmatter<'a> {
     meeting_url: Option<&'a str>,
     meeting_id: i64,
     attendees: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    invited: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     extraction: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -85,7 +87,7 @@ struct SlackAttendee<'a> {
 }
 
 // The frontmatter keys the app writes. On a rerun these are rewritten; any other key stays.
-pub(crate) const APP_KEYS: [&str; 17] = [
+pub(crate) const APP_KEYS: [&str; 18] = [
     "title",
     "date",
     "created",
@@ -95,6 +97,7 @@ pub(crate) const APP_KEYS: [&str; 17] = [
     "meeting_url",
     "meeting_id",
     "attendees",
+    "invited",
     "extraction",
     "slack_workspace",
     "slack_channel",
@@ -148,7 +151,7 @@ pub(crate) fn note(
 
     let transcript = note.transcript;
     let started_at = note.started_at();
-    let attendees = attendees(transcript, note.calendar_match);
+    let attendees = attendees(transcript, note.my_name);
     let frontmatter = frontmatter_yaml(note, &attendees)?;
 
     let speaker_name = |speaker: &str| -> String {
@@ -244,16 +247,46 @@ pub(crate) fn my_speaker_name<'a>(
         .map(|label| my_name.unwrap_or(label))
 }
 
-/// The calendar event's attendees, else the people the call app showed.
-pub(crate) fn attendees(transcript: &Transcript, calendar_match: &CalendarMatch) -> Vec<String> {
-    match &calendar_match.event {
-        Some(event) => event.attendees.clone(),
-        None => transcript
-            .attendees
+/// The people who joined the call: the call app's participant list, else everyone who spoke or
+/// wrote in the chat, plus the local user. Invitees who never joined are left out.
+pub(crate) fn attendees(transcript: &Transcript, my_name: Option<&str>) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let mut add = |name: &str| {
+        if !names.iter().any(|known| known == name) {
+            names.push(name.to_owned());
+        }
+    };
+    if transcript.attendees.is_empty() {
+        let people = transcript
+            .segments
             .iter()
-            .map(|attendee| attendee.name.clone())
-            .collect(),
+            .map(|segment| segment.speaker.as_str())
+            .chain(
+                transcript
+                    .chat_messages
+                    .iter()
+                    .map(|message| message.sender.as_str()),
+            )
+            .chain(transcript.my_speaker.as_deref());
+        for speaker in people {
+            add(speaker_name(transcript, my_name, speaker));
+        }
+    } else {
+        for attendee in &transcript.attendees {
+            add(&attendee.name);
+        }
     }
+    names
+}
+
+/// Everyone the matched calendar event invites, whether or not they joined.
+pub(crate) fn invited(calendar_match: &CalendarMatch) -> Vec<String> {
+    calendar_match
+        .event
+        .iter()
+        .flat_map(|event| &event.invited)
+        .map(|invitee| invitee.name.clone())
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -315,6 +348,7 @@ fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String
         meeting_url: transcript.meeting_url.as_deref(),
         meeting_id: note.meeting_id.as_i64(),
         attendees: attendees.to_vec(),
+        invited: invited(note.calendar_match),
         extraction: note.notes.and(note.extraction_provider),
         slack_workspace: huddle.map(|huddle| huddle.workspace.as_str()),
         slack_channel: huddle.map(|huddle| huddle.channel.as_str()),
