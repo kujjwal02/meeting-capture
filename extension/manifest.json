@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "mc-meet",
+  "version": "0.1.0",
+  "description": "Streams Google Meet captions, chat and participants to the meeting-capture app.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqfnZJHhf77rtyA1cka4V9OE0BP3SmT7n45W/JbAiRll4ovp1bg5EJnKVoUkh88/r406o1NptMZZz+eK16z+t7w7KSJav1znsrCNTf6DwnPD3ulmnoW72N1yE2Rze9uvMxAeGCUHu9axJzzRRDsxtT4meJ4qRKbb4XrpJVF6eT3Sec/sW4cdBTF7tnS21prU+bSx/oKScKlK84xShw545d9YS7Qt+MyggCwI3kRwifiv3kmPq7wKqVRsPox8l8hnsoKjZgcr1v6xdOkXMTYcDXlWsdt6JE0+YA8fjT763L1HDelVOSUyuiUaINgkJvNobJZi9G3q0bFS+fqnVt6np6QIDAQAB",
+  "minimum_chrome_version": "116",
+  "permissions": ["nativeMessaging", "storage", "unlimitedStorage", "alarms", "scripting"],
+  "host_permissions": ["https://meet.google.com/*"],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["page/wire.js", "page-hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://meet.google.com/*"],
+      "js": ["content/selectors.js", "content/dom-readers.js", "content/main.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
