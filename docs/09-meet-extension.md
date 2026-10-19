@@ -26,7 +26,8 @@ flowchart LR
 | Call events | `extension/call-events.js`, MAIN world, isolated world and service worker | Builds every event the extension sends, one function per `kind`, in the shapes below. |
 | Page hook | `extension/page-hook.js` and `extension/page/wire.js`, MAIN world, `document_start` | Wraps `RTCPeerConnection` and decodes Meet's `collections`, `captions`, `captions_v2` and `meet_messages` data channels. Opens the two caption channels itself. |
 | Content script | `extension/content/`, isolated world | Finds call start and end, reads the DOM when the channels give nothing, and owns the call session for its tab. |
-| Service worker | `extension/background.js` | Holds the native port, numbers and queues events, resends after a reconnect. |
+| Session rules | `extension/session-rules.js`, service worker | Decides what each tab message, tab change and alarm does to the worker's sessions. Numbers events. Makes no `chrome.*` calls and reads no clock, so it also runs in Node. |
+| Service worker | `extension/background.js` | Stores the session state and queued events in one write, holds the native port, resends after a reconnect. |
 | Host mode | `crates/native-host`, run by the app binary | Chrome starts `meeting-capture chrome-extension://<id>/`. `main` sees the argument and relays frames between stdio and the app socket before Tauri starts. |
 | Call log | `crates/app/src/browser_calls.rs` | Listens on the socket, appends each event to the session log, acks it, ends calls, hands logs to intake. |
 | Parser | `crates/sources/src/browser_call.rs` | Turns a session log into a `Transcript`. |

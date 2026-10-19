@@ -1,34 +1,25 @@
 // Service worker. It numbers call events, keeps each one in chrome.storage.local until the app
 // acks it, and holds the native messaging port to the app. Chrome may stop this worker at any
-// time, so every piece of state that matters lives in storage.
+// time, so every piece of state that matters lives in storage. session-rules.js decides what each
+// tab message, tab change and alarm does; this file reads and writes storage and runs the effects.
 //
-// Storage keys:
-//   nextSeq       the next event seq for this install
+// Storage keys: one per field of the session state in session-rules.js, plus
 //   q:<seq>       an event message waiting for its ack
-//   tabSessions   { [tabId]: session_id } for tabs in a call
-//   lastN         { [session_id]: n } the last content script event number stored. One small
-//                 entry per call; never pruned.
-//   pendingEnds   { [session_id]: { tab_id, at_ms } } sessions whose page went away
-//   endedSessions the last session IDs that got a call_ended, newest last
 
-import "./call-events.js";
+import { decide, hasOpenSessions, restoreState, STATE_KEYS } from "./session-rules.js";
 
 const HOST_NAME = "com.meetingcapture.app";
 const PROTOCOL = 1;
-// A page that unloads mid-call has this long to come back to the same session.
-const RESUME_WINDOW_MS = 5 * 60 * 1000;
 const BACKOFF_MIN_MS = 1000;
 const BACKOFF_MAX_MS = 60000;
 const RECONNECT_ALARM = "mc-meet-reconnect";
 const PENDING_END_ALARM = "mc-meet-pending-end";
 const QUEUE_PREFIX = "q:";
-const ENDED_SESSIONS_KEPT = 50;
 
 let nativePort = null;
 let isWelcomed = false;
 let backoffMs = BACKOFF_MIN_MS;
 let reconnectTimer = null;
-let nextSeq = null;
 
 // Every storage change and native send runs on this chain, so seq order holds on the wire.
 let chain = Promise.resolve();
@@ -38,212 +29,108 @@ function serially(task) {
   return run;
 }
 
-async function readState() {
-  const stored = await chrome.storage.local.get([
-    "tabSessions",
-    "lastN",
-    "pendingEnds",
-    "endedSessions",
-  ]);
-  return {
-    tabSessions: stored.tabSessions ?? {},
-    lastN: stored.lastN ?? {},
-    pendingEnds: stored.pendingEnds ?? {},
-    endedSessions: stored.endedSessions ?? [],
-  };
-}
+// The worker's only storage access. A Map-backed object with the same four methods can stand in
+// for chrome.storage.local.
+const store = {
+  readState: () => chrome.storage.local.get(STATE_KEYS),
 
-function markEnded(state, sessionId) {
-  state.endedSessions = [...state.endedSessions.filter((s) => s !== sessionId), sessionId].slice(
-    -ENDED_SESSIONS_KEPT,
-  );
-}
+  // The state and its queued events land in one write, so a stop between them cannot lose an
+  // event or store it twice.
+  async commit(state, queued) {
+    const messages = Object.fromEntries(queued.map((m) => [`${QUEUE_PREFIX}${m.seq}`, m]));
+    await chrome.storage.local.set({ ...state, ...messages });
+  },
 
-// A fresh install starts at the install time in microseconds. A reinstall mid-call resumes the
-// tab's session, and the app drops any seq that session's log already has.
-async function takeSeq() {
-  if (nextSeq === null)
-    nextSeq = (await chrome.storage.local.get("nextSeq")).nextSeq ?? Date.now() * 1000;
-  const seq = nextSeq;
-  nextSeq += 1;
-  return seq;
-}
+  // Returns the acked message, or undefined when it was already gone.
+  async removeAcked(seq) {
+    const key = `${QUEUE_PREFIX}${seq}`;
+    const acked = (await chrome.storage.local.get(key))[key];
+    await chrome.storage.local.remove(key);
+    return acked;
+  },
 
-// Stores one event with its seq, plus any state changes, in a single write. Runs on the chain.
-async function storeEvent(sessionId, event, extraState = {}) {
-  const seq = await takeSeq();
-  const message = { type: "event", seq, session_id: sessionId, event };
-  await chrome.storage.local.set({ nextSeq, [`${QUEUE_PREFIX}${seq}`]: message, ...extraState });
-  if (nativePort && isWelcomed) nativePort.postMessage(message);
-  else ensureNative();
-  return seq;
-}
+  async unacked() {
+    const stored = await chrome.storage.local.get(null);
+    return Object.entries(stored)
+      .filter(([key]) => key.startsWith(QUEUE_PREFIX))
+      .map(([, message]) => message)
+      .sort((a, b) => a.seq - b.seq);
+  },
+};
 
-function setDiscardable(tabId, isDiscardable) {
-  chrome.tabs.update(Number(tabId), { autoDiscardable: isDiscardable }).catch(() => {});
-}
-
-// Ends a session the worker tracks. Runs on the chain.
-async function endSession(state, sessionId, reason, atMs) {
-  for (const [tabId, tabSession] of Object.entries(state.tabSessions)) {
-    if (tabSession !== sessionId) continue;
-    delete state.tabSessions[tabId];
-    setDiscardable(tabId, true);
+// Applies one input to the stored state. Runs on the chain. port is the tab's port, if any.
+async function apply(input, port) {
+  const nowMs = Date.now();
+  const state = restoreState(await store.readState(), nowMs);
+  const decision = decide(state, input, nowMs);
+  if (decision.state !== state) await store.commit(decision.state, decision.queued);
+  for (const message of decision.queued) {
+    if (nativePort && isWelcomed) nativePort.postMessage(message);
+    else ensureNative();
   }
-  delete state.pendingEnds[sessionId];
-  markEnded(state, sessionId);
-  await storeEvent(sessionId, globalThis.mcMeetCallEvents.callEnded({ atMs, reason }), state);
+  for (const effect of decision.effects) await runEffect(effect, port);
 }
 
-// A tab starts or resumes a session. Any other session of that tab is over.
-async function attachTab(state, tabId, sessionId) {
-  const previous = state.tabSessions[tabId];
-  if (previous && previous !== sessionId) {
-    const unloadedMs = state.pendingEnds[previous]?.at_ms ?? Date.now();
-    await endSession(state, previous, "page_unload", unloadedMs);
+async function runEffect(effect, port) {
+  switch (effect.kind) {
+    case "stored":
+      tellTab(port, { type: "stored", session_id: effect.sessionId, n: effect.n });
+      return;
+    case "session_ended":
+      tellTab(port, { type: "session_ended", session_id: effect.sessionId });
+      return;
+    case "set_discardable":
+      chrome.tabs
+        .update(Number(effect.tabId), { autoDiscardable: effect.isDiscardable })
+        .catch(() => {});
+      return;
+    case "set_pending_alarm":
+      await chrome.alarms.create(PENDING_END_ALARM, { when: effect.whenMs });
+      return;
+    case "clear_pending_alarm":
+      await chrome.alarms.clear(PENDING_END_ALARM);
+      return;
   }
-  state.tabSessions[tabId] = sessionId;
-  delete state.pendingEnds[sessionId];
-  setDiscardable(tabId, false);
+}
+
+function tellTab(port, message) {
+  try {
+    port.postMessage(message);
+  } catch {}
 }
 
 // ---- Content script ports.
-
-async function onTabMessage(port, message) {
-  const tabId = port.sender?.tab?.id;
-  if (tabId === undefined) return;
-  if (message.type === "resume") {
-    const state = await readState();
-    // The worker already ended this session: the page came back too late.
-    if (state.endedSessions.includes(message.session_id)) {
-      tellSessionEnded(port, message.session_id);
-      return;
-    }
-    await attachTab(state, tabId, message.session_id);
-    await chrome.storage.local.set(state);
-    await schedulePendingEnds(state);
-    return;
-  }
-  if (message.type !== "event") return;
-  const state = await readState();
-  const sessionId = message.session_id;
-  if ((state.lastN[sessionId] ?? 0) >= message.n) {
-    reply(port, sessionId, message.n);
-    return;
-  }
-  const event = message.event;
-  if (state.endedSessions.includes(sessionId) && event.kind !== "call_ended") {
-    reply(port, sessionId, message.n);
-    tellSessionEnded(port, sessionId);
-    return;
-  }
-  if (event.kind === "call_started") {
-    event.tab_id = tabId;
-    await attachTab(state, tabId, sessionId);
-  }
-  if (event.kind === "call_ended") {
-    delete state.tabSessions[tabId];
-    delete state.pendingEnds[sessionId];
-    markEnded(state, sessionId);
-    setDiscardable(tabId, true);
-  }
-  // Kept after the call ends too, so a late resend of call_ended is not stored twice.
-  state.lastN[sessionId] = message.n;
-  await storeEvent(sessionId, event, state);
-  await schedulePendingEnds(state);
-  reply(port, sessionId, message.n);
-}
-
-function reply(port, sessionId, n) {
-  try {
-    port.postMessage({ type: "stored", session_id: sessionId, n });
-  } catch {}
-}
-
-function tellSessionEnded(port, sessionId) {
-  try {
-    port.postMessage({ type: "session_ended", session_id: sessionId });
-  } catch {}
-}
-
-// The page of a tab in a call went away: a reload, a navigation or a crash. The call ends
-// unless the same tab resumes the session within the window.
-async function onTabGone(tabId) {
-  const state = await readState();
-  const sessionId = state.tabSessions[tabId];
-  if (!sessionId || state.pendingEnds[sessionId]) return;
-  state.pendingEnds[sessionId] = { tab_id: Number(tabId), at_ms: Date.now() };
-  await chrome.storage.local.set({ pendingEnds: state.pendingEnds });
-  await schedulePendingEnds(state);
-}
-
-async function schedulePendingEnds(state) {
-  const dueTimes = Object.values(state.pendingEnds).map((p) => p.at_ms + RESUME_WINDOW_MS);
-  if (dueTimes.length === 0) {
-    await chrome.alarms.clear(PENDING_END_ALARM);
-    return;
-  }
-  await chrome.alarms.create(PENDING_END_ALARM, {
-    when: Math.max(Math.min(...dueTimes), Date.now() + 1000),
-  });
-}
-
-async function endDuePendingSessions() {
-  const state = await readState();
-  const nowMs = Date.now();
-  for (const [sessionId, pending] of Object.entries(state.pendingEnds)) {
-    if (pending.at_ms + RESUME_WINDOW_MS <= nowMs) {
-      await endSession(state, sessionId, "page_unload", pending.at_ms);
-    }
-  }
-  await schedulePendingEnds(state);
-}
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "mc-meet-tab") return;
   const tabId = port.sender?.tab?.id;
   port.onMessage.addListener((message) => {
-    serially(() => onTabMessage(port, message));
+    if (tabId === undefined) return;
+    serially(() => apply({ kind: "tab_message", tabId, message }, port));
   });
   port.onDisconnect.addListener(() => {
     void chrome.runtime.lastError;
-    if (tabId !== undefined) serially(() => onTabGone(tabId));
+    if (tabId !== undefined) serially(() => apply({ kind: "tab_gone", tabId }));
   });
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
-  serially(async () => {
-    const state = await readState();
-    const sessionId = state.tabSessions[tabId];
-    if (sessionId) await endSession(state, sessionId, "tab_closed", Date.now());
-    await schedulePendingEnds(state);
-  });
+  serially(() => apply({ kind: "tab_closed", tabId }));
 });
 
 // ---- Native port to the app.
 
 async function hasWork() {
-  const stored = await chrome.storage.local.get(null);
-  if (Object.keys(stored).some((key) => key.startsWith(QUEUE_PREFIX))) return true;
-  return (
-    Object.keys(stored.tabSessions ?? {}).length > 0 ||
-    Object.keys(stored.pendingEnds ?? {}).length > 0
-  );
+  if ((await store.unacked()).length > 0) return true;
+  return hasOpenSessions(restoreState(await store.readState(), Date.now()));
 }
 
 async function resendUnacked() {
-  const stored = await chrome.storage.local.get(null);
-  const messages = Object.entries(stored)
-    .filter(([key]) => key.startsWith(QUEUE_PREFIX))
-    .map(([, message]) => message)
-    .sort((a, b) => a.seq - b.seq);
-  for (const message of messages) nativePort?.postMessage(message);
+  for (const message of await store.unacked()) nativePort?.postMessage(message);
 }
 
 async function onAck(seq) {
-  const key = `${QUEUE_PREFIX}${seq}`;
-  const acked = (await chrome.storage.local.get(key))[key];
-  await chrome.storage.local.remove(key);
+  const acked = await store.removeAcked(seq);
   // After the last call ends and nothing is left to send, close the port so the host can exit.
   // Only a call_ended ack can make the worker idle, so only that ack pays for the full check.
   if (acked?.event?.kind !== "call_ended") return;
@@ -314,29 +201,19 @@ function ensureNative() {
 }
 
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === PENDING_END_ALARM) serially(endDuePendingSessions);
+  if (alarm.name === PENDING_END_ALARM) serially(() => apply({ kind: "pending_due" }));
   if (alarm.name === RECONNECT_ALARM) ensureNative();
 });
 
-// A session whose tab no longer exists lost its page with no tab close seen: a browser restart
-// or crash, or the extension was off. A restored tab may still resume it.
+// Sessions whose tab no longer exists wait for a restored tab to resume them.
 async function holdSessionsOfMissingTabs() {
-  const state = await readState();
-  const nowMs = Date.now();
-  let isChanged = false;
-  for (const [tabId, sessionId] of Object.entries(state.tabSessions)) {
+  const { tabSessions } = restoreState(await store.readState(), Date.now());
+  const tabIds = [];
+  for (const tabId of Object.keys(tabSessions)) {
     const tab = await chrome.tabs.get(Number(tabId)).catch(() => undefined);
-    if (tab) continue;
-    state.pendingEnds[sessionId] ??= { tab_id: null, at_ms: nowMs };
-    delete state.tabSessions[tabId];
-    isChanged = true;
+    if (!tab) tabIds.push(tabId);
   }
-  if (!isChanged) return;
-  await chrome.storage.local.set({
-    tabSessions: state.tabSessions,
-    pendingEnds: state.pendingEnds,
-  });
-  await schedulePendingEnds(state);
+  await apply({ kind: "tabs_missing", tabIds });
 }
 
 // An update or reload orphans the content scripts in open Meet tabs. Inject fresh ones; they
