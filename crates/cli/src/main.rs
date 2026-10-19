@@ -35,6 +35,13 @@ enum Command {
         #[arg(long)]
         discard_edits: bool,
     },
+    /// Join two TranscripTonic meetings of one call into the first, then rewrite its note.
+    Merge {
+        /// The meeting that keeps its note.
+        kept_id: i64,
+        /// The meeting that leaves the store. Its note is left for you to remove.
+        dropped_id: i64,
+    },
     /// Resume a failed meeting at the step that failed.
     Retry { meeting_id: i64 },
     /// Run only the extraction for a meeting and print the checked notes as JSON. Writes nothing.
@@ -86,6 +93,20 @@ fn main() -> anyhow::Result<()> {
         } => {
             let id = MeetingId::new(meeting_id);
             print_outcome(id, &pipeline.reprocess(id, discard_edits)?, &time_zone);
+        }
+        Command::Merge {
+            kept_id,
+            dropped_id,
+        } => {
+            let id = MeetingId::new(kept_id);
+            let dropped_note = pipeline.merge(id, MeetingId::new(dropped_id))?;
+            print_outcome(id, &pipeline.run(id)?, &time_zone);
+            if let Some(note_path) = dropped_note {
+                println!(
+                    "      remove the note of {dropped_id}: {}",
+                    note_path.display()
+                );
+            }
         }
         Command::Retry { meeting_id } => {
             let id = MeetingId::new(meeting_id);

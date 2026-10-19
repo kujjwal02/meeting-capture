@@ -31,7 +31,7 @@ use crate::render::NoteInput;
 use crate::settings::{AppDirs, LlmSettings, Settings, SettingsError, SettingsStore};
 use crate::vault::Vault;
 
-pub use crate::intake::{InputError, Intake, IntakeError};
+pub use crate::intake::{InputError, Intake, IntakeError, MergeError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {

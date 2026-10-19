@@ -203,6 +203,81 @@ fn meet_code_from_title(title: &str) -> Option<&str> {
     is_meet_code.then_some(code)
 }
 
+/// Joins two advanced bodies of one call that TranscripTonic filed as two meetings. The result
+/// starts at the earlier start, ends at the later end and keeps the earlier title, since
+/// TranscripTonic retitles the second part "Google Meet". Caption blocks and chat messages are
+/// the union of both, one per speaker and start time. Where both have a block, the longer text
+/// wins, since a block grows until its speaker stops.
+///
+/// # Errors
+///
+/// Returns `ParseError` when either body is not a valid advanced body.
+///
+/// # Panics
+///
+/// Never: a JSON map always serializes.
+pub fn merge_payloads(payload: &[u8], other_payload: &[u8]) -> Result<Vec<u8>, ParseError> {
+    let (first, second) = {
+        let started_at = |payload: &[u8]| parse(payload).map(|transcript| transcript.started_at);
+        if started_at(payload)? <= started_at(other_payload)? {
+            (payload, other_payload)
+        } else {
+            (other_payload, payload)
+        }
+    };
+    let mut merged: serde_json::Map<String, serde_json::Value> = from_json(first)?;
+    let second: serde_json::Map<String, serde_json::Value> = from_json(second)?;
+    let ended_at = |body: &serde_json::Map<String, serde_json::Value>| {
+        body.get("meetingEndTimestamp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|at| at.parse::<Timestamp>().ok())
+    };
+    if ended_at(&second) > ended_at(&merged)
+        && let Some(end) = second.get("meetingEndTimestamp")
+    {
+        merged.insert("meetingEndTimestamp".to_owned(), end.clone());
+    }
+    for (list, text_key) in [
+        ("transcript", "transcriptText"),
+        ("chatMessages", "chatMessageText"),
+    ] {
+        let mut by_start: std::collections::BTreeMap<(String, String), serde_json::Value> =
+            std::collections::BTreeMap::new();
+        let entries = [&merged, &second]
+            .into_iter()
+            .filter_map(|body| body.get(list).and_then(serde_json::Value::as_array))
+            .flatten();
+        for entry in entries {
+            let field = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned()
+            };
+            let text_len = |entry: &serde_json::Value| {
+                entry
+                    .get(text_key)
+                    .and_then(serde_json::Value::as_str)
+                    .map_or(0, str::len)
+            };
+            // Timestamp first, so the merged list is in time order.
+            let key = (field("timestamp"), field("personName"));
+            match by_start.get(&key) {
+                Some(kept) if text_len(kept) >= text_len(entry) => {}
+                Some(_) | None => {
+                    by_start.insert(key, entry.clone());
+                }
+            }
+        }
+        merged.insert(
+            list.to_owned(),
+            serde_json::Value::Array(by_start.into_values().collect()),
+        );
+    }
+    Ok(serde_json::to_vec(&merged).expect("a JSON map always serializes"))
+}
+
 /// Saves a raw payload in `payload_dir` under a name no other payload has, synced to disk.
 ///
 /// TranscripTonic marks a meeting posted on a 2xx reply and never sends it again, so the payload
