@@ -9,9 +9,10 @@ vault.
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS%20(Apple%20silicon)-lightgrey)
 
 > [!NOTE]
-> v0.3.0 is an early release for Apple silicon Macs. It turns Google Meet captions, read by the
-> mc-meet extension, and Slack huddle captions into notes. Call detection, audio capture, local
-> speech-to-text and the Windows build are on the [roadmap](docs/03-roadmap.md). The app is built
+> v0.4.0 is an early release for Apple silicon Macs. It turns Google Meet captions, read by the
+> mc-meet extension, and Slack huddle captions into notes, and logs when each call starts and ends.
+> Audio capture, Teams and Zoom detection, local speech-to-text and the Windows build are on the
+> [roadmap](docs/03-roadmap.md). The app is built
 > for one person's machines, so expect rough edges.
 
 ## Why
