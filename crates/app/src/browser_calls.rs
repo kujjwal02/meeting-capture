@@ -1,70 +1,37 @@
 //! Receives mc-meet's call events through host mode: appends each to its session log, acks it,
 //! ends calls, shows what the extension reports, and turns each finished log into a meeting.
 
+mod call_book;
 mod call_log;
 mod log_folder;
 
-use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use jiff::{SignedDuration, Timestamp};
 use jobs::InputKind;
 use native_host::frames::{LengthOrder, read_frame, write_frame};
 use native_host::socket::{AppEnd, CallListener};
 use pipeline::{InputError, Intake, IntakeError, Pipeline};
 use serde::{Deserialize, Serialize};
-use sources::browser_call::{CallEvent, CallStart, EndReason, HealthSource};
+use sources::browser_call::HealthSource;
 use tauri::{AppHandle, Manager as _};
 use tokio::io::{AsyncWrite, ReadHalf};
 use tracing::Instrument as _;
 
-use self::call_log::CallLog;
+use self::call_book::{CallBook, EventError, Logged, Now};
 use self::log_folder::LogFolder;
 use crate::AppState;
 
 /// The protocol this app speaks. An extension that says an older one gets a tray warning.
 const PROTOCOL: u32 = 1;
-/// A call no extension port holds ends this long after its last event.
-const IDLE_CALL_END: Duration = Duration::from_mins(5);
-/// A new session of a meeting whose call ended this long ago or less joins that call's log.
-const REJOIN_WINDOW: SignedDuration = SignedDuration::from_mins(10);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-const MAX_SESSION_ID_CHARS: usize = 64;
 
-/// The open calls and the extension ports, shared by every connection.
-#[derive(Default)]
+/// The call book, shared by every connection.
 pub(crate) struct BrowserCalls {
-    registry: Mutex<Registry>,
+    book: Mutex<CallBook>,
     next_port_id: AtomicU64,
-}
-
-#[derive(Default)]
-struct Registry {
-    /// Open calls by log path. Sessions that rejoined a meeting share its log.
-    open_calls: HashMap<PathBuf, OpenCall>,
-    /// The log path of each open session.
-    open_sessions: HashMap<String, PathBuf>,
-    /// Ports that said `hello`, by port id, with the protocol each said.
-    greeted_ports: HashMap<u64, u32>,
-}
-
-struct OpenCall {
-    log: CallLog,
-    /// The sessions writing to the log. The call ends when the last one ends.
-    sessions: HashSet<String>,
-    /// The first session's start, which names the call.
-    start: Option<CallStart>,
-    /// The ports that sent an event for the call since it opened.
-    holder_ports: HashSet<u64>,
-    last_event_at: Instant,
-    /// The latest event time in the call.
-    last_at: Option<Timestamp>,
-    caption_source: Option<HealthSource>,
-    health_problem: Option<String>,
 }
 
 /// What the tray shows for mc-meet.
@@ -84,29 +51,20 @@ pub(crate) struct CallStatus {
 }
 
 impl BrowserCalls {
-    fn lock(&self) -> MutexGuard<'_, Registry> {
-        self.registry.lock().unwrap_or_else(PoisonError::into_inner)
+    /// The calls whose logs go in `log_dir`.
+    pub fn new(log_dir: PathBuf) -> Self {
+        Self {
+            book: Mutex::new(CallBook::new(LogFolder::new(log_dir))),
+            next_port_id: AtomicU64::new(0),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, CallBook> {
+        self.book.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn status(&self) -> BrowserCallStatus {
-        let registry = self.lock();
-        let mut calls: Vec<(&PathBuf, &OpenCall)> = registry.open_calls.iter().collect();
-        calls.sort_by_key(|(log_path, _)| *log_path);
-        BrowserCallStatus {
-            is_connected: !registry.greeted_ports.is_empty(),
-            is_extension_outdated: registry
-                .greeted_ports
-                .values()
-                .any(|&protocol| protocol < PROTOCOL),
-            calls: calls
-                .into_iter()
-                .map(|(_, call)| CallStatus {
-                    title: call.title(),
-                    caption_source: call.caption_source,
-                    health_problem: call.health_problem.clone(),
-                })
-                .collect(),
-        }
+        self.lock().status()
     }
 }
 
@@ -145,33 +103,11 @@ enum AppMessage {
     },
 }
 
-/// What the app did with one event.
-enum Logged {
-    Appended,
-    /// The log already had the event's `seq`.
-    Duplicate,
-    /// The event ended its call; the log is complete.
-    Ended(PathBuf),
-}
-
-#[derive(Debug, thiserror::Error)]
-enum EventError {
-    #[error(
-        "field `session_id` must be 1 to {MAX_SESSION_ID_CHARS} letters, digits or hyphens, \
-         not {0:?}"
-    )]
-    InvalidSessionId(String),
-    #[error("field `event` is not a valid call event: {0}")]
-    InvalidEvent(serde_json::Error),
-    #[error("could not write the browser call log: {0}")]
-    Write(#[from] std::io::Error),
-}
-
 pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
     let state = app.state::<AppState>();
     let app_dirs = state.settings.app_dirs();
     register_host(app_dirs.host_manifest_dir());
-    let logs = LogFolder::new(app_dirs.browser_call_log_dir());
+    let logs = state.browser_calls.lock().logs().clone();
     // Before the listener starts, so a resent event cannot reopen a log this is closing.
     match logs.finish_open_logs() {
         Ok(log_paths) => {
@@ -185,7 +121,7 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
         }
     }
     let socket = app_dirs.browser_call_socket().to_path_buf();
-    tauri::async_runtime::spawn(listen(app.clone(), Arc::clone(pipeline), socket, logs));
+    tauri::async_runtime::spawn(listen(app.clone(), Arc::clone(pipeline), socket));
     tauri::async_runtime::spawn(end_idle_calls(app.clone(), Arc::clone(pipeline)));
 }
 
@@ -239,7 +175,7 @@ fn record_left_over(app: &AppHandle, pipeline: &Pipeline, log_paths: Vec<PathBuf
     }
 }
 
-async fn listen(app: AppHandle, pipeline: Arc<Pipeline>, socket: PathBuf, logs: LogFolder) {
+async fn listen(app: AppHandle, pipeline: Arc<Pipeline>, socket: PathBuf) {
     let mut listener = match CallListener::bind(&socket) {
         Ok(listener) => listener,
         Err(error) => {
@@ -261,7 +197,6 @@ async fn listen(app: AppHandle, pipeline: Arc<Pipeline>, socket: PathBuf, logs: 
                 let port = Port {
                     app: app.clone(),
                     pipeline: Arc::clone(&pipeline),
-                    logs: logs.clone(),
                     id: port_id,
                 };
                 tauri::async_runtime::spawn(port.serve(connection).instrument(span));
@@ -279,7 +214,6 @@ async fn listen(app: AppHandle, pipeline: Arc<Pipeline>, socket: PathBuf, logs: 
 struct Port {
     app: AppHandle,
     pipeline: Arc<Pipeline>,
-    logs: LogFolder,
     id: u64,
 }
 
@@ -290,12 +224,7 @@ impl Port {
             Ok(()) => tracing::info!("port closed"),
             Err(error) => tracing::warn!(exception.message = %error, "port closed on an error"),
         }
-        let mut registry = self.calls().lock();
-        registry.greeted_ports.remove(&self.id);
-        for call in registry.open_calls.values_mut() {
-            call.holder_ports.remove(&self.id);
-        }
-        drop(registry);
+        self.calls().lock().close_port(self.id);
         crate::tray::refresh(&self.app);
     }
 
@@ -341,11 +270,7 @@ impl Port {
                         browser.extension.protocol = protocol,
                         "mc-meet connected"
                     );
-                    let open_sessions = {
-                        let mut registry = self.calls().lock();
-                        registry.greeted_ports.insert(self.id, protocol);
-                        registry.open_sessions.keys().cloned().collect()
-                    };
+                    let open_sessions = self.calls().lock().greet(self.id, protocol);
                     crate::tray::refresh(&self.app);
                     let welcome = AppMessage::Welcome {
                         protocol: PROTOCOL,
@@ -369,8 +294,7 @@ impl Port {
         Ok(())
     }
 
-    /// Logs one event and reports whether to ack it. An event that cannot be written is not
-    /// acked, so the extension resends it after the next `welcome`.
+    /// Logs one event and reports whether to ack it.
     fn take_event(&self, seq: u64, session_id: String, event: &serde_json::Value) -> bool {
         let span = tracing::info_span!(
             "browser_call.event",
@@ -378,168 +302,39 @@ impl Port {
             browser_call.session_id = session_id
         );
         let _entered = span.enter();
-        let logged = self.log_event(seq, session_id, event);
+        let logged = self
+            .calls()
+            .lock()
+            .take_event(self.id, seq, session_id, event, Now::read());
         crate::tray::refresh(&self.app);
-        match logged {
-            Ok(Logged::Appended | Logged::Duplicate) => true,
+        match &logged {
+            Ok(Logged::Appended | Logged::Duplicate) => {}
             Ok(Logged::Ended(log_path)) => {
                 let (app, pipeline) = (self.app.clone(), Arc::clone(&self.pipeline));
+                let log_path = log_path.clone();
                 tauri::async_runtime::spawn_blocking(move || {
                     record_and_run(&app, &pipeline, &log_path);
                 });
-                true
             }
-            // Resending cannot fix it, so the ack drops it from the extension's queue.
             Err(error @ (EventError::InvalidSessionId(_) | EventError::InvalidEvent(_))) => {
                 tracing::warn!(exception.message = %error, "dropped an event that is not valid");
-                true
             }
             Err(error @ EventError::Write(_)) => {
                 tracing::error!(exception.message = %error, "could not log an event");
-                false
             }
         }
-    }
-
-    fn log_event(
-        &self,
-        seq: u64,
-        session_id: String,
-        raw_event: &serde_json::Value,
-    ) -> Result<Logged, EventError> {
-        if !is_valid_session_id(&session_id) {
-            return Err(EventError::InvalidSessionId(session_id));
-        }
-        let event = CallEvent::deserialize(raw_event).map_err(EventError::InvalidEvent)?;
-        let is_end = event.ends_call();
-        let mut guard = self.calls().lock();
-        let registry = &mut *guard;
-        let log_path = if let Some(log_path) = registry.open_sessions.get(&session_id) {
-            log_path.clone()
-        } else {
-            let Some(log_path) = self.open_session(registry, &session_id, seq, &event)? else {
-                return Ok(Logged::Duplicate);
-            };
-            log_path
-        };
-        let call = registry
-            .open_calls
-            .get_mut(&log_path)
-            .ok_or_else(|| std::io::Error::other("an open session has no open call"))?;
-        if call.log.has_seq(seq) {
-            return Ok(Logged::Duplicate);
-        }
-        call.log.append(Some(seq), raw_event, is_end)?;
-        call.holder_ports.insert(self.id);
-        call.last_event_at = Instant::now();
-        call.last_at = call.last_at.max(event.at());
-        note_event(call, &event);
-        if !is_end {
-            return Ok(Logged::Appended);
-        }
-        call.sessions.remove(&session_id);
-        registry.open_sessions.remove(&session_id);
-        if !call.sessions.is_empty() {
-            tracing::info!("browser call session ended; another session goes on");
-            return Ok(Logged::Appended);
-        }
-        registry.open_calls.remove(&log_path);
-        tracing::info!("browser call ended");
-        Ok(Logged::Ended(log_path))
-    }
-
-    /// Opens the log of a session this run has not seen and returns its path. That is the log
-    /// it wrote before a resend or late events, else the log of the meeting it rejoined, else a
-    /// new log. Returns `None` when the log already has `seq`.
-    fn open_session(
-        &self,
-        registry: &mut Registry,
-        session_id: &str,
-        seq: u64,
-        event: &CallEvent,
-    ) -> Result<Option<PathBuf>, EventError> {
-        let log_path = if let Some(log_path) = self.logs.find(session_id)? {
-            log_path
-        } else if let Some(log_path) = self.rejoined_log(registry, event)? {
-            self.logs.record_rejoin(session_id, &log_path)?;
-            tracing::info!(file.path = %log_path.display(), "browser call rejoined");
-            log_path
-        } else {
-            let started_at = event.at().unwrap_or_else(Timestamp::now);
-            let log = self.logs.create(started_at, session_id)?;
-            tracing::info!(file.path = %log.path().display(), "browser call started");
-            let log_path = log.path().to_path_buf();
-            registry
-                .open_calls
-                .insert(log_path.clone(), OpenCall::new(log, None));
-            log_path
-        };
-        let call = match registry.open_calls.entry(log_path.clone()) {
-            Entry::Occupied(open) => open.into_mut(),
-            // One that already ended: a resend after a quit, late events after an idle end, or
-            // a rejoin.
-            Entry::Vacant(ended) => {
-                let (log, summary) = CallLog::reopen(&log_path)?;
-                if log.has_seq(seq) {
-                    return Ok(None);
-                }
-                tracing::info!(file.path = %log_path.display(), "browser call reopened");
-                ended.insert(OpenCall::new(log, summary.start))
-            }
-        };
-        if call.log.has_seq(seq) {
-            return Ok(None);
-        }
-        call.sessions.insert(session_id.to_owned());
-        registry
-            .open_sessions
-            .insert(session_id.to_owned(), log_path.clone());
-        Ok(Some(log_path))
-    }
-
-    // A new session of a meeting with an open call, or one that ended within `REJOIN_WINDOW`,
-    // joins its log: the user left and joined again, or joined from a new tab after a crash.
-    fn rejoined_log(
-        &self,
-        registry: &Registry,
-        event: &CallEvent,
-    ) -> std::io::Result<Option<PathBuf>> {
-        let meeting_code = CallStart::from_event(event).and_then(|start| start.meeting_code);
-        let (Some(at), Some(meeting_code)) = (event.at(), meeting_code) else {
-            return Ok(None);
-        };
-        let open = registry.open_calls.iter().find(|(_, call)| {
-            call.start
-                .as_ref()
-                .is_some_and(|start| start.meeting_code.as_ref() == Some(&meeting_code))
-        });
-        if let Some((log_path, _)) = open {
-            return Ok(Some(log_path.clone()));
-        }
-        let since = at
-            .checked_sub(REJOIN_WINDOW)
-            .map_err(std::io::Error::other)?;
-        self.logs.find_rejoinable(&meeting_code, since)
+        is_acked(&logged)
     }
 }
 
-impl OpenCall {
-    fn new(log: CallLog, start: Option<CallStart>) -> Self {
-        Self {
-            log,
-            sessions: HashSet::new(),
-            start,
-            holder_ports: HashSet::new(),
-            last_event_at: Instant::now(),
-            last_at: None,
-            caption_source: None,
-            health_problem: None,
-        }
-    }
-
-    fn title(&self) -> Option<String> {
-        let start = self.start.as_ref()?;
-        start.title.clone().or_else(|| start.meeting_code.clone())
+// An event that cannot be written is not acked, so the extension resends it after the next
+// `welcome`. One that is not valid is acked: resending cannot fix it, and the ack drops it from
+// the extension's queue.
+fn is_acked(logged: &Result<Logged, EventError>) -> bool {
+    match logged {
+        Ok(Logged::Appended | Logged::Duplicate | Logged::Ended(_))
+        | Err(EventError::InvalidSessionId(_) | EventError::InvalidEvent(_)) => true,
+        Err(EventError::Write(_)) => false,
     }
 }
 
@@ -551,98 +346,16 @@ async fn send(
     write_frame(to_host, LengthOrder::Little, &frame).await
 }
 
-// The session id names the log file, so it must not hold a path separator.
-fn is_valid_session_id(session_id: &str) -> bool {
-    (1..=MAX_SESSION_ID_CHARS).contains(&session_id.len())
-        && session_id
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || character == '-')
-}
-
-// Keeps what the tray shows about the call current.
-fn note_event(call: &mut OpenCall, event: &CallEvent) {
-    match event {
-        CallEvent::CallStarted { .. } => {
-            if call.start.is_none() {
-                call.start = CallStart::from_event(event);
-            }
-        }
-        CallEvent::Health {
-            source,
-            captions_on,
-            parse_failures,
-            detail,
-            ..
-        } => {
-            call.caption_source = Some(*source);
-            let problem = match source {
-                HealthSource::None => Some("no captions found"),
-                HealthSource::Channel | HealthSource::Dom if !captions_on => {
-                    Some("captions are off")
-                }
-                HealthSource::Channel | HealthSource::Dom if *parse_failures > 0 => {
-                    Some("some captions could not be read")
-                }
-                HealthSource::Channel | HealthSource::Dom => None,
-            };
-            call.health_problem = problem.map(|problem| match detail {
-                Some(detail) if !detail.trim().is_empty() => format!("{problem}: {detail}"),
-                Some(_) | None => problem.to_owned(),
-            });
-            if let Some(problem) = &call.health_problem {
-                tracing::warn!(exception.message = problem, "mc-meet health problem");
-            }
-        }
-        CallEvent::Caption { .. }
-        | CallEvent::Chat { .. }
-        | CallEvent::Roster { .. }
-        | CallEvent::CallEnded { .. }
-        | CallEvent::Unknown => {}
-    }
-}
-
-// Ends each call no port has held for `IDLE_CALL_END` since its last event: the browser quit or
-// crashed without a `call_ended`.
+// A browser that quit or crashed sends no `call_ended`, so a timer ends its calls.
 async fn end_idle_calls(app: AppHandle, pipeline: Arc<Pipeline>) {
     let mut interval = tokio::time::interval(IDLE_CHECK_INTERVAL);
     loop {
         interval.tick().await;
-        let ended = {
-            let calls = &app.state::<AppState>().browser_calls;
-            let mut registry = calls.lock();
-            let idle_logs: Vec<PathBuf> = registry
-                .open_calls
-                .iter()
-                .filter(|(_, call)| {
-                    call.holder_ports.is_empty() && call.last_event_at.elapsed() >= IDLE_CALL_END
-                })
-                .map(|(log_path, _)| log_path.clone())
-                .collect();
-            idle_logs
-                .into_iter()
-                .filter_map(|log_path| {
-                    let mut call = registry.open_calls.remove(&log_path)?;
-                    for session_id in &call.sessions {
-                        registry.open_sessions.remove(session_id);
-                    }
-                    let at = call.last_at.unwrap_or_else(Timestamp::now);
-                    if let Err(error) = call.log.end(at, EndReason::Idle) {
-                        // Left open, so the next start ends it.
-                        tracing::error!(
-                            file.path = %call.log.path().display(),
-                            exception.message = %error,
-                            "could not end an idle browser call"
-                        );
-                        return None;
-                    }
-                    tracing::info!(
-                        file.path = %call.log.path().display(),
-                        "idle browser call ended"
-                    );
-                    Some(call.log.path().to_path_buf())
-                })
-                .collect::<Vec<_>>()
-        };
+        let ended = app
+            .state::<AppState>()
+            .browser_calls
+            .lock()
+            .end_idle_calls(Now::read());
         if ended.is_empty() {
             continue;
         }
