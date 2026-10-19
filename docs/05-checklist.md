@@ -181,6 +181,29 @@ Done when:
 - [ ] A calendar sign-in still works after 8 days.
 - [ ] Windows build checked on the PC.
 
+## Phase 1b: mc-meet extension
+
+[Spec](09-meet-extension.md).
+
+- [x] `mc merge <kept-id> <dropped-id>` joins two TranscripTonic meetings of one call. Meetings 32
+  and 33 of 2026-10-19 merged.
+- [x] `attendees` lists only people who joined: the roster, else speakers and chat senders plus
+  you. Calendar invitees go to `invited`, with their response kept in the stored match.
+- [ ] Host mode in the app binary relays native messaging frames to the app socket, and starts
+  the app when it is not running.
+- [ ] The app writes the host manifest for each Chromium browser on every start.
+- [ ] Browser call events: one JSONL log per session, acked, ended on `call_ended` or 5 minutes
+  without a port, closed after a crash. `InputKind::BrowserCallLog` and its parser.
+- [ ] mc-meet extension: data channel decoder, DOM fallback, session per tab, acked resend, no
+  telemetry.
+- [ ] Tray line: extension connected, current call, caption source, last health problem.
+- [ ] TranscripTonic uninstalled; caption receiver and its docs removed.
+
+Done when:
+
+- [ ] 3 Meet calls, one with a second Meet tab, one browser restart and one app quit mid-call,
+  each give one note whose attendees joined the call.
+
 ## Phase 2: call detection
 
 - [ ] `detect` reports when an app takes or releases the mic, and which app.
@@ -229,7 +252,6 @@ Done when:
 ## Phase 6: extra sources
 
 - [ ] Hinglish calls routed to Soniox.
-- [ ] Meet REST API fills a call TranscripTonic missed.
 - [ ] Dropped audio files transcribed.
 - [ ] Calendar match from Google Calendar's "secret address in iCal format", with no OAuth sign-in
   and no "Google hasn't verified this app" screen. The URL is a secret, so it goes in
@@ -239,7 +261,7 @@ Done when:
 Done when:
 
 - [ ] A Hinglish call gets a Soniox transcript.
-- [ ] The Meet API fills a missed call.
+- [ ] An iCal address matches a call with no Google sign-in.
 
 ## Phase 7: recording
 
