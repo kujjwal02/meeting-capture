@@ -517,6 +517,7 @@ fn source_name(transcript: &Transcript) -> &'static str {
         sources::Source::MeetApi => "meet-api",
         sources::Source::AudioFile => "audio-file",
         sources::Source::SlackHuddle => "slack-huddle",
+        sources::Source::MeetExtension => "meet-extension",
     }
 }
 

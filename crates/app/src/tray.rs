@@ -7,6 +7,7 @@ use huddle_captions::HuddleHealth;
 use jobs::{JobState, Meeting, MeetingId};
 use pipeline::settings::SettingsStore;
 use pipeline::{Pipeline, has_user_edits};
+use sources::browser_call::HealthSource;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Manager, Wry};
@@ -123,6 +124,7 @@ fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
     };
     menu.append(&label_entry(app, &listener_label)?)?;
     append_huddle_status(app, &menu, &state)?;
+    append_browser_call_status(app, &menu, &state)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
 
     if let Some(pipeline) = &state.pipeline {
@@ -190,6 +192,39 @@ fn append_huddle_status(app: &AppHandle, menu: &Menu<Wry>, state: &AppState) -> 
         }
     };
     menu.append(&label_entry(app, &label)?)
+}
+
+// One line for the extension, and one per open Meet call.
+fn append_browser_call_status(
+    app: &AppHandle,
+    menu: &Menu<Wry>,
+    state: &AppState,
+) -> tauri::Result<()> {
+    let status = state.browser_calls.status();
+    let extension_label = match (status.is_connected, status.is_extension_outdated) {
+        (false, _) => "mc-meet: not connected",
+        (true, false) => "mc-meet: connected",
+        (true, true) => "mc-meet: connected, reload it in chrome://extensions",
+    };
+    menu.append(&label_entry(app, extension_label)?)?;
+    for call in status.calls {
+        let title = shorten(call.title.as_deref().unwrap_or("call"), MAX_TITLE_CHARS);
+        let label = match (call.health_problem, call.caption_source) {
+            (Some(problem), _) => {
+                format!("Meet {title}: {}", shorten(&problem, MAX_REASON_CHARS))
+            }
+            (None, None) => format!("Meet {title}: waiting for captions"),
+            (None, Some(HealthSource::Channel)) => {
+                format!("Meet {title}: reading captions from the call")
+            }
+            (None, Some(HealthSource::Dom)) => {
+                format!("Meet {title}: reading captions from the page")
+            }
+            (None, Some(HealthSource::None)) => format!("Meet {title}: no captions found"),
+        };
+        menu.append(&label_entry(app, &label)?)?;
+    }
+    Ok(())
 }
 
 // A line per account. One that needs to sign in again opens the settings window.

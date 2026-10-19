@@ -1,4 +1,4 @@
-//! Intake: reads an input file, parses it with the parser for its kind, skips a short huddle when
+//! Intake: reads an input file, parses it with the parser for its kind, skips a short call when
 //! the tray asks, copies the file into the app folder for its kind when it is not there yet, and
 //! records the meeting.
 
@@ -9,10 +9,10 @@ use sources::Transcript;
 
 use crate::Pipeline;
 
-// A huddle with almost no captions was most likely a misclick or a quick check.
+// A call with almost no captions was most likely a misclick or a quick check.
 const MIN_CAPTION_SEGMENTS: usize = 3;
 
-/// What intake did with a huddle log the tray passed.
+/// What intake did with a call log the tray passed.
 #[derive(Debug, Clone, Copy)]
 pub enum Intake {
     Recorded(MeetingId),
@@ -32,6 +32,8 @@ pub enum InputError {
     ParseTranscriptonic(#[from] sources::transcriptonic::ParseError),
     #[error(transparent)]
     ParseSlackHuddle(#[from] sources::slack_huddle::ParseError),
+    #[error(transparent)]
+    ParseBrowserCall(#[from] sources::browser_call::ParseError),
 }
 
 /// Why intake could not record a meeting for an input.
@@ -82,27 +84,27 @@ impl Pipeline {
         self.record(kind, input_path, &input, &transcript)
     }
 
-    /// Takes in a huddle log as `take_in` does, but skips a huddle shorter than
-    /// `min_huddle_seconds` or with fewer than `MIN_CAPTION_SEGMENTS` caption segments. The tray
-    /// does this. The log stays, so `mc ingest` can still write its note.
+    /// Takes in a call log as `take_in` does, but skips a call shorter than `min_call_seconds`
+    /// or with fewer than `MIN_CAPTION_SEGMENTS` caption segments. The tray does this. The log
+    /// stays, so `mc ingest` can still write its note.
     ///
     /// # Errors
     ///
     /// Returns the errors of `take_in`.
-    pub fn take_in_huddle_log_unless_short(
+    pub fn take_in_unless_short(
         &self,
+        kind: InputKind,
         log_path: &Path,
-        min_huddle_seconds: u32,
+        min_call_seconds: u32,
     ) -> Result<Intake, IntakeError> {
-        let kind = InputKind::SlackHuddleLog;
         let (input, transcript) = read_as(kind, log_path)?;
         let length_s = transcript.duration().as_secs();
         let segments = transcript.segments.len();
-        if length_s < i64::from(min_huddle_seconds) || segments < MIN_CAPTION_SEGMENTS {
+        if length_s < i64::from(min_call_seconds) || segments < MIN_CAPTION_SEGMENTS {
             tracing::info!(
-                huddle.length_s = length_s,
+                call.length_s = length_s,
                 caption.segments = segments,
-                "short huddle; no note"
+                "short call; no note"
             );
             return Ok(Intake::TooShort);
         }
@@ -132,6 +134,12 @@ impl Pipeline {
                     return Err(MergeError::NotMergeable {
                         id,
                         kind: "Slack huddle",
+                    });
+                }
+                InputKind::BrowserCallLog => {
+                    return Err(MergeError::NotMergeable {
+                        id,
+                        kind: "browser call",
                     });
                 }
             }
@@ -190,12 +198,7 @@ impl Pipeline {
         match kind {
             InputKind::TranscriptonicPayload => {
                 let payload_dir = self.app_dirs.payload_dir();
-                // Canonical first, so a bare file name passed from inside the folder has a parent.
-                let is_in_place = std::fs::canonicalize(input_path).is_ok_and(|path| {
-                    path.parent()
-                        .is_some_and(|input_dir| is_same_file(input_dir, &payload_dir))
-                });
-                if is_in_place {
+                if is_in_dir(input_path, &payload_dir) {
                     return Ok(input_path.to_path_buf());
                 }
                 sources::transcriptonic::save_payload(&payload_dir, input)
@@ -212,8 +215,32 @@ impl Pipeline {
                 }
                 Ok(log_path)
             }
+            // Named for its start time and session when the app wrote it. One from elsewhere
+            // keeps its own name.
+            InputKind::BrowserCallLog => {
+                let log_dir = self.app_dirs.browser_call_log_dir();
+                if is_in_dir(input_path, &log_dir) {
+                    return Ok(input_path.to_path_buf());
+                }
+                let Some(file_name) = input_path.file_name() else {
+                    return Err(copy_error(log_dir)(std::io::Error::from(
+                        std::io::ErrorKind::InvalidInput,
+                    )));
+                };
+                let log_path = log_dir.join(file_name);
+                std::fs::copy(input_path, &log_path).map_err(copy_error(log_dir))?;
+                Ok(log_path)
+            }
         }
     }
+}
+
+// Canonical first, so a bare file name passed from inside the folder has a parent.
+fn is_in_dir(path: &Path, dir: &Path) -> bool {
+    std::fs::canonicalize(path).is_ok_and(|path| {
+        path.parent()
+            .is_some_and(|parent_dir| is_same_file(parent_dir, dir))
+    })
 }
 
 // Canonical paths, so a relative or symlinked path from `mc ingest` still counts as in place.
@@ -253,5 +280,6 @@ fn parse(kind: InputKind, input: &[u8]) -> Result<Transcript, InputError> {
     match kind {
         InputKind::TranscriptonicPayload => Ok(sources::transcriptonic::parse(input)?),
         InputKind::SlackHuddleLog => Ok(sources::slack_huddle::parse(input)?),
+        InputKind::BrowserCallLog => Ok(sources::browser_call::parse(input)?),
     }
 }

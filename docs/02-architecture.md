@@ -240,7 +240,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 Every source produces this shape before the pipeline runs:
 
 ```yaml
-source: transcriptonic | slack-huddle | recorder | meet-api | audio-file
+source: transcriptonic | slack-huddle | meet-extension | recorder | meet-api | audio-file
 started_at: 2026-10-16T05:30:00Z
 ended_at: 2026-10-16T06:10:00Z
 platform: meet | teams | zoom | slack | other

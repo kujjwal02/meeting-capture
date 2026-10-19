@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use directories::ProjectDirs;
 
@@ -9,6 +9,7 @@ use super::SettingsError;
 pub struct AppDirs {
     pub(super) config_dir: PathBuf,
     data_dir: PathBuf,
+    browser_call_socket: PathBuf,
 }
 
 impl AppDirs {
@@ -21,16 +22,20 @@ impl AppDirs {
     pub fn locate() -> Result<Self, SettingsError> {
         if let Some(home) = std::env::var_os("MEETING_CAPTURE_HOME") {
             let home = PathBuf::from(home);
+            let data_dir = home.join("data");
             return Ok(Self {
                 config_dir: home.join("config"),
-                data_dir: home.join("data"),
+                browser_call_socket: browser_call_socket(&data_dir, true),
+                data_dir,
             });
         }
         let project = ProjectDirs::from("com", "ujjwalkumar", "meetingcapture")
             .ok_or(SettingsError::NoHomeDir)?;
+        let data_dir = project.data_dir().to_path_buf();
         Ok(Self {
             config_dir: project.config_dir().to_path_buf(),
-            data_dir: project.data_dir().to_path_buf(),
+            browser_call_socket: browser_call_socket(&data_dir, false),
+            data_dir,
         })
     }
 
@@ -44,6 +49,7 @@ impl AppDirs {
             &self.config_dir,
             &self.payload_dir(),
             &self.huddle_log_dir(),
+            &self.browser_call_log_dir(),
             &self.note_staging_dir(),
             &self.log_dir(),
         ] {
@@ -83,6 +89,26 @@ impl AppDirs {
         self.data_dir.join("huddles")
     }
 
+    /// Raw inputs: one log per browser call, as the app wrote it from mc-meet's events.
+    #[must_use]
+    pub fn browser_call_log_dir(&self) -> PathBuf {
+        self.data_dir.join("browser-calls")
+    }
+
+    /// Holds the native messaging host manifest on Windows.
+    #[must_use]
+    pub fn host_manifest_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Where the tray app listens for host mode: a Unix socket path, or a Windows named pipe
+    /// name. Host mode connects to the same place, so both must see the same
+    /// `MEETING_CAPTURE_HOME`.
+    #[must_use]
+    pub fn browser_call_socket(&self) -> &Path {
+        &self.browser_call_socket
+    }
+
     /// Layout profiles that override the built-in ones, for a Slack release the app does not
     /// know yet.
     #[must_use]
@@ -107,4 +133,29 @@ impl AppDirs {
     pub fn note_staging_dir(&self) -> PathBuf {
         self.data_dir.join("note-staging")
     }
+}
+
+#[cfg(not(windows))]
+fn browser_call_socket(data_dir: &Path, _is_home_override: bool) -> PathBuf {
+    data_dir.join("browser-calls.sock")
+}
+
+// A named pipe lives outside the data folder. A dev home gets its own pipe, so a dev run never
+// takes the installed app's calls.
+#[cfg(windows)]
+fn browser_call_socket(data_dir: &Path, is_home_override: bool) -> PathBuf {
+    use std::fmt::Write as _;
+
+    use sha2::{Digest as _, Sha256};
+
+    let user_name = std::env::var("USERNAME").unwrap_or_default();
+    let mut pipe_name = format!(r"\\.\pipe\meeting-capture-{user_name}");
+    if is_home_override {
+        pipe_name.push('-');
+        let digest = Sha256::digest(data_dir.to_string_lossy().as_bytes());
+        for byte in &digest[..4] {
+            let _ = write!(pipe_name, "{byte:02x}");
+        }
+    }
+    PathBuf::from(pipe_name)
 }

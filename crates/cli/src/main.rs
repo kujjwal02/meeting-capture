@@ -23,7 +23,7 @@ struct Cli {
 enum Command {
     /// Add a saved input as a new meeting and process it.
     Ingest {
-        /// A TranscripTonic advanced webhook body, or a Slack huddle log.
+        /// A TranscripTonic advanced webhook body, a Slack huddle log or a browser call log.
         input_file: PathBuf,
         #[arg(long, value_enum, default_value_t = InputKindArg::TranscriptonicPayload)]
         kind: InputKindArg,
@@ -165,6 +165,7 @@ fn main() -> anyhow::Result<()> {
 enum InputKindArg {
     TranscriptonicPayload,
     SlackHuddleLog,
+    BrowserCallLog,
 }
 
 impl From<InputKindArg> for InputKind {
@@ -172,6 +173,7 @@ impl From<InputKindArg> for InputKind {
         match kind {
             InputKindArg::TranscriptonicPayload => InputKind::TranscriptonicPayload,
             InputKindArg::SlackHuddleLog => InputKind::SlackHuddleLog,
+            InputKindArg::BrowserCallLog => InputKind::BrowserCallLog,
         }
     }
 }

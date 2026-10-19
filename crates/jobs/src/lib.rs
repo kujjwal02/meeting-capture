@@ -85,15 +85,22 @@ pub enum InputKind {
     TranscriptonicPayload,
     /// A Slack huddle log written by the huddle watcher, one JSON line per event.
     SlackHuddleLog,
+    /// A browser call log written by the app from mc-meet's events, one JSON line per event.
+    BrowserCallLog,
 }
 
 impl InputKind {
-    const ALL: [InputKind; 2] = [InputKind::TranscriptonicPayload, InputKind::SlackHuddleLog];
+    const ALL: [InputKind; 3] = [
+        InputKind::TranscriptonicPayload,
+        InputKind::SlackHuddleLog,
+        InputKind::BrowserCallLog,
+    ];
 
     fn as_str(self) -> &'static str {
         match self {
             InputKind::TranscriptonicPayload => "transcriptonic-payload",
             InputKind::SlackHuddleLog => "slack-huddle-log",
+            InputKind::BrowserCallLog => "browser-call-log",
         }
     }
 }
