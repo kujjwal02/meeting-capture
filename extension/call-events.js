@@ -1,7 +1,8 @@
 // Call events in the wire shapes of docs/09-meet-extension.md. Every event the extension sends
 // is built here, so the schema has one owner. A plain script with no imports or exports: the
-// manifest loads it before page/wire.js in the MAIN world and before the content scripts in the
-// isolated world, and session-rules.js imports it for its side effect.
+// manifest loads it before the content scripts, and session-rules.js imports it for its side
+// effect. Chrome injects a file into one world of a tab only, so the MAIN world's page hook sends
+// readings and the content script builds the events.
 // Times go in as milliseconds and out as RFC 3339 UTC strings.
 globalThis.mcMeetCallEvents = Object.freeze({
   // The worker fills in tab_id: a content script cannot read it.

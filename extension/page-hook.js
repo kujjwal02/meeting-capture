@@ -53,7 +53,7 @@
   }
 
   const reader = wire.createMeetReader({
-    emit: (event) => post({ t: "event", event }),
+    emit: (reading) => post({ t: "reading", reading }),
     notice: (notice) => post({ t: "notice", notice }),
   });
 
@@ -200,7 +200,7 @@
     postHookState();
     if (isFirstListener) for (const message of earlyMessages.splice(0)) post(message);
     const roster = reader.lastRoster();
-    if (roster) post({ t: "event", event: roster });
+    if (roster) post({ t: "reading", reading: roster });
   });
 
   // The content script may have loaded first and missed nothing but this signal.

@@ -1,11 +1,10 @@
-// Protobuf wire decoder and Meet frame reader. Runs in the Meet page (MAIN world) after
-// call-events.js and before page-hook.js, and in Node for the fixture script, which loads
-// call-events.js first. It touches no DOM and no network.
+// Protobuf wire decoder and Meet frame reader. Runs in the Meet page (MAIN world) before
+// page-hook.js, and in Node for the fixture script. It touches no DOM and no network.
+// It reports readings with camelCase fields; the content script turns them into call events,
+// since Chrome injects call-events.js into one world of a tab only.
 // Field numbers and their sources are in extension/PROTOCOL-NOTES.md.
 (() => {
   if (globalThis.mcMeetWire) return;
-
-  const callEvents = globalThis.mcMeetCallEvents;
 
   class WireError extends Error {}
 
@@ -390,7 +389,8 @@
     return { raw: 0, parsed: 0, control: 0, rejected: 0, consecutive: 0 };
   }
 
-  // emit(event) receives caption, chat and roster events in the spec's shapes. notice(notice)
+  // emit(reading) receives caption, chat and roster readings: the fields of
+  // call-events.js's builder of the same kind, plus kind. notice(notice)
   // receives { kind: "parse_gap" | "self_removed" } notices for the content script, which never
   // reach the app.
   function createMeetReader({ now = () => Date.now(), emit, notice = () => {} }) {
@@ -447,19 +447,13 @@
     function emitRosterIfChanged() {
       const participants = [...devices.entries()]
         .filter(([, d]) => !d.parentDeviceId && d.name && !ABSENT_STATUSES.has(d.status))
-        .map(([deviceId, d]) =>
-          callEvents.rosterParticipant({
-            deviceId,
-            name: d.name,
-            isSelf: deviceId === selfDeviceId,
-          }),
-        )
-        .sort((a, b) => (a.device_id < b.device_id ? -1 : a.device_id > b.device_id ? 1 : 0));
+        .map(([deviceId, d]) => ({ deviceId, name: d.name, isSelf: deviceId === selfDeviceId }))
+        .sort((a, b) => (a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0));
       if (participants.length === 0) return;
       const key = JSON.stringify(participants);
       if (key === lastRosterKey) return;
       lastRosterKey = key;
-      lastRoster = callEvents.roster({ atMs: now(), participants });
+      lastRoster = { kind: "roster", atMs: now(), participants };
       emit(lastRoster);
     }
 
@@ -486,16 +480,15 @@
         if (chatIds.has(chat.messageId)) continue;
         chatIds.add(chat.messageId);
         if (chatIds.size > MAX_CHATS) chatIds.delete(chatIds.values().next().value);
-        emit(
-          callEvents.chat({
-            atMs: chatTime(chat.sentMs, arrivedMs),
-            messageId: chat.messageId,
-            deviceId: chat.deviceId,
-            sender: nameOf(chat.deviceId),
-            text: chat.text,
-            source: "channel",
-          }),
-        );
+        emit({
+          kind: "chat",
+          atMs: chatTime(chat.sentMs, arrivedMs),
+          messageId: chat.messageId,
+          deviceId: chat.deviceId,
+          sender: nameOf(chat.deviceId),
+          text: chat.text,
+          source: "channel",
+        });
       }
     }
 
@@ -518,17 +511,16 @@
       const firstAtMs = known?.firstAtMs ?? now();
       utterances.set(key, { version, text: caption.text, firstAtMs });
       if (utterances.size > MAX_UTTERANCES) utterances.delete(utterances.keys().next().value);
-      emit(
-        callEvents.caption({
-          atMs: firstAtMs,
-          deviceId: caption.deviceId,
-          utteranceId,
-          version,
-          speaker: nameOf(caption.deviceId),
-          text: caption.text,
-          source: "channel",
-        }),
-      );
+      emit({
+        kind: "caption",
+        atMs: firstAtMs,
+        deviceId: caption.deviceId,
+        utteranceId,
+        version,
+        speaker: nameOf(caption.deviceId),
+        text: caption.text,
+        source: "channel",
+      });
     }
 
     // Decodes one data channel frame. Returns { ack } for a captions_v2 caption, so the
