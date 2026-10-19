@@ -10,6 +10,7 @@ use pipeline::Pipeline;
 use tauri::{AppHandle, Manager as _};
 
 use crate::AppState;
+use crate::calls::{CallEndReason, CallPlatform};
 use crate::finished_logs::{self, LogSource};
 use crate::notify;
 
@@ -33,6 +34,9 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
     // Before the watcher starts, so it cannot touch a log the watcher is writing.
     match huddle_captions::finish_open_logs(&paths.log_dir) {
         Ok(logs) => {
+            state
+                .calls
+                .end_at_launch(&logs.ended_paths, CallPlatform::SlackHuddle);
             let (app, pipeline) = (app.clone(), Arc::clone(pipeline));
             tauri::async_runtime::spawn_blocking(move || {
                 let min_call_seconds = min_huddle_seconds(&app);
@@ -40,7 +44,7 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
                     &app,
                     &pipeline,
                     LogSource::SlackHuddle,
-                    logs,
+                    logs.log_paths,
                     min_call_seconds,
                 );
             });
@@ -88,7 +92,9 @@ impl Reporter {
                 );
             }
             Notice::PermissionGranted => self.set_status(HuddleStatus::Idle),
-            Notice::HuddleStarted { channel, .. } => {
+            Notice::HuddleStarted { log_path, channel } => {
+                self.calls()
+                    .open(&log_path, CallPlatform::SlackHuddle, Some(channel.clone()));
                 self.set_status(HuddleStatus::Reading {
                     channel,
                     health: None,
@@ -115,6 +121,8 @@ impl Reporter {
                 }
             }
             Notice::HuddleEnded { log_path, .. } => {
+                // The watcher gives no reason; the window closing is the usual one.
+                self.calls().end(&log_path, CallEndReason::WindowClosed);
                 self.set_status(HuddleStatus::Idle);
                 self.notified.retain(|(path, _)| *path != log_path);
                 let (app, pipeline) = (self.app.clone(), Arc::clone(&self.pipeline));
@@ -124,6 +132,10 @@ impl Reporter {
             }
             Notice::Problem { message } => notify(&self.app, "Slack huddle captions", &message),
         }
+    }
+
+    fn calls(&self) -> &crate::calls::Calls {
+        &self.app.state::<AppState>().inner().calls
     }
 
     fn set_status(&self, status: HuddleStatus) {

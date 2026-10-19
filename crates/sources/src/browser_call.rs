@@ -94,18 +94,24 @@ impl CallEvent {
         }
     }
 
-    /// Whether the event ends its call.
+    /// Why the call ended, for an event that ends its call.
     #[must_use]
-    pub fn ends_call(&self) -> bool {
+    pub fn end_reason(&self) -> Option<EndReason> {
         match self {
-            CallEvent::CallEnded { .. } => true,
+            CallEvent::CallEnded { reason, .. } => Some(*reason),
             CallEvent::CallStarted { .. }
             | CallEvent::Caption { .. }
             | CallEvent::Chat { .. }
             | CallEvent::Roster { .. }
             | CallEvent::Health { .. }
-            | CallEvent::Unknown => false,
+            | CallEvent::Unknown => None,
         }
+    }
+
+    /// Whether the event ends its call.
+    #[must_use]
+    pub fn ends_call(&self) -> bool {
+        self.end_reason().is_some()
     }
 }
 

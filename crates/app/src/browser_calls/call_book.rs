@@ -47,6 +47,9 @@ struct OpenCall {
     last_at: Option<Timestamp>,
     caption_source: Option<HealthSource>,
     health_problem: Option<String>,
+    /// Whether the book returned `Opened` for the call. Set only after a write, so a resent
+    /// first event still reports it when the first write failed.
+    is_reported: bool,
 }
 
 /// One clock reading, taken by the caller for one input.
@@ -70,10 +73,19 @@ impl Now {
 /// What the book did with one event.
 pub(super) enum Logged {
     Appended,
+    /// The call's first event written since it opened in this run, other than an end.
+    Opened {
+        log_path: PathBuf,
+        /// The title Meet showed, else the meeting code.
+        title: Option<String>,
+    },
     /// The log already had the event's `seq`.
     Duplicate,
     /// The event ended its call; the log is complete.
-    Ended(PathBuf),
+    Ended {
+        log_path: PathBuf,
+        reason: EndReason,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -131,7 +143,8 @@ impl CallBook {
             return Err(EventError::InvalidSessionId(session_id));
         }
         let event = CallEvent::deserialize(raw_event).map_err(EventError::InvalidEvent)?;
-        let is_end = event.ends_call();
+        let end_reason = event.end_reason();
+        let is_end = end_reason.is_some();
         let log_path = if let Some(log_path) = self.open_sessions.get(&session_id) {
             log_path.clone()
         } else {
@@ -153,9 +166,16 @@ impl CallBook {
         call.last_event_at = now.instant;
         call.last_at = call.last_at.max(event.at());
         call.note_event(&event);
-        if !is_end {
+        let Some(reason) = end_reason else {
+            if !call.is_reported {
+                call.is_reported = true;
+                return Ok(Logged::Opened {
+                    title: call.title(),
+                    log_path,
+                });
+            }
             return Ok(Logged::Appended);
-        }
+        };
         call.sessions.remove(&session_id);
         self.open_sessions.remove(&session_id);
         if !call.sessions.is_empty() {
@@ -164,7 +184,7 @@ impl CallBook {
         }
         self.close_call(&log_path);
         tracing::info!("browser call ended");
-        Ok(Logged::Ended(log_path))
+        Ok(Logged::Ended { log_path, reason })
     }
 
     /// Ends each call no port has held for `IDLE_CALL_END` since its last event: the browser
@@ -308,6 +328,7 @@ impl OpenCall {
             last_at: None,
             caption_source: None,
             health_problem: None,
+            is_reported: false,
         }
     }
 

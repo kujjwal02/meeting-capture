@@ -21,6 +21,7 @@ mod tracker;
 use std::path::{Path, PathBuf};
 
 pub use log::finish_open_logs;
+pub use sources::append_log::FinishedLogs;
 pub use sources::slack_huddle::HuddleHealth;
 
 /// Read before each huddle step, so a settings change applies without a restart.

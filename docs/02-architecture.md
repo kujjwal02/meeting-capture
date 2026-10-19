@@ -121,11 +121,14 @@ flowchart LR
   left open and records any with no meeting.
 - macOS only. On Windows the crate starts nothing until a UI Automation adapter exists.
 
-### Audio (phases 2, 3, 5, 7)
+### Audio (phases 2, 3, 3b, 5, 7)
 
 ```mermaid
 flowchart LR
-    DET["detect"] -->|call started / ended| APP["app"]
+    MEET["mc-meet events"] --> CALLS["app: calls"]
+    HUD["huddle watcher"] --> CALLS
+    DET["detect"] -->|mic taken / released| CALLS
+    CALLS -->|call started / ended| APP["app"]
     APP --> CAP["capture"]
     APP --> OBS["obs-control"]
     CAP -->|PCM frames| APP
@@ -133,7 +136,11 @@ flowchart LR
     STEM --> MEDIA[("mic.wav + remote.wav")]
 ```
 
-- `detect` reports when an app takes or releases the mic, and which app.
+- The app's `calls` module turns each source's reports into one call stream: `call.started`,
+  `call.resumed` and `call.ended`, each with `call.id`, `call.platform` and `call.title`. The id is
+  the source's log path. A Meet rejoin within 10 minutes resumes the same call. Capture subscribes
+  to the stream.
+- `detect` (phase 3b) reports when an app takes or releases the mic, and which app.
 - `capture` has one `CallAudioSource` trait. The macOS build uses a Core Audio tap; the Windows
   build uses WASAPI process loopback. Both use `cpal` for the mic.
 - The app connects `capture` to `stem-writer`. Neither crate knows about the other.
@@ -213,7 +220,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 | jobs | 1 | One row per meeting with a closed state enum and the extraction retry schedule. Runs a meeting's steps under its lease: one run per meeting across processes, renewed from a second thread, given back however the run ends | `rusqlite`, `tracing` |
 | cli | 1 | `mc`: rerun any job step or ingest a file, without Tauri | `clap` |
 | app | 1 | Tray, settings, "Note written" notifications, permission prompts, review of extracted commitments | Tauri 2, plugin `notification` 2 |
-| detect | 2 | Emit "call started" and "call ended" when an app takes or releases the mic | Vendored from Anarlog `crates/detect` (MIT) |
+| detect | 3b | Emit "call started" and "call ended" when an app takes or releases the mic | Vendored from Anarlog `crates/detect` (MIT) |
 | capture | 3, 5 | One `CallAudioSource` trait; per-OS adapters emit timestamped PCM frames | Mac: Core Audio tap via `cidre`. Windows: WASAPI process loopback via `wasapi`. Mic: `cpal`. Adapted from Anarlog `crates/audio-actual` |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV, flushed every few seconds | `hound` |
 | stt | 4 | VAD, Parakeet TDT 0.6B v3 int8, diarization of the remote stem | `sherpa-onnx` |
