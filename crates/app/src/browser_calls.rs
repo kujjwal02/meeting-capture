@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use jobs::InputKind;
 use native_host::frames::{LengthOrder, read_frame, write_frame};
 use native_host::socket::{AppEnd, CallListener};
@@ -28,6 +28,8 @@ use crate::AppState;
 const PROTOCOL: u32 = 1;
 /// A call no extension port holds ends this long after its last event.
 const IDLE_CALL_END: Duration = Duration::from_mins(5);
+/// A new session of a meeting whose call ended this long ago or less joins that call's log.
+const REJOIN_WINDOW: SignedDuration = SignedDuration::from_mins(10);
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_SESSION_ID_CHARS: usize = 64;
 
@@ -40,13 +42,19 @@ pub(crate) struct BrowserCalls {
 
 #[derive(Default)]
 struct Registry {
-    open_calls: HashMap<String, OpenCall>,
+    /// Open calls by log path. Sessions that rejoined a meeting share its log.
+    open_calls: HashMap<PathBuf, OpenCall>,
+    /// The log path of each open session.
+    open_sessions: HashMap<String, PathBuf>,
     /// Ports that said `hello`, by port id, with the protocol each said.
     greeted_ports: HashMap<u64, u32>,
 }
 
 struct OpenCall {
     log: CallLog,
+    /// The sessions writing to the log. The call ends when the last one ends.
+    sessions: HashSet<String>,
+    meeting_code: Option<String>,
     /// The ports that sent an event for the call since it opened.
     holder_ports: HashSet<u64>,
     last_event_at: Instant,
@@ -80,8 +88,8 @@ impl BrowserCalls {
 
     pub fn status(&self) -> BrowserCallStatus {
         let registry = self.lock();
-        let mut calls: Vec<(&String, &OpenCall)> = registry.open_calls.iter().collect();
-        calls.sort_by_key(|(session_id, _)| *session_id);
+        let mut calls: Vec<(&PathBuf, &OpenCall)> = registry.open_calls.iter().collect();
+        calls.sort_by_key(|(log_path, _)| *log_path);
         BrowserCallStatus {
             is_connected: !registry.greeted_ports.is_empty(),
             is_extension_outdated: registry
@@ -337,7 +345,7 @@ impl Port {
                     let open_sessions = {
                         let mut registry = self.calls().lock();
                         registry.greeted_ports.insert(self.id, protocol);
-                        registry.open_calls.keys().cloned().collect()
+                        registry.open_sessions.keys().cloned().collect()
                     };
                     crate::tray::refresh(&self.app);
                     let welcome = AppMessage::Welcome {
@@ -405,55 +413,136 @@ impl Port {
         }
         let event = CallEvent::deserialize(raw_event).map_err(EventError::InvalidEvent)?;
         let is_end = call_log::is_end(&event);
-        let mut registry = self.calls().lock();
-        let call = match registry.open_calls.entry(session_id.clone()) {
-            Entry::Occupied(open) => {
-                let call = open.into_mut();
-                if call.log.has_seq(seq) {
-                    return Ok(Logged::Duplicate);
-                }
-                call
-            }
-            // A call this run has not seen, or one that already ended: a resend after a quit,
-            // or late events after an idle end.
-            Entry::Vacant(unseen) => {
-                let log = if let Some(log_path) = call_log::find(&self.log_dir, unseen.key())? {
-                    let log = CallLog::reopen(&log_path)?;
-                    if log.has_seq(seq) {
-                        return Ok(Logged::Duplicate);
-                    }
-                    tracing::info!(file.path = %log_path.display(), "browser call reopened");
-                    log
-                } else {
-                    let started_at = event.at().unwrap_or_else(Timestamp::now);
-                    let log = CallLog::create(&self.log_dir, started_at, unseen.key())?;
-                    tracing::info!(file.path = %log.path().display(), "browser call started");
-                    log
-                };
-                let title = read_title(log.path());
-                unseen.insert(OpenCall {
-                    log,
-                    holder_ports: HashSet::new(),
-                    last_event_at: Instant::now(),
-                    last_at: None,
-                    title,
-                    caption_source: None,
-                    health_problem: None,
-                })
-            }
+        let mut guard = self.calls().lock();
+        let registry = &mut *guard;
+        let log_path = if let Some(log_path) = registry.open_sessions.get(&session_id) {
+            log_path.clone()
+        } else {
+            let Some(log_path) = self.open_session(registry, &session_id, seq, &event)? else {
+                return Ok(Logged::Duplicate);
+            };
+            log_path
         };
+        let call = registry
+            .open_calls
+            .get_mut(&log_path)
+            .ok_or_else(|| std::io::Error::other("an open session has no open call"))?;
+        if call.log.has_seq(seq) {
+            return Ok(Logged::Duplicate);
+        }
         call.log.append(Some(seq), raw_event, is_end)?;
         call.holder_ports.insert(self.id);
         call.last_event_at = Instant::now();
         call.last_at = call.last_at.max(event.at());
         note_event(call, &event);
-        if is_end {
-            let ended = registry.open_calls.remove(&session_id);
-            let log_path = ended.map(|call| call.log.path().to_path_buf());
-            tracing::info!("browser call ended");
-            return Ok(log_path.map_or(Logged::Appended, Logged::Ended));
+        if !is_end {
+            return Ok(Logged::Appended);
         }
-        Ok(Logged::Appended)
+        call.sessions.remove(&session_id);
+        registry.open_sessions.remove(&session_id);
+        if !call.sessions.is_empty() {
+            tracing::info!("browser call session ended; another session goes on");
+            return Ok(Logged::Appended);
+        }
+        registry.open_calls.remove(&log_path);
+        tracing::info!("browser call ended");
+        Ok(Logged::Ended(log_path))
+    }
+
+    /// Opens the log of a session this run has not seen and returns its path. That is the log
+    /// it wrote before a resend or late events, else the log of the meeting it rejoined, else a
+    /// new log. Returns `None` when the log already has `seq`.
+    fn open_session(
+        &self,
+        registry: &mut Registry,
+        session_id: &str,
+        seq: u64,
+        event: &CallEvent,
+    ) -> Result<Option<PathBuf>, EventError> {
+        let log_path = if let Some(log_path) = call_log::find(&self.log_dir, session_id)? {
+            log_path
+        } else if let Some(log_path) = self.rejoined_log(registry, event)? {
+            call_log::record_rejoin(&self.log_dir, session_id, &log_path)?;
+            tracing::info!(file.path = %log_path.display(), "browser call rejoined");
+            log_path
+        } else {
+            let started_at = event.at().unwrap_or_else(Timestamp::now);
+            let log = CallLog::create(&self.log_dir, started_at, session_id)?;
+            tracing::info!(file.path = %log.path().display(), "browser call started");
+            let log_path = log.path().to_path_buf();
+            registry
+                .open_calls
+                .insert(log_path.clone(), OpenCall::new(log));
+            log_path
+        };
+        let call = match registry.open_calls.entry(log_path.clone()) {
+            Entry::Occupied(open) => open.into_mut(),
+            // One that already ended: a resend after a quit, late events after an idle end, or
+            // a rejoin.
+            Entry::Vacant(ended) => {
+                let log = CallLog::reopen(&log_path)?;
+                if log.has_seq(seq) {
+                    return Ok(None);
+                }
+                tracing::info!(file.path = %log_path.display(), "browser call reopened");
+                ended.insert(OpenCall::new(log))
+            }
+        };
+        if call.log.has_seq(seq) {
+            return Ok(None);
+        }
+        call.sessions.insert(session_id.to_owned());
+        registry
+            .open_sessions
+            .insert(session_id.to_owned(), log_path.clone());
+        Ok(Some(log_path))
+    }
+
+    // A new session of a meeting with an open call, or one that ended within `REJOIN_WINDOW`,
+    // joins its log: the user left and joined again, or joined from a new tab after a crash.
+    fn rejoined_log(
+        &self,
+        registry: &Registry,
+        event: &CallEvent,
+    ) -> std::io::Result<Option<PathBuf>> {
+        let CallEvent::CallStarted {
+            at, meeting_code, ..
+        } = event
+        else {
+            return Ok(None);
+        };
+        let meeting_code = meeting_code.trim();
+        if meeting_code.is_empty() {
+            return Ok(None);
+        }
+        let open = registry
+            .open_calls
+            .iter()
+            .find(|(_, call)| call.meeting_code.as_deref() == Some(meeting_code));
+        if let Some((log_path, _)) = open {
+            return Ok(Some(log_path.clone()));
+        }
+        let since = at
+            .checked_sub(REJOIN_WINDOW)
+            .map_err(std::io::Error::other)?;
+        call_log::find_rejoinable(&self.log_dir, meeting_code, since)
+    }
+}
+
+impl OpenCall {
+    fn new(log: CallLog) -> Self {
+        let started = read_start(log.path());
+        Self {
+            log,
+            sessions: HashSet::new(),
+            meeting_code: started.as_ref().map(|(_, code)| code.clone()),
+            holder_ports: HashSet::new(),
+            last_event_at: Instant::now(),
+            last_at: None,
+            title: started.map(|(title, _)| title),
+            caption_source: None,
+            health_problem: None,
+        }
     }
 }
 
@@ -473,11 +562,21 @@ fn is_valid_session_id(session_id: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
-// The title of a reopened call, from its `call_started` line.
-fn read_title(log_path: &Path) -> Option<String> {
+// The title and meeting code of a reopened call, from its first `call_started` line.
+fn read_start(log_path: &Path) -> Option<(String, String)> {
     let contents = std::fs::read(log_path).ok()?;
     let lines = sources::browser_call::read_lines(&contents).ok()?;
-    lines.iter().find_map(|line| call_title(&line.event))
+    lines.iter().find_map(|line| match &line.event {
+        CallEvent::CallStarted { meeting_code, .. } => {
+            Some((call_title(&line.event)?, meeting_code.trim().to_owned()))
+        }
+        CallEvent::Caption { .. }
+        | CallEvent::Chat { .. }
+        | CallEvent::Roster { .. }
+        | CallEvent::Health { .. }
+        | CallEvent::CallEnded { .. }
+        | CallEvent::Unknown => None,
+    })
 }
 
 fn call_title(event: &CallEvent) -> Option<String> {
@@ -504,9 +603,13 @@ fn call_title(event: &CallEvent) -> Option<String> {
 // Keeps what the tray shows about the call current.
 fn note_event(call: &mut OpenCall, event: &CallEvent) {
     match event {
-        CallEvent::CallStarted { .. } => {
-            if let Some(title) = call_title(event) {
-                call.title = Some(title);
+        CallEvent::CallStarted { meeting_code, .. } => {
+            // The first session's title and code name the call.
+            if call.title.is_none() {
+                call.title = call_title(event);
+            }
+            if call.meeting_code.is_none() {
+                call.meeting_code = Some(meeting_code.trim().to_owned());
             }
         }
         CallEvent::Health {
@@ -552,18 +655,21 @@ async fn end_idle_calls(app: AppHandle, pipeline: Arc<Pipeline>) {
         let ended = {
             let calls = &app.state::<AppState>().browser_calls;
             let mut registry = calls.lock();
-            let idle_sessions: Vec<String> = registry
+            let idle_logs: Vec<PathBuf> = registry
                 .open_calls
                 .iter()
                 .filter(|(_, call)| {
                     call.holder_ports.is_empty() && call.last_event_at.elapsed() >= IDLE_CALL_END
                 })
-                .map(|(session_id, _)| session_id.clone())
+                .map(|(log_path, _)| log_path.clone())
                 .collect();
-            idle_sessions
+            idle_logs
                 .into_iter()
-                .filter_map(|session_id| {
-                    let mut call = registry.open_calls.remove(&session_id)?;
+                .filter_map(|log_path| {
+                    let mut call = registry.open_calls.remove(&log_path)?;
+                    for session_id in &call.sessions {
+                        registry.open_sessions.remove(session_id);
+                    }
                     let at = call.last_at.unwrap_or_else(Timestamp::now);
                     if let Err(error) = call.log.end(at, EndReason::Idle) {
                         // Left open, so the next start ends it.

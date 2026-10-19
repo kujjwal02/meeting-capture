@@ -174,6 +174,14 @@ could not write gets no `ack`.
 - The call ends on `call_ended`, or 5 minutes after the last event once no port has the session
   open. Then intake reads the log as `InputKind::BrowserCallLog`. For the second case the app
   appends its own `call_ended` line, with reason `idle` and no `seq`.
+- A new session joins the log of an earlier call when its `call_started` has the same meeting
+  code, and that call is open or its last event is at most 10 minutes before. This covers
+  leaving and joining again, and joining from a new tab after a crash. The note stays one note.
+  - A `<session_id>.rejoin` file next to the logs names the log the session joined, so resends
+    and a restart find it.
+  - The call ends when its last session ends.
+  - Two different meetings on one meeting code, such as a personal room, merge when the second
+    starts within 10 minutes of the first.
 - An event for a session whose log already ended reopens that log. The call ends again by the
   same rules, and intake updates the same meeting and note.
 - A call with fewer than 3 caption lines writes no note, as for huddles. The log stays.
