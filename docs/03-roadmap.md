@@ -8,7 +8,7 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 | 1 | Tray app and captions pipeline | Tauri tray app with autostart and no Dock icon, caption receiver, Slack huddle captions on the Mac, job store, Google sign-in for work and personal calendars, calendar match, LLM extraction, vault writer, `mc` CLI | 5 real Meet calls and 3 Slack huddles write correct notes with no manual step; the tray lists them; a calendar sign-in still works after 8 days | 6 |
 | 1b | mc-meet extension | Our own Meet extension: captions, chat and roster from Meet's data channels with a DOM fallback, native messaging to the app, one event log per call, attendees who joined. Replaces TranscripTonic and the webhook receiver. [Spec](09-meet-extension.md) | 3 Meet calls, one with a second Meet tab, one browser restart and one app quit mid-call, each give one note whose attendees joined the call | 8 |
 | 2 | Call detection | One call stream for capture to follow: `call.started`, `call.resumed` and `call.ended`, built from mc-meet's `call_started` and `call_ended` and the huddle watcher | Meet and a Slack huddle each log start within 5 s on the Mac, Meet its end within 5 s and a huddle within 6 s; Meet does the same on the PC | 1 |
-| 3 | Mac capture | Tap and mic stems, recovery of orphan WAVs at launch | 3 calls, one with AirPods connected mid-call, no gap over 1 s, app under 5% CPU | 5 |
+| 3 | Mac capture | Tap and mic stems from a supervised `mc-capture` helper, recovery of orphan WAVs at launch | 3 calls, one with AirPods connected mid-call, no gap over 1 s, app and helper under 5% CPU; a `kill -9` of the app or the helper mid-call leaves stems that play | 6 |
 | 3b | Mic detection | Calls in native apps such as Teams and Zoom, from the app that holds the mic, on both OSes. Also ends a Meet call at once when the browser crashes | Teams and Zoom each log start and end within 5 s, on the Mac and the PC | 2 |
 | 4 | Local STT | Parakeet, VAD, remote diarization, caption-name merge | A 1 h call transcribes in under 10 min on the M2; names match captions on 3 Meet calls | 4 |
 | 5 | Windows capture | WASAPI loopback, mic | Phase 3 checks pass on the PC | 4 |
@@ -111,6 +111,72 @@ Progress is tracked in the [checklist](05-checklist.md).
 - A huddle under `min_huddle_seconds` (default 120) or with fewer than 3 caption lines writes no
   note. `mc ingest --kind slack-huddle-log` writes one from its log.
 
+## Phase 3 detail
+
+- `mc-capture` is a helper binary in `Contents/MacOS/`, shipped as a Tauri sidecar and signed with
+  the app's identity. It owns the audio devices and the stem files. The app never links Core Audio
+  code, so a crash or hung HAL call in capture never takes the tray down.
+- The app talks to the helper in JSON lines. App to helper: `start` with the call id and folder,
+  and `stop`. Helper to app: `recording`, `gap`, `device_changed`, `permission` and `error`.
+- If the helper exits, the app restarts it after 1, 2 and then 4 s and sends `start` again. After
+  3 failures in 60 s the tray shows "Recording failed". If the app exits, the helper sees stdin
+  close, closes both WAVs within 1 s and exits.
+- Remote audio: a global mono tap (`with_mono_global_tap_excluding_processes` with an empty list)
+  in a private aggregate device whose only member is the tap. Adding the output device doubles
+  the audio and blocks Zoom and Slack joins. The app does not exclude itself: that broke Zoom on
+  macOS 26.
+- Mic: `cpal` on the system default input. If the default input is Bluetooth, the built-in mic is
+  recorded instead, so the app never forces AirPods into HFP. On a device change (debounced 1 s)
+  the new stream opens before the old one closes.
+- Every native open runs on its own thread with a 5 s timeout. On timeout the helper exits and the
+  app restarts it. Teardown stops the device and waits for running callbacks before it frees
+  anything.
+- Real-time callbacks only downmix to mono and push into an SPSC ring of 65,536 samples. A writer
+  thread resamples to 16 kHz with one rubato cubic resampler per stem, kept for the whole stream.
+- Alignment: the writer compares samples written with the monotonic clock. A stem more than
+  100 ms behind gets silence, logged as a gap. This also absorbs clock drift between the mic and
+  the tap.
+- Stems are 16 kHz mono 16-bit WAV through `hound`, 115 MB per hour each. The header is rewritten
+  every 5 s, so a crash loses at most 5 s.
+- Each call gets a folder in the app data folder, named after the call id. A start, resume or
+  helper restart begins a new numbered pair: `001-mic.wav`, `001-remote.wav`, then `002-...`.
+  `stems.json` holds the call id, the platform, each segment's UTC start and end, its state
+  (`open`, `closed` or `recovered`), the mic device, dropped samples and the gap list.
+- At launch the app repairs every segment not marked closed: it truncates to a whole sample,
+  rewrites the RIFF and data sizes from the file length, and marks the segment `recovered`.
+- System-audio permission: `TCCAccessPreflight("kTCCServiceAudioCapture")` through dlopen, at
+  launch and before each call. If the private call is missing, the status is unknown, and the tray
+  warns after 60 s of an all-zero tap while the mic hears speech. Mic permission comes from
+  `AVCaptureDevice`. Warnings follow the huddle permission flow: one notification and a tray row
+  that opens System Settings.
+- The tray shows a recording dot and "Recording: `<title>`" while stems are open, and a "Stop
+  recording this call" row.
+- Both plists get `NSMicrophoneUsageDescription` and `NSAudioCaptureUsageDescription`, and the
+  bundle requires macOS 14.4. On 14.2 and 14.3 the tap's permission prompt lands in another
+  category.
+- Tauri signs with the hardened runtime, which blocks the mic unless the bundle has the
+  `com.apple.security.device.audio-input` entitlement. Tauri signs the sidecar with the same
+  entitlements.
+- macOS files the helper's mic and system-audio grants under the app that launched it, so the
+  helper needs no permission of its own.
+- Measured on an M2 MacBook Air, macOS 27.0.1: the tap delivers 48 kHz mono 32-bit float and opens in
+  under 300 ms. The helper uses 0.4% of a core with the tap open, 0.6% with the mic too, before
+  resampling.
+- No echo cancellation: it was 63 to 76% of Muesli's CPU. Phase 4 drops mic segments whose text
+  matches an overlapping remote segment.
+
+### Build order
+
+1. Spike: plist strings, minimum version, a bare `mc-capture` that records 60 s. Check that macOS
+   attributes its prompts to Meeting Capture. Measure the tap's format, whether it survives a
+   switch to AirPods, the AirPods HFP rate, and CPU with only the tap open.
+2. `capture` crate: `Frame`, `CallAudioSource`, tap and mic sources, ring, timed opens, teardown.
+3. `stem-writer`: resampling, gap fill, WAV with 5 s flush, `stems.json`.
+4. Helper protocol, app supervision, tray rows. The app subscribes to the call stream early in
+   `setup()`, so it sees the calls ended at launch.
+5. Device listeners, the Bluetooth rule, mic swap, tap rebuild on stall, permission checks.
+6. Orphan repair at launch. Then 3 real calls, AirPods mid-call, `kill -9` of each process.
+
 ## Open questions
 
 - Whether the akaiketech.com Workspace admin allows unverified third-party apps to read calendars.
@@ -121,7 +187,7 @@ Progress is tracked in the [checklist](05-checklist.md).
 - Meet caption quality on Indian English and Hinglish.
 - Haiku 5.5, Sonnet through Claude Code and GLM-5.3-Flash on five real transcripts.
 - Codex as a fourth provider, through `codex exec`.
-- Recording consent: tray shows recording state; a per-client "never record" list.
+- Recording consent: a per-client "never record" list.
 
 ## Risks
 

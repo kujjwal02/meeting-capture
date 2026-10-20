@@ -129,10 +129,11 @@ flowchart LR
     HUD["huddle watcher"] --> CALLS
     DET["detect"] -->|mic taken / released| CALLS
     CALLS -->|call started / ended| APP["app"]
-    APP --> CAP["capture"]
+    APP -->|start / stop| HELPER["mc-capture"]
     APP --> OBS["obs-control"]
-    CAP -->|PCM frames| APP
-    APP --> STEM["stem-writer"]
+    HELPER --> CAP["capture"]
+    CAP -->|PCM frames| HELPER
+    HELPER --> STEM["stem-writer"]
     STEM --> MEDIA[("mic.wav + remote.wav")]
 ```
 
@@ -141,9 +142,10 @@ flowchart LR
   the source's log path. A Meet rejoin within 10 minutes resumes the same call. Capture subscribes
   to the stream.
 - `detect` (phase 3b) reports when an app takes or releases the mic, and which app.
-- `capture` has one `CallAudioSource` trait. The macOS build uses a Core Audio tap; the Windows
-  build uses WASAPI process loopback. Both use `cpal` for the mic.
-- The app connects `capture` to `stem-writer`. Neither crate knows about the other.
+- `capture` has one `CallAudioSource` trait. Its macOS module uses a Core Audio global tap; its
+  Windows module uses WASAPI process loopback. Both use `cpal` for the mic.
+- `mc-capture` is a helper process the app spawns and restarts. It connects `capture` to
+  `stem-writer`; neither crate knows about the other. A crash in capture never stops the tray.
 - `obs-control` starts and stops OBS video recording with the call.
 
 ## 2. Transcribe (phases 4, 6)
