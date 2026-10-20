@@ -25,7 +25,7 @@ tauri-plugin-opener.workspace = true
 tauri-plugin-single-instance.workspace = true
 tauri-plugin-updater.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "net", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

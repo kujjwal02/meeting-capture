@@ -128,6 +128,14 @@
     return channel;
   };
 
+  // Turning Meet's captions off closes Meet's caption channel, and Meet then stops streaming
+  // captions to this browser. Keeping that channel open keeps captions coming with CC off.
+  const nativeCloseChannel = RTCDataChannel.prototype.close;
+  RTCDataChannel.prototype.close = function (...args) {
+    if (CAPTION_LABELS.includes(this.label) && !ownChannels.has(this)) return;
+    return nativeCloseChannel.apply(this, args);
+  };
+
   const WrappedPeerConnection = new Proxy(NativePeerConnection, {
     construct(target, args, newTarget) {
       const connection = Reflect.construct(target, args, newTarget);

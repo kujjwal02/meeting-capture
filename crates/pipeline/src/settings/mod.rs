@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 pub use app_dirs::AppDirs;
 pub use edit::{SettingsChange, SettingsStore};
-pub use file::{Effort, GoogleSettings, LlmSettings, ProviderKind, SettingsFile, SlackSettings};
+pub use file::{
+    Effort, GoogleSettings, LlmSettings, MeetSettings, ProviderKind, SettingsFile, SlackSettings,
+};
 pub use validate::Settings;
 
 #[derive(Debug, thiserror::Error)]

@@ -61,6 +61,12 @@ on the peer connection that carries `collections`. Tactiq does the same and stat
 streams captions without the captions button (T:10534, T:10714-10724). It acks `captions_v2`
 frames only on channels it opened; Meet acks its own (T:10668-10671).
 
+Measured in mc-meet on 2026-10-20, the channels the hook opens stay silent until Meet's captions
+are on. Turning captions off makes Meet call `close()` on its own `captions` channel about 1 s
+later, and the stream to every caption channel stops. When the hook blocks that `close()`, Meet
+keeps streaming to the hook's channels with captions off, through silences of 5 minutes. Bluedot
+blocks the same `close()`.
+
 ## Not used
 
 - `media-session` caption language config (T:9697-9727). We never change the caption language.

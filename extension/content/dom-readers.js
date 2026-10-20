@@ -21,6 +21,12 @@ globalThis.mcMeetCreateDomCaptions = ({ emit, selfName }) => {
   let region = null;
   let monitorTimer = null;
   let turn = null;
+  let isRegionHidden = false;
+
+  // Meet keeps writing captions into a hidden region, so the reader works with the box gone.
+  function showRegion() {
+    if (region) region.style.display = isRegionHidden ? "none" : "";
+  }
 
   function resolveSpeaker(label) {
     // Meet labels the local user "You" in English. The roster name replaces it when known.
@@ -88,6 +94,7 @@ globalThis.mcMeetCreateDomCaptions = ({ emit, selfName }) => {
     if (!node || node === region) return;
     observer?.disconnect();
     region = node;
+    showRegion();
     turn = null;
     observer = new MutationObserver(onMutations);
     observer.observe(node, { childList: true, characterData: true, subtree: true });
@@ -104,8 +111,13 @@ globalThis.mcMeetCreateDomCaptions = ({ emit, selfName }) => {
       monitorTimer = null;
       observer?.disconnect();
       observer = null;
+      if (region) region.style.display = "";
       region = null;
       turn = null;
+    },
+    setRegionHidden(isHidden) {
+      isRegionHidden = isHidden;
+      showRegion();
     },
     isAttached: () => region !== null,
   };

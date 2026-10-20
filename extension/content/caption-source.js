@@ -12,8 +12,9 @@
 //   parse_gap            { atMs, channel, parseFailures, detail, isInCall } frames failed to decode
 //   tick                 { atMs } the content script's once-a-second check, in a call
 //   captions_clicked     { atMs } main.js clicked Meet's captions button
+//   captions_hidden      { atMs } main.js turned Meet's captions off; the channel keeps streaming
 //
-// decide returns { source, health, reportsHealth, isCaptionsClickDue }. source is "none",
+// decide returns { source, health, reportsHealth, isCaptionsClickDue, isCaptionsHideDue }. source is "none",
 // "channel" or "dom". health holds the health event fields this policy owns.
 
 // The DOM reader starts when no caption arrives this long after the caption channels open.
@@ -30,6 +31,10 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
   let lastChannelCaptionMs = null;
   let captionsClicks = 0;
   let lastCaptionsClickMs = 0;
+  // Once hidden, mc-meet never turns captions back on itself, so a user who wants them can.
+  let isCaptionsHidden = false;
+  // Hiding before the current channels carry a caption would stop them from ever starting.
+  let hasCaptionOnOpenChannels = false;
 
   const health = () => ({ source, parseFailures, detail });
 
@@ -39,6 +44,8 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
     source = "dom";
     detail = reason;
     captionsClicks = 0;
+    // The DOM reader needs Meet's captions on.
+    isCaptionsHidden = false;
     return true;
   }
 
@@ -51,6 +58,7 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
 
   function isCaptionsClickDue(atMs) {
     return (
+      !isCaptionsHidden &&
       captionsClicks < MC_MEET_CAPTIONS_CLICK_ATTEMPTS &&
       atMs - lastCaptionsClickMs >= MC_MEET_CAPTIONS_CLICK_GAP_MS
     );
@@ -63,6 +71,8 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         source = "none";
         pageStartedMs = fact.atMs;
         lastChannelCaptionMs = null;
+        isCaptionsHidden = false;
+        hasCaptionOnOpenChannels = false;
         return true;
       case "call_ended":
         source = "none";
@@ -73,12 +83,16 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         return false;
       case "hook_state":
         channelsOpenedAtMs = fact.channelsOpenedAtMs;
+        // New channels on a new peer connection need Meet's captions on to start streaming.
+        isCaptionsHidden = false;
+        hasCaptionOnOpenChannels = false;
         return true;
       case "channel_open_failed":
         detail = `opening ${fact.label} failed: ${fact.error}`;
         return true;
       case "channel_caption":
         lastChannelCaptionMs = fact.atMs;
+        hasCaptionOnOpenChannels = true;
         return useChannel();
       case "parse_gap": {
         parseFailures = fact.parseFailures;
@@ -104,6 +118,9 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         captionsClicks += 1;
         lastCaptionsClickMs = fact.atMs;
         return false;
+      case "captions_hidden":
+        isCaptionsHidden = true;
+        return false;
     }
   }
 
@@ -115,6 +132,11 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         health: health(),
         reportsHealth,
         isCaptionsClickDue: fact.kind === "tick" && isCaptionsClickDue(fact.atMs),
+        isCaptionsHideDue:
+          fact.kind === "tick" &&
+          source === "channel" &&
+          hasCaptionOnOpenChannels &&
+          !isCaptionsHidden,
       };
     },
     health,

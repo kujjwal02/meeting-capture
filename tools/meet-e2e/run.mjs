@@ -155,7 +155,11 @@ async function devtools() {
   const send = (method, params = {}, sessionId = undefined) => {
     const id = ++nextId;
     socket.send(JSON.stringify({ id, method, params, sessionId }));
-    return new Promise((resolve) => waiting.set(id, resolve));
+    // A browser that stops answering would hang the run and skip the cleanup.
+    return new Promise((resolve, reject) => {
+      waiting.set(id, resolve);
+      setTimeout(() => reject(new Error(`devtools ${method} got no reply in 30 s`)), 30000);
+    });
   };
   return { send, pageLog, profileDir: profileDirOf(httpUrl), close: () => socket.close() };
 }
@@ -331,13 +335,13 @@ const expect = (isTrue, text) => {
   if (!isTrue) failures.push(text);
 };
 
+const extensionDir = join(repoDir, "extension");
 try {
   step(`dev app ${app.pid} with home ${homeDir}`);
   await until("the dev app writes the host manifest", 30000, () =>
     pointHostAt(wrapper, binary, profileManifestPath),
   );
 
-  const extensionDir = join(repoDir, "extension");
   await cdp.send("Extensions.uninstall", { id: extensionId(extensionDir) });
   const loaded = await cdp.send("Extensions.loadUnpacked", { path: extensionDir });
   if (loaded.error) throw new Error(`could not load mc-meet: ${loaded.error.message}`);
@@ -480,7 +484,18 @@ try {
     Math.abs(Date.parse(chat.at) - sentMs) < 15000,
     `chat time within 15 s of sending (${chat.at})`,
   );
-  expect(healths.at(-1)?.captions_on === true, "the last health event has captions on");
+  // Captions read as off until mc-meet first turns them on.
+  const shownIndex = healths.findIndex((health) => health.captions_on === true);
+  const hiddenAt =
+    shownIndex === -1
+      ? undefined
+      : healths.slice(shownIndex).find((health) => health.captions_on === false)?.at;
+  expect(hiddenAt !== undefined, "mc-meet turned captions off");
+  expect(
+    captions.filter((caption) => caption.at > hiddenAt).length >= 3,
+    "3 captions arrived after captions went off",
+  );
+  expect(healths.at(-1)?.captions_on === false, "the last health event has captions off");
   expect(note.includes(chatText), "the note has the chat message");
   step(`note ${notePath}`);
 } catch (error) {
@@ -510,6 +525,11 @@ try {
       patchrome(who, "close");
     } catch {}
   }
+  // A worker with queued events starts the app through host mode, and that app points the host
+  // manifests at itself again. Without mc-meet nothing starts it.
+  try {
+    await cdp.send("Extensions.uninstall", { id: extensionId(extensionDir) });
+  } catch {}
   cdp.close();
   process.kill(app.pid);
   for (const [path, manifest] of manifestsBefore) writeFileSync(path, manifest);

@@ -1,6 +1,6 @@
 //! The settings window: plain HTML in `ui/`, calling the commands here. It edits the settings
-//! file through `SettingsStore`. Google account, LLM and Slack changes apply at once; the rest
-//! after a restart.
+//! file through `SettingsStore`. Google account, LLM, Slack and Meet changes apply at once; the
+//! rest after a restart.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use pipeline::calendar::AccountStatus;
 use pipeline::google::{self, OAuthClient};
 use pipeline::llm::claude_code_auth;
-use pipeline::settings::{ProviderKind, SettingsError, SettingsFile, SlackSettings};
+use pipeline::settings::{MeetSettings, ProviderKind, SettingsError, SettingsFile, SlackSettings};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt as _;
@@ -45,6 +45,7 @@ pub(crate) struct SettingsView {
     accounts: Vec<AccountView>,
     llm: LlmView,
     slack: SlackSettings,
+    meet: MeetSettings,
     settings_file: PathBuf,
 }
 
@@ -80,6 +81,7 @@ pub(crate) struct SettingsForm {
     llm_api_key: String,
     slack_read_captions: bool,
     slack_auto_start_captions: bool,
+    meet_hide_captions: bool,
 }
 
 #[derive(Serialize)]
@@ -127,6 +129,7 @@ impl SettingsForm {
         }
         file.slack.read_captions = self.slack_read_captions;
         file.slack.auto_start_captions = self.slack_auto_start_captions;
+        file.meet.hide_captions = self.meet_hide_captions;
     }
 }
 
@@ -161,6 +164,7 @@ pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, 
         accounts,
         llm,
         slack: file.slack,
+        meet: file.meet,
         settings_file: state.settings.app_dirs().settings_file(),
     })
 }
@@ -186,6 +190,7 @@ pub(crate) fn settings_save(
         .map_err(|error| error.to_string())?;
     tracing::info!("settings saved");
     crate::tray::refresh(&app);
+    state.browser_calls.send_settings(state.settings.meet());
     revoke_in_background(change.tokens_to_revoke);
     let mut saved = "Saved.".to_owned();
     if change.has_dropped_llm_api_key && form.llm_provider.is_some_and(ProviderKind::takes_api_key)

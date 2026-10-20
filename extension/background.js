@@ -5,6 +5,7 @@
 //
 // Storage keys: one per field of the session state in session-rules.js, plus
 //   q:<seq>       an event message waiting for its ack
+//   settings      the app's [meet] settings, which main.js reads
 
 import { decide, hasOpenSessions, restoreState, STATE_KEYS } from "./session-rules.js";
 
@@ -15,6 +16,7 @@ const BACKOFF_MAX_MS = 60000;
 const RECONNECT_ALARM = "mc-meet-reconnect";
 const PENDING_END_ALARM = "mc-meet-pending-end";
 const QUEUE_PREFIX = "q:";
+const SETTINGS_KEY = "settings";
 
 let nativePort = null;
 let isWelcomed = false;
@@ -173,7 +175,10 @@ function connectNative() {
       isWelcomed = true;
       backoffMs = BACKOFF_MIN_MS;
       console.info("mc-meet: app", message.app_version, "open sessions", message.open_sessions);
+      storeSettings(message.settings);
       serially(resendUnacked);
+    } else if (message?.type === "settings") {
+      storeSettings(message.settings);
     } else if (message?.type === "ack") {
       serially(() => onAck(message.seq));
     } else if (message?.type === "app_unavailable") {
@@ -190,6 +195,14 @@ function connectNative() {
     type: "hello",
     protocol: PROTOCOL,
     extension_version: chrome.runtime.getManifest().version,
+  });
+}
+
+// An older app sends no settings; the stored ones stay.
+function storeSettings(settings) {
+  if (!settings) return;
+  chrome.storage.local.set({ [SETTINGS_KEY]: settings }).catch((error) => {
+    console.error("mc-meet: could not store the settings:", error);
   });
 }
 

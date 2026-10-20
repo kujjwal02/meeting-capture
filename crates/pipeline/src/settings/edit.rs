@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
 
-use super::{AppDirs, LlmSettings, Settings, SettingsError, SettingsFile, SlackSettings};
+use super::{
+    AppDirs, LlmSettings, MeetSettings, Settings, SettingsError, SettingsFile, SlackSettings,
+};
 use crate::calendar::GoogleAccounts;
 
-/// The settings file and the sections that apply while the app runs: LLM, Google and Slack.
+/// The settings file and the sections that apply while the app runs: LLM, Google, Slack and
+/// Meet.
 /// Every edit of the file goes through `edit`, which also hands the new sections to their
 /// readers.
 pub struct SettingsStore {
@@ -15,6 +18,7 @@ pub struct SettingsStore {
     file_lock: Mutex<()>,
     llm: RwLock<LlmSettings>,
     slack: RwLock<SlackSettings>,
+    meet: RwLock<MeetSettings>,
     google: GoogleAccounts,
 }
 
@@ -40,6 +44,7 @@ impl SettingsStore {
             file_lock: Mutex::new(()),
             llm: RwLock::new(LlmSettings::default()),
             slack: RwLock::new(SlackSettings::default()),
+            meet: RwLock::new(MeetSettings::default()),
             google: GoogleAccounts::default(),
         }
     }
@@ -73,7 +78,7 @@ impl SettingsStore {
     }
 
     /// Reads the file, applies `edit`, validates and writes the result, and hands the LLM,
-    /// Google and Slack sections to their readers, all under one lock.
+    /// Google, Slack and Meet sections to their readers, all under one lock.
     ///
     /// # Errors
     ///
@@ -107,6 +112,12 @@ impl SettingsStore {
         *self.slack.read().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// mc-meet gets these when it connects and after each edit.
+    #[must_use]
+    pub fn meet(&self) -> MeetSettings {
+        *self.meet.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// The signed-in Google accounts and whether each still works.
     #[must_use]
     pub fn google(&self) -> &GoogleAccounts {
@@ -116,6 +127,7 @@ impl SettingsStore {
     fn take_live_sections(&self, file: &SettingsFile) {
         *self.llm.write().unwrap_or_else(PoisonError::into_inner) = file.llm.clone();
         *self.slack.write().unwrap_or_else(PoisonError::into_inner) = file.slack;
+        *self.meet.write().unwrap_or_else(PoisonError::into_inner) = file.meet;
         self.google.replace(&file.google);
     }
 

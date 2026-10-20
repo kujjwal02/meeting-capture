@@ -5,7 +5,7 @@ use jiff::tz::TimeZone;
 
 use super::{LlmSettings, ProviderKind, SettingsError, SettingsFile};
 
-/// The settings that apply at launch. LLM, Google and Slack settings change while the app runs,
+/// The settings that apply at launch. LLM, Google, Slack and Meet settings change while the app runs,
 /// so `SettingsStore` holds them instead.
 #[derive(Debug)]
 pub struct Settings {

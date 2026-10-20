@@ -116,8 +116,9 @@ unknown fields are ignored on both sides, so either side can be newer.
 
 | `type` | Fields | When |
 | --- | --- | --- |
-| `welcome` | `protocol`, `app_version`, `open_sessions` (session IDs the app still has open) | Reply to `hello`. |
+| `welcome` | `protocol`, `app_version`, `open_sessions` (session IDs the app still has open), `settings` | Reply to `hello`. |
 | `ack` | `seq` | After the event is appended to its log. |
+| `settings` | `settings` | After a save in the settings window, to every welcomed port. |
 | `app_unavailable` | none | From host mode when the app did not start in 10 s. |
 
 The extension keeps each event in `chrome.storage.local` until its `ack`, and resends unacked
@@ -125,6 +126,10 @@ events in `seq` order after `welcome`. The app ignores an event whose `seq` its 
 and acks it again. An event with an invalid `session_id` (1 to 64 letters, digits or hyphens) or
 invalid fields for its `kind` is acked and dropped, since a resend cannot fix it. An event the app
 could not write gets no `ack`.
+
+`settings` holds `hide_captions`, the app's `[meet] hide_captions`. The worker stores it in
+`chrome.storage.local`, and the content script reads it at load and on each change. Without a
+stored value the content script hides captions.
 
 ## Sessions
 
@@ -155,6 +160,17 @@ could not write gets no `ack`.
   the DOM reader. `extension/content/caption-source.js` holds these rules. It reads no DOM and no
   clock, so it also runs in Node. `content/main.js` feeds it timestamped facts and runs the reader
   it picks.
+- Hidden captions. Meet's caption box covers a shared screen. With `hide_captions` on, the
+  content script turns Meet's captions off after the first channel caption, so the box shows for
+  a few seconds at call start. Turning captions off makes Meet close its own caption channel and
+  stop streaming captions. The page hook blocks `close()` on caption channels it did not open,
+  and Meet keeps streaming to the hook's channels. Once hidden, the content script never turns
+  captions back on in that call, so a user who wants them can. A new peer connection turns them on
+  again until its channels carry a caption. While the DOM reader runs, captions stay on and the
+  caption region gets `display: none`. Meet keeps writing captions into the hidden region.
+- The DOM reader makes one utterance of each speaker turn. Meet did not trim a 1200-character
+  monologue in the caption region, so one speaker talking alone gives one caption line, and a call
+  with fewer than 3 lines writes no note.
 - Page hook to content script. The hook sends spec events (`caption`, `chat`, `roster`) as
   `event` messages. It sends its own notices (`parse_gap`, `self_removed`) as `notice` messages,
   which never reach the app.
@@ -233,6 +249,9 @@ is older than the app's.
   or the call gets no speech and no captions.
 - The tray shows mc-meet as connected only while the worker has work, since the port closes
   after the last ack.
+- A worker with queued events starts the app through host mode, and that app points the host
+  manifests at itself. Uninstall the extension before stopping a dev app, or a later call reaches
+  the dev build.
 
 ## Sources
 

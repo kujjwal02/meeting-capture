@@ -27,6 +27,24 @@ impl Default for SlackSettings {
     }
 }
 
+/// Google Meet captions, read by the mc-meet extension. The app sends these to mc-meet when it
+/// connects and after each save, so a change applies to calls already open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MeetSettings {
+    /// Turn Meet's captions off once captions stream, so the caption box covers no shared
+    /// screen. mc-meet keeps recording them.
+    pub hide_captions: bool,
+}
+
+impl Default for MeetSettings {
+    fn default() -> Self {
+        Self {
+            hide_captions: true,
+        }
+    }
+}
+
 /// The LLM that writes the notes. Validated on load and on every write. The provider and base
 /// URL change only through `set_endpoint`, which also decides which endpoint keeps a key.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +210,8 @@ pub struct SettingsFile {
     pub llm: LlmSettings,
     #[serde(default)]
     pub slack: SlackSettings,
+    #[serde(default)]
+    pub meet: MeetSettings,
 }
 
 /// Heads the settings file whenever the app writes it.
@@ -215,6 +235,8 @@ const SETTINGS_HEADER: &str = "\
 # [slack] read_captions: read Slack huddle captions from the Slack desktop app (macOS).
 # [slack] auto_start_captions: press the huddle's Captions tab when its caption panel is hidden.
 # [slack] min_huddle_seconds: a shorter huddle writes no note. Default 120.
+# [meet] hide_captions: turn Meet's captions off once mc-meet reads them, so the caption box
+#   covers no shared screen. mc-meet keeps recording them. Default true.
 
 ";
 

@@ -150,8 +150,10 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
             (None, Some(error.to_string()))
         }
     };
-    let browser_calls =
-        browser_calls::BrowserCalls::new(settings_store.app_dirs().browser_call_log_dir());
+    let browser_calls = browser_calls::BrowserCalls::new(
+        settings_store.app_dirs().browser_call_log_dir(),
+        settings_store.meet(),
+    );
     app.manage(AppState {
         pipeline: pipeline.clone(),
         pipeline_error,

@@ -13,10 +13,12 @@ use std::time::Duration;
 use native_host::frames::{LengthOrder, read_frame, write_frame};
 use native_host::socket::{AppEnd, CallListener};
 use pipeline::Pipeline;
+use pipeline::settings::MeetSettings;
 use serde::{Deserialize, Serialize};
 use sources::browser_call::HealthSource;
 use tauri::{AppHandle, Manager as _};
 use tokio::io::{AsyncWrite, ReadHalf};
+use tokio::sync::watch;
 use tracing::Instrument as _;
 
 use self::call_book::{CallBook, EventError, Logged, Now};
@@ -33,6 +35,8 @@ const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 pub(crate) struct BrowserCalls {
     book: Mutex<CallBook>,
     next_port_id: AtomicU64,
+    /// Every welcomed port sends mc-meet the new value.
+    meet_settings: watch::Sender<MeetSettings>,
 }
 
 /// What the tray shows for mc-meet.
@@ -53,11 +57,22 @@ pub(crate) struct CallStatus {
 
 impl BrowserCalls {
     /// The calls whose logs go in `log_dir`.
-    pub fn new(log_dir: PathBuf) -> Self {
+    pub fn new(log_dir: PathBuf, meet_settings: MeetSettings) -> Self {
         Self {
             book: Mutex::new(CallBook::new(LogFolder::new(log_dir))),
             next_port_id: AtomicU64::new(0),
+            meet_settings: watch::Sender::new(meet_settings),
         }
+    }
+
+    /// Sends the settings to every welcomed mc-meet port. A port stays open through a call, so a
+    /// save must reach the ports already open.
+    pub fn send_settings(&self, meet_settings: MeetSettings) {
+        self.meet_settings.send_if_modified(|current| {
+            let is_changed = *current != meet_settings;
+            *current = meet_settings;
+            is_changed
+        });
     }
 
     fn lock(&self) -> MutexGuard<'_, CallBook> {
@@ -98,10 +113,28 @@ enum AppMessage {
         protocol: u32,
         app_version: &'static str,
         open_sessions: Vec<String>,
+        settings: MeetSettingsMessage,
     },
     Ack {
         seq: u64,
     },
+    Settings {
+        settings: MeetSettingsMessage,
+    },
+}
+
+/// The settings mc-meet acts on, as the extension reads them.
+#[derive(Serialize)]
+struct MeetSettingsMessage {
+    hide_captions: bool,
+}
+
+impl From<MeetSettings> for MeetSettingsMessage {
+    fn from(settings: MeetSettings) -> Self {
+        Self {
+            hide_captions: settings.hide_captions,
+        }
+    }
 }
 
 pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
@@ -215,8 +248,8 @@ struct Port {
 
 impl Port {
     async fn serve(self, connection: AppEnd) {
-        let (mut from_host, mut to_host) = tokio::io::split(connection);
-        match self.relay(&mut from_host, &mut to_host).await {
+        let (from_host, mut to_host) = tokio::io::split(connection);
+        match self.relay(from_host, &mut to_host).await {
             Ok(()) => tracing::info!("port closed"),
             Err(error) => tracing::warn!(exception.message = %error, "port closed on an error"),
         }
@@ -230,11 +263,35 @@ impl Port {
 
     async fn relay(
         &self,
-        from_host: &mut ReadHalf<AppEnd>,
+        from_host: ReadHalf<AppEnd>,
         to_host: &mut (impl AsyncWrite + Unpin),
     ) -> std::io::Result<()> {
         let mut is_host_known = false;
-        while let Some(frame) = read_frame(from_host, LengthOrder::Little).await? {
+        let mut meet_settings = self.calls().meet_settings.subscribe();
+        let mut is_sending_settings = false;
+        // A frame read dropped halfway would lose its bytes, so one read lives across the
+        // settings sends and owns the read half until it finishes.
+        let mut next_frame = Box::pin(read_next_frame(from_host));
+        loop {
+            let frame = tokio::select! {
+                (from_host, frame) = &mut next_frame => {
+                    next_frame.set(read_next_frame(from_host));
+                    match frame? {
+                        Some(frame) => frame,
+                        None => break,
+                    }
+                },
+                changed = meet_settings.changed(), if is_sending_settings => {
+                    // A closed sender would end every later wait at once.
+                    if changed.is_err() {
+                        is_sending_settings = false;
+                        continue;
+                    }
+                    let settings = (*meet_settings.borrow_and_update()).into();
+                    send(to_host, &AppMessage::Settings { settings }).await?;
+                    continue;
+                }
+            };
             let message: ExtensionMessage = match serde_json::from_slice(&frame) {
                 Ok(message) => message,
                 Err(error) => {
@@ -272,8 +329,10 @@ impl Port {
                         protocol: PROTOCOL,
                         app_version: env!("CARGO_PKG_VERSION"),
                         open_sessions,
+                        settings: (*meet_settings.borrow_and_update()).into(),
                     };
                     send(to_host, &welcome).await?;
+                    is_sending_settings = true;
                 }
                 ExtensionMessage::Event {
                     seq,
@@ -346,6 +405,13 @@ fn is_acked(logged: &Result<Logged, EventError>) -> bool {
         | Err(EventError::InvalidSessionId(_) | EventError::InvalidEvent(_)) => true,
         Err(EventError::Write(_)) => false,
     }
+}
+
+async fn read_next_frame(
+    mut from_host: ReadHalf<AppEnd>,
+) -> (ReadHalf<AppEnd>, std::io::Result<Option<Vec<u8>>>) {
+    let frame = read_frame(&mut from_host, LengthOrder::Little).await;
+    (from_host, frame)
 }
 
 async fn send(

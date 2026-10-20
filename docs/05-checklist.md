@@ -199,6 +199,10 @@ Done when:
 - [x] Tray line: extension connected, current call, caption source, last health problem.
 - [x] A rejoin of the same meeting within 10 minutes goes into the same log and note.
 - [x] Captions turn on when the call starts, so the first words are kept.
+- [x] `[meet] hide_captions`, default on: captions go off after the first channel caption and
+  mc-meet keeps recording them. The page hook blocks Meet's `close()` on its caption channel.
+- [ ] The DOM reader splits a long single-speaker turn into caption lines. A 1200-character
+  monologue now gives one line and no note.
 - [x] TranscripTonic uninstalled; caption receiver and its docs removed.
 
 Done when:

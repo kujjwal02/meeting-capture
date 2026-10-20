@@ -42,6 +42,8 @@ was not running when the tab opened.
    - one `call_started` line;
    - a `health` line with `"source":"channel"` once someone speaks. `"source":"dom"` means the
      channels gave no caption in 20 s, and `detail` says why;
+   - with `[meet] hide_captions` on, a `health` line with `"captions_on":false` a few seconds
+     after the first caption, and `caption` lines after it;
    - `roster` lines with your name and `"is_self":true`;
    - `caption` lines whose `version` grows for one `utterance_id`.
 4. Leave the call. A `call_ended` line with `"reason":"left"` follows within about 4 s.
@@ -52,8 +54,9 @@ skeleton with `PROTOCOL-NOTES.md`.
 ## Rules
 
 - No network requests, telemetry, remote config, popup or downloads.
-- The extension never changes the caption language. It clicks the captions button only when it
-  falls back to the DOM and captions are off.
+- The extension never changes the caption language. It turns Meet's captions on when the call
+  starts, because Meet streams no captions until they are on. With the app's `[meet]
+  hide_captions` on, it turns them off after the first channel caption and keeps recording.
 - Plain JavaScript, no build step, no npm packages. `biome check extension/` must pass.
 
 ## Licences

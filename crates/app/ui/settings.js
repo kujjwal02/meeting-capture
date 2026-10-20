@@ -117,6 +117,7 @@ async function load() {
     field("slack-read-captions").checked = settings.slack.read_captions;
     field("slack-auto-start-captions").checked = settings.slack.auto_start_captions;
     showSlackFields();
+    field("meet-hide-captions").checked = settings.meet.hide_captions;
     renderAccounts(settings.accounts);
   } catch (error) {
     showMessage(String(error), true);
@@ -137,6 +138,7 @@ async function save(event) {
     llm_api_key: field("llm-api-key").value,
     slack_read_captions: field("slack-read-captions").checked,
     slack_auto_start_captions: field("slack-auto-start-captions").checked,
+    meet_hide_captions: field("meet-hide-captions").checked,
   };
   try {
     showMessage(await invoke("settings_save", { form }), false);

@@ -11,6 +11,7 @@
   const callEvents = globalThis.mcMeetCallEvents;
 
   const SESSION_KEY = "mc-meet-session";
+  const SETTINGS_KEY = "settings";
   // A reload of the same meeting in this tab within this window keeps the session.
   const RESUME_WINDOW_MS = 5 * 60 * 1000;
   const LEAVE_GRACE_MS = 3000;
@@ -33,12 +34,30 @@
   let lastPingMs = 0;
   let port = null;
   let isContextValid = true;
+  // The app's [meet] hide_captions. The worker stores it; on until the app says otherwise.
+  let isHidingCaptions = true;
   const outbox = [];
 
   const captionSource = globalThis.mcMeetCreateCaptionSourcePolicy();
   const domCaptions = globalThis.mcMeetCreateDomCaptions({
     emit: (event) => onReaderEvent("dom", event),
     selfName: () => selfName,
+  });
+
+  // ---- Settings. The worker stores what the app sends, so they hold while the app is away.
+
+  function takeSettings(settings) {
+    if (typeof settings?.hide_captions !== "boolean") return;
+    isHidingCaptions = settings.hide_captions;
+    domCaptions.setRegionHidden(isHidingCaptions);
+  }
+
+  chrome.storage.local
+    .get(SETTINGS_KEY)
+    .then((stored) => takeSettings(stored[SETTINGS_KEY]))
+    .catch(() => {});
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === "local" && changes[SETTINGS_KEY]) takeSettings(changes[SETTINGS_KEY].newValue);
   });
 
   // ---- Worker port.
@@ -207,6 +226,14 @@
     button.click();
   }
 
+  // The caption box covers a shared screen. Meet keeps streaming to channels mc-meet opened.
+  function clickCaptionsOff(nowMs) {
+    const button = findIconButton(selectors.captionsOnIcon);
+    if (!button) return;
+    captionSource.decide({ kind: "captions_hidden", atMs: nowMs });
+    button.click();
+  }
+
   // ---- Reader events. Both caption readers deliver spec events here; origin names the reader.
 
   function onReaderEvent(origin, event) {
@@ -333,6 +360,7 @@
     const decision = captionSource.decide({ kind: "tick", atMs: nowMs });
     follow(decision);
     if (decision.isCaptionsClickDue) clickCaptionsOn(nowMs);
+    if (decision.isCaptionsHideDue && isHidingCaptions) clickCaptionsOff(nowMs);
 
     const isRosterLate = nowMs - call.page_started_ms >= ROSTER_WAIT_MS;
     if (!isRosterFromChannel && isRosterLate && nowMs - lastDomRosterMs >= DOM_ROSTER_EVERY_MS) {
