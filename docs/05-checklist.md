@@ -222,7 +222,7 @@ Done when:
 ## Phase 3: Mac capture
 
 - [x] Spike: tap format, helper prompt attribution, CPU with the tap open.
-- [ ] Spike: tap across a switch to AirPods, AirPods HFP rate.
+- [x] Spike: tap across a switch to AirPods, AirPods HFP rate.
 - [x] Usage strings in both plists; minimum macOS 14.4; the audio-input entitlement.
 - [ ] `capture` with one `CallAudioSource` trait; global tap for remote audio, `cpal` for the mic.
 - [ ] `stem-writer` writes numbered `mic.wav` and `remote.wav` segments and `stems.json`.
