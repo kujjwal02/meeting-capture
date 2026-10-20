@@ -1,0 +1,26 @@
+[package]
+name = "capture"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+cpal.workspace = true
+rtrb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cidre.workspace = true
+
+# The workspace forbids unsafe code, and `forbid` cannot be lowered per module. The tap reads Core
+# Audio buffers through raw pointers, so this crate denies unsafe code and allows it in
+# `mac::tap` alone.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"

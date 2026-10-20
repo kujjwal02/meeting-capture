@@ -227,6 +227,8 @@ function devInfoPlist() {
     CFBundleName: devAppName,
     CFBundleDisplayName: devAppName,
     CFBundlePackageType: "APPL",
+    NSMicrophoneUsageDescription: "Meeting Capture records your side of a call.",
+    NSAudioCaptureUsageDescription: "Meeting Capture records the other side of a call.",
   };
   const keys = Object.entries(entries)
     .map(([key, value]) => `  <key>${key}</key>\n  <string>${value}</string>\n`)
