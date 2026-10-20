@@ -162,6 +162,9 @@ Progress is tracked in the [checklist](05-checklist.md).
 - Measured on an M2 MacBook Air, macOS 27.0.1: the tap delivers 48 kHz mono 32-bit float and opens in
   under 300 ms. The helper uses 0.4% of a core with the tap open, 0.6% with the mic too, before
   resampling.
+- The tap keeps running at 48 kHz across a switch to AirPods Pro, with no dropped samples. The
+  switch also moves the default input to the AirPods; an open built-in mic stream stays on the
+  built-in mic. The AirPods mic, once open, records at 24 kHz mono and the tap stays at 48 kHz.
 - No echo cancellation: it was 63 to 76% of Muesli's CPU. Phase 4 drops mic segments whose text
   matches an overlapping remote segment.
 
