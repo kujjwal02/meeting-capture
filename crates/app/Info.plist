@@ -5,5 +5,9 @@
   <!-- Tray-only app: no Dock icon, even for the moment before setup() runs. -->
   <key>LSUIElement</key>
   <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Meeting Capture records your side of a call.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>Meeting Capture records the other side of a call.</string>
 </dict>
 </plist>
