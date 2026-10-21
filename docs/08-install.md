@@ -67,9 +67,11 @@ store.
 
 ## Upgrade
 
-From v0.2.0, the app updates itself. It checks the GitHub releases at launch and every 6 hours, and
-downloads a newer version in the background. Then the tray menu shows "Install update <version>
-and restart". If you don't pick it, the update installs the next time the app quits.
+From v0.2.0, the app updates itself. It checks the GitHub releases at launch and about every
+hour while the computer is awake, and downloads a newer version in the background. Then the tray
+menu shows "Install update <version> and restart". If you don't pick it, the update installs the
+next time the app quits. To check at once, pick "Check for updates" in the tray. A notification
+says whether an update is ready, or why the check failed.
 
 The update keeps the quarantine flag off, so it opens without a prompt. `brew upgrade` skips the
 app, because the cask is marked as self-updating.

@@ -88,7 +88,7 @@ Done when:
   `.p12` file. `just release` and the Release workflow sign with it.
 - [x] Create the signing identity.
 - [ ] Install the v0.1.0 DMG from the GitHub release and take one Meet call with it.
-- [x] The app checks GitHub releases every 6 hours, downloads a newer version, and installs it from
+- [x] The app checks GitHub releases every hour, downloads a newer version, and installs it from
   the tray item or at quit.
 - [x] Check workflow: `just check` on macOS, clippy on Windows. Release workflow on a `v*` tag:
   build, sign, publish, update the Homebrew cask.
