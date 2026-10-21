@@ -24,6 +24,10 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
+    "resources": {
+      "../../extension/": "mc-meet/",
+      "../../LICENSE": "mc-meet/LICENSE"
+    },
     "createUpdaterArtifacts": true,
     "macOS": {
       "minimumSystemVersion": "14.4",

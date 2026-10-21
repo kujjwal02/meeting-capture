@@ -10,6 +10,7 @@ mod calls;
 mod finished_logs;
 mod huddles;
 mod launch;
+mod meet_extension;
 mod meetings;
 mod settings_window;
 mod tray;
@@ -165,6 +166,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     });
     tray::create(app.handle())?;
     updates::start(app.handle());
+    meet_extension::start(app.handle());
     if let Some(pipeline) = pipeline {
         check_google_accounts(app.handle().clone());
         huddles::start(app.handle(), &pipeline);

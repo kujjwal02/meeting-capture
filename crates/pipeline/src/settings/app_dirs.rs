@@ -109,6 +109,12 @@ impl AppDirs {
         &self.browser_call_socket
     }
 
+    /// The mc-meet folder Chrome loads unpacked. The app rewrites it when its version changes.
+    #[must_use]
+    pub fn meet_extension_dir(&self) -> PathBuf {
+        self.data_dir.join("mc-meet")
+    }
+
     /// Layout profiles that override the built-in ones, for a Slack release the app does not
     /// know yet.
     #[must_use]

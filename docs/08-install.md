@@ -61,7 +61,7 @@ store.
    Settings, Privacy & Security, Accessibility.
 2. Load a Google OAuth client and sign in. Follow [Google setup](06-google-setup.md).
 3. Pick the LLM provider in Settings. See [LLM extraction](07-llm-extraction.md).
-4. Load the mc-meet extension. Follow [mc-meet](09-meet-extension.md#install).
+4. Pick "Install mc-meet in Chrome…" in the tray. Follow [mc-meet](09-meet-extension.md#install).
 5. Take a Meet call. The note appears in the vault after the call ends, when the call had at least
    3 caption lines.
 
@@ -74,9 +74,12 @@ and restart". If you don't pick it, the update installs the next time the app qu
 The update keeps the quarantine flag off, so it opens without a prompt. `brew upgrade` skips the
 app, because the cask is marked as self-updating.
 
-mc-meet does not update itself. When the tray warns that its protocol is older than the app's,
-replace its folder with the one in the new release's `mc-meet_<version>.zip`. See
-[mc-meet](09-meet-extension.md#install).
+mc-meet updates with the app. The app rewrites the extension's folder, and mc-meet reloads itself
+after the next call ends. See [mc-meet](09-meet-extension.md#install).
+
+From a version that shipped `mc-meet_<version>.zip`, pick "Install mc-meet in Chrome…" in the tray
+once. Remove the old mc-meet from `chrome://extensions` first: both copies have the same ID, so
+Chrome keeps only one.
 
 To upgrade v0.1.0, which has no updater, use one of these:
 
