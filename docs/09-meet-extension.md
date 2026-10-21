@@ -116,7 +116,7 @@ unknown fields are ignored on both sides, so either side can be newer.
 
 | `type` | Fields | When |
 | --- | --- | --- |
-| `welcome` | `protocol`, `app_version`, `open_sessions` (session IDs the app still has open), `settings` | Reply to `hello`. |
+| `welcome` | `protocol`, `app_version`, `folder_version` (the version in the folder the app installs mc-meet into, or null), `open_sessions` (session IDs the app still has open), `settings` | Reply to `hello`. |
 | `ack` | `seq` | After the event is appended to its log. |
 | `settings` | `settings` | After a save in the settings window, to every welcomed port. |
 | `app_unavailable` | none | From host mode when the app did not start in 10 s. |
@@ -221,21 +221,32 @@ stored value the content script hides captions.
 
 ## Install
 
-Each GitHub release has `mc-meet_<version>.zip`. Chrome installs extensions from outside the
-Chrome Web Store only as an unpacked folder.
+Chrome installs extensions from outside the Chrome Web Store only as an unpacked folder. The app
+bundles mc-meet and keeps that folder for you:
 
-1. Download `mc-meet_<version>.zip` from the
-   [latest release](https://github.com/kujjwal02/meeting-capture/releases/latest). Unzip it into a
-   folder you keep, such as `~/Applications/mc-meet`. Chrome loads the extension from that folder
-   at each start.
-2. Open `chrome://extensions`. Turn on Developer mode.
-3. Click "Load unpacked". Pick the `mc-meet` folder from the zip. From a clone, pick the repo's
-   `extension/` folder.
-4. Start the app once, so it writes the native host manifest.
+- macOS: `~/Library/Application Support/com.ujjwalkumar.meetingcapture/mc-meet`
+- Windows: `%APPDATA%\ujjwalkumar\meetingcapture\data\mc-meet`
 
-To update, replace the folder with the new release's `mc-meet` folder, or pull the repo. Then click
-the reload icon on mc-meet in `chrome://extensions`. The tray warns when the extension's protocol
-is older than the app's.
+At each start, the app checks the folder's manifest version. When it differs from the app's
+version, the app copies its bundled extension there, stamped with its own version, and leaves out
+the docs. The tray item below always copies it again, which repairs a folder with missing files.
+
+To install:
+
+1. In the tray, pick "Install mc-meet in Chrome…". The app shows the folder in Finder or Explorer
+   and opens `chrome://extensions` in Chrome.
+2. Turn on Developer mode.
+3. Drag the `mc-meet` folder onto the page, or click "Load unpacked" and pick it.
+
+For Brave, Edge or another Chromium browser, open its extensions page and load the same folder.
+
+Updates need no steps. In `welcome`, the app sends the folder's version as `folder_version`. When
+that differs from the extension's version, the worker waits until the last call ends and its port
+closes, then calls `chrome.runtime.reload()`, so Chrome reads the new files. It reloads once per
+folder version and stores that version in `reloaded_for`. A folder the app does not manage
+therefore reloads once, not after every call.
+
+From a clone, load the repo's `extension/` folder instead, and click its reload icon after a pull.
 
 ### Dev runs on macOS
 

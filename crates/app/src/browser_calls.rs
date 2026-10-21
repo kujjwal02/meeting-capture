@@ -112,6 +112,8 @@ enum AppMessage {
     Welcome {
         protocol: u32,
         app_version: &'static str,
+        /// The version in the folder the app installs mc-meet into, when it has one.
+        folder_version: Option<String>,
         open_sessions: Vec<String>,
         settings: MeetSettingsMessage,
     },
@@ -328,6 +330,7 @@ impl Port {
                     let welcome = AppMessage::Welcome {
                         protocol: PROTOCOL,
                         app_version: env!("CARGO_PKG_VERSION"),
+                        folder_version: crate::meet_extension::folder_version(&self.app),
                         open_sessions,
                         settings: (*meet_settings.borrow_and_update()).into(),
                     };

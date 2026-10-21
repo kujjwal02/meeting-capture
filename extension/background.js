@@ -6,6 +6,7 @@
 // Storage keys: one per field of the session state in session-rules.js, plus
 //   q:<seq>       an event message waiting for its ack
 //   settings      the app's [meet] settings, which main.js reads
+//   reloaded_for  the folder version mc-meet last reloaded itself for
 
 import { decide, hasOpenSessions, restoreState, STATE_KEYS } from "./session-rules.js";
 
@@ -17,11 +18,14 @@ const RECONNECT_ALARM = "mc-meet-reconnect";
 const PENDING_END_ALARM = "mc-meet-pending-end";
 const QUEUE_PREFIX = "q:";
 const SETTINGS_KEY = "settings";
+const RELOADED_FOR_KEY = "reloaded_for";
 
 let nativePort = null;
 let isWelcomed = false;
 let backoffMs = BACKOFF_MIN_MS;
 let reconnectTimer = null;
+// The folder version to reload for once no call is open, or null.
+let pendingReloadFor = null;
 
 // Every storage change and native send runs on this chain, so seq order holds on the wire.
 let chain = Promise.resolve();
@@ -140,7 +144,26 @@ async function onAck(seq) {
     nativePort.disconnect();
     nativePort = null;
     isWelcomed = false;
+    await reloadIfPending();
   }
+}
+
+// The app rewrites mc-meet's folder, stamped with its own version, when that version changes, and
+// sends the folder's version in welcome. Chrome reads the new files only on a reload. A reload in
+// a call would orphan the Meet tab's content scripts, so it waits for the worker to go idle. It
+// runs once per folder version, so a folder the app does not manage, such as a clone, does not
+// reload after every call.
+async function noteFolderVersion(folderVersion) {
+  if (!folderVersion || folderVersion === chrome.runtime.getManifest().version) return;
+  const reloadedFor = (await chrome.storage.local.get(RELOADED_FOR_KEY))[RELOADED_FOR_KEY];
+  if (reloadedFor !== folderVersion) pendingReloadFor = folderVersion;
+}
+
+async function reloadIfPending() {
+  if (pendingReloadFor === null) return;
+  console.info("mc-meet: reloading for folder version", pendingReloadFor);
+  await chrome.storage.local.set({ [RELOADED_FOR_KEY]: pendingReloadFor });
+  chrome.runtime.reload();
 }
 
 function scheduleReconnect() {
@@ -176,6 +199,7 @@ function connectNative() {
       backoffMs = BACKOFF_MIN_MS;
       console.info("mc-meet: app", message.app_version, "open sessions", message.open_sessions);
       storeSettings(message.settings);
+      serially(() => noteFolderVersion(message.folder_version));
       serially(resendUnacked);
     } else if (message?.type === "settings") {
       storeSettings(message.settings);

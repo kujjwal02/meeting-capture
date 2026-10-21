@@ -21,6 +21,9 @@ to the meeting-capture app over native messaging. The design is in `docs/09-meet
 
 ## Load it unpacked
 
+A released app installs its own copy and updates it. See `docs/09-meet-extension.md`. These steps
+load the clone's folder for development.
+
 1. Open `chrome://extensions`. Turn on Developer mode.
 2. Click "Load unpacked". Pick this `extension/` folder.
 3. Check that the card shows ID `pbpjeihgfeefjehjnjknnefomhkblcfk`. The app's host manifest allows
