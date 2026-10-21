@@ -122,8 +122,8 @@ just hooks
 
 To release, set `version` in `Cargo.toml`, merge to `main`, then push a tag such as `v0.3.0`. The
 Release workflow runs the checks, builds and signs the app, publishes the GitHub release, and
-updates the [Homebrew cask](https://github.com/kujjwal02/homebrew-tap). Installed apps pick up the
-release within 6 hours.
+updates the [Homebrew cask](https://github.com/kujjwal02/homebrew-tap). Installed apps check for a new
+release about every hour while the computer is awake.
 
 To keep a dev run away from your real job store, set `MEETING_CAPTURE_HOME` to a scratch folder. The
 app then reads `config/settings.toml` and writes `data/` inside it. It also runs next to the

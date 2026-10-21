@@ -32,6 +32,7 @@ enum MenuAction {
     RetryFailed,
     OpenAccessibilitySettings,
     InstallUpdate,
+    CheckForUpdates,
     InstallMeetExtension,
     StartAtLogin,
     OpenSettings,
@@ -48,6 +49,7 @@ impl MenuAction {
             MenuAction::RetryFailed => "retry-failed".to_owned(),
             MenuAction::OpenAccessibilitySettings => "open-accessibility-settings".to_owned(),
             MenuAction::InstallUpdate => "install-update".to_owned(),
+            MenuAction::CheckForUpdates => "check-for-updates".to_owned(),
             MenuAction::InstallMeetExtension => "install-meet-extension".to_owned(),
             MenuAction::StartAtLogin => "start-at-login".to_owned(),
             MenuAction::OpenSettings => "open-settings".to_owned(),
@@ -71,6 +73,7 @@ impl MenuAction {
             MenuAction::RetryFailed,
             MenuAction::OpenAccessibilitySettings,
             MenuAction::InstallUpdate,
+            MenuAction::CheckForUpdates,
             MenuAction::InstallMeetExtension,
             MenuAction::StartAtLogin,
             MenuAction::OpenSettings,
@@ -141,6 +144,8 @@ fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
             &label,
             true,
         )?)?;
+    } else {
+        menu.append(&check_for_updates_entry(app, &state)?)?;
     }
     menu.append(&action_entry(
         app,
@@ -352,6 +357,17 @@ fn meeting_submenu(
     Ok(submenu)
 }
 
+fn check_for_updates_entry(app: &AppHandle, state: &AppState) -> tauri::Result<MenuItem<Wry>> {
+    // A dev build has no bundle to replace, so it never checks.
+    if cfg!(debug_assertions) {
+        return label_entry(app, "Check for updates (release builds only)");
+    }
+    if state.updates.is_checking() {
+        return label_entry(app, "Checking for updates…");
+    }
+    action_entry(app, &MenuAction::CheckForUpdates, "Check for updates", true)
+}
+
 // A login item from a dev build would start the debug binary at login on the real folders, and
 // its single-instance lock would then stop the installed app.
 #[cfg(debug_assertions)]
@@ -416,6 +432,7 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
             let app = app.clone();
             tauri::async_runtime::spawn_blocking(move || updates::install_and_restart(&app));
         }
+        MenuAction::CheckForUpdates => updates::check_now(app),
         MenuAction::InstallMeetExtension => {
             let app = app.clone();
             tauri::async_runtime::spawn_blocking(move || crate::meet_extension::show_setup(&app));
@@ -478,7 +495,7 @@ fn label_entry(app: &AppHandle, label: &str) -> tauri::Result<MenuItem<Wry>> {
     MenuItem::new(app, label, false, None::<&str>)
 }
 
-fn shorten(text: &str, max_chars: usize) -> String {
+pub(crate) fn shorten(text: &str, max_chars: usize) -> String {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
     match line.char_indices().nth(max_chars) {
         Some((cut, _)) => format!("{}…", &line[..cut]),
