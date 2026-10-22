@@ -9,7 +9,7 @@ vault.
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS%20(Apple%20silicon)-lightgrey)
 
 > [!NOTE]
-> v0.6.1 is an early release for Apple silicon Macs. It turns Google Meet captions, read by the
+> v0.6.2 is an early release for Apple silicon Macs. It turns Google Meet captions, read by the
 > mc-meet extension, and Slack huddle captions into notes, and logs when each call starts and ends.
 > The app installs mc-meet and updates it, and mc-meet hides Meet's caption box while it records
 > captions. Audio capture, Teams and Zoom
