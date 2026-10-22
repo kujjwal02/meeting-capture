@@ -22,6 +22,7 @@ offset 3 (legacy captions). Source: T:10409-10413.
 | Message | Path or field | Meaning | Source |
 | --- | --- | --- | --- |
 | `captions_v2` frame | `1` | utterance | T:9038 (`CaptionsV2Packet`), A:1724 |
+| `captions_v2` frame | `1.1` | utterance, in frames seen from October 2026; `1` then has no field `3` | live frame skeleton |
 | utterance | `1` varint | utterance ID (int64, may exceed 2^53) | T:9109, A:1734 |
 | utterance | `2` varint | version, grows as Meet revises the text | T:9109, A:1735 |
 | utterance | `3` | caption | T:9109, A:1736 |

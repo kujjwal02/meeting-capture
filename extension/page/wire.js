@@ -199,11 +199,13 @@
   // ---- Meet messages. Each decoder returns { ok: true, ... } or { ok: false, reason }.
 
   // captions_v2: CaptionsV2Packet { 1: utterance { 1: id, 2: version, 3: caption { 3: text,
-  // 4: language, 6: device id } } }
+  // 4: language, 6: device id } } }. Meet also sends the utterance one level deeper, at 1.1.
+  // An utterance's field 1 is a varint id, a wrapper's is a message, so field 3 tells them apart.
   function decodeCaptionV2(bytes) {
     let utterance;
     try {
-      utterance = messageField(parseFields(bytes), 1);
+      const first = messageField(parseFields(bytes), 1);
+      utterance = first && !first.has(3) ? messageField(first, 1) : first;
     } catch {
       return { ok: false, reason: "decode-threw" };
     }
