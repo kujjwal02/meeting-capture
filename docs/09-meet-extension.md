@@ -27,7 +27,8 @@ flowchart LR
 | Page hook | `extension/page-hook.js` and `extension/page/wire.js`, MAIN world, `document_start` | Wraps `RTCPeerConnection` and decodes Meet's `collections`, `captions`, `captions_v2` and `meet_messages` data channels. Opens the two caption channels itself. |
 | Content script | `extension/content/`, isolated world | Finds call start and end, reads the DOM when the channels give nothing, and owns the call session for its tab. |
 | Session rules | `extension/session-rules.js`, service worker | Decides what each tab message, tab change and alarm does to the worker's sessions. Numbers events. Makes no `chrome.*` calls and reads no clock, so it also runs in Node. |
-| Service worker | `extension/background.js` | Stores the session state and queued events in one write, holds the native port, resends after a reconnect. |
+| Service worker | `extension/background.js` | Stores the session state and queued events in one write, holds the native port, resends after a reconnect. Shows each Meet tab's call status on the toolbar icon. |
+| Popup | `extension/popup/` | The active tab's call status, and a "Save debug report" button. |
 | Host mode | `crates/native-host`, run by the app binary | Chrome starts `meeting-capture chrome-extension://<id>/`. `main` sees the argument and relays frames between stdio and the app socket before Tauri starts. |
 | Call log | `crates/app/src/browser_calls.rs` | Listens on the socket, appends each event to the session log, acks it, ends calls, hands logs to intake. |
 | Parser | `crates/sources/src/browser_call.rs` | Turns a session log into a `Transcript`. |
@@ -78,8 +79,12 @@ unknown fields are ignored on both sides, so either side can be newer.
 
 | `type` | Fields | When |
 | --- | --- | --- |
-| `hello` | `protocol` (integer, now 1), `extension_version` | First message on each port. |
+| `hello` | `protocol` (integer, now 1), `extension_version`, `sessions` (the session IDs the worker has open) | First message on each port. The app counts the port as the holder of those calls. |
 | `event` | `seq`, `session_id`, `event` | Each call event. `seq` grows by one per event for the whole install and survives a worker restart. A new install starts it at the install time in microseconds, so a reinstall mid-call never repeats a `seq` in the session it resumes. |
+| `frame_failed` | `session_id`, `channel` (`captions` or `captions_v2`), `at`, `reason`, `skeleton`, `byte_length`, `bytes_base64` (the frame as received, or null above 256 KB) | A caption channel frame that did not decode. At most 20 per channel per call from the page, and 20 per session from the content script. Failures on `collections` and `meet_messages` stay in the page: a chat or roster frame with nothing to read is common. Not queued: sent only while the app is connected. |
+| `pages_away` | `session_ids`: every session whose tab closed, reloaded or crashed and may still come back | After `welcome`, and whenever the list changes. Not queued. A call all of whose sessions are away shows "the Meet tab closed or reloaded", with no notification. |
+| `page_snapshot` | `session_id`, `snapshot` | Reply to `snapshot_request`. See "Debug material". |
+| `save_debug_report` | `session_id` (the popup's tab session, or null), `with_text` | The popup's "Save debug report" button. The app answers `debug_report_failed` for a `session_id` that is not 1 to 64 letters, digits or hyphens. |
 
 `event.kind` is one of the kinds below. `extension/call-events.js` builds each of them.
 
@@ -89,7 +94,7 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `caption` | `at`, `device_id`, `utterance_id`, `version`, `speaker`, `text`, `source` (`channel` or `dom`) |
 | `chat` | `at`, `message_id`, `device_id` (channel only), `sender`, `text`, `source` |
 | `roster` | `at`, `participants`: list of `{device_id, name, is_self}`, the whole list each time it changes |
-| `health` | `at`, `source` (`channel`, `dom` or `none`), `captions_on` (Meet's captions button is on), `parse_failures`, `detail` |
+| `health` | `at`, `source` (`channel`, `dom` or `none`), `captions_on` (Meet's captions button is on, and Meet does not refuse captions), `captions_unavailable` (Meet refuses captions), `caption_frames_failing` (caption frames fail to decode, with no caption decoded since), `parse_failures`, `detail` |
 | `call_ended` | `at`, `reason` (`left`, `tab_closed`, `kicked`, `page_unload`; the app writes `idle` and `app_restarted`) |
 
 - `caption`: `utterance_id` is a string and `version` an integer. `at` is when the utterance first
@@ -111,6 +116,15 @@ unknown fields are ignored on both sides, so either side can be newer.
   reason for the DOM fallback, or a parse-gap report: after 10 failed frames in a row on one
   channel, it names the failure reasons and a skeleton of the last frame (tag and wire type tree
   with lengths, no text). `parse_failures` counts failed frames on all channels.
+- `captions_unavailable` is true when Meet's captions button is disabled, or its own label says
+  "Live captions are temporarily unavailable". A hover tooltip with that text does not count: it
+  shows only under the pointer. The text match is English only; other UI languages rely on the
+  disabled button.
+- `source` is `channel` only after a caption arrived on the caption channels the page has open.
+  When Meet opens a new meeting connection, the hook opens new caption channels and `source`
+  goes back to `none` until one of them carries a caption.
+- After each `welcome` the worker tells every Meet tab, and each tab sends `health` again: a
+  restarted app has none for the call.
 
 ### App to extension
 
@@ -120,6 +134,19 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `ack` | `seq` | After the event is appended to its log. |
 | `settings` | `settings` | After a save in the settings window, to every welcomed port. |
 | `app_unavailable` | none | From host mode when the app did not start in 10 s. |
+| `call_status` | `calls`: one entry per open Meet call, below | After `welcome`, and whenever a call's status changes. |
+| `snapshot_request` | `session_ids` | When a call gets a problem, at most 5 times per call. |
+| `debug_report_saved` | `path` | Reply to `save_debug_report`. |
+| `debug_report_failed` | `error` | Reply to `save_debug_report`. |
+
+Each `call_status` entry has `session_ids`, `title`, `state` (`waiting`, `recording` or
+`problem`), `reason` and `reason_text` (null unless `problem`), `started_at`, `started_at_label`,
+`recording_since_label`, `caption_count`, `last_caption_at`, `caption_source` (`channel`, `dom`,
+`none` or null), and `problems` (the last 3, oldest first, each `{reason, reason_text, at,
+at_label}`). Labels are clock times such as `21:02 IST` in the app's settings time zone.
+`reason` is one of `captions_off`, `meet_captions_unavailable`, `caption_parse_failures`,
+`captions_silent`, `no_captions`, `extension_disconnected`, `meet_page_away` and
+`huddle_captions_unreadable`. mc-meet shows `reason_text` and needs no other.
 
 The extension keeps each event in `chrome.storage.local` until its `ack`, and resends unacked
 events in `seq` order after `welcome`. The app ignores an event whose `seq` its log already has,
@@ -172,8 +199,8 @@ stored value the content script hides captions.
   monologue in the caption region, so one speaker talking alone gives one caption line, and a call
   with fewer than 3 lines writes no note.
 - Page hook to content script. The hook sends spec events (`caption`, `chat`, `roster`) as
-  `event` messages. It sends its own notices (`parse_gap`, `self_removed`) as `notice` messages,
-  which never reach the app.
+  `event` messages. It sends its own notices (`parse_gap`, `self_removed`, `frame_failed`) as
+  `notice` messages. Only `frame_failed` of a caption channel reaches the app, as `frame_failed`.
 - Roster. From `collections` and the `SyncMeetingSpaceCollections` response. When neither gives a
   roster 30 s into the call, the content script reads the People panel if it is open, else the
   video tiles, every 10 s.
@@ -190,7 +217,65 @@ stored value the content script hides captions.
 - Extension update. The worker injects fresh content scripts into open Meet tabs. They resume the
   tab's session. The old page hook keeps running until the tab reloads.
 - Permissions: `nativeMessaging`, `storage`, `unlimitedStorage` (a long call queued while the app
-  is down), `alarms`, `scripting` (the update injection), host `https://meet.google.com/*`.
+  is down), `alarms`, `scripting` (the update injection), `notifications` (the app is not
+  running), host `https://meet.google.com/*`.
+
+## Call status
+
+The app decides each call's status. mc-meet only shows it, and decides one thing itself: that the
+app is not reachable.
+
+| State | Icon | Badge | Title |
+| --- | --- | --- | --- |
+| No call in the tab | grey ring | none | `mc-meet: connected` |
+| Waiting | grey ring | `…` | `Waiting for captions` |
+| Recording | red dot | `REC` | `Recording since 21:02 IST` |
+| Problem | amber | `!` | `Not recording: <reason>` |
+| App not reachable | grey ring, crossed out | `OFF` | `Meeting Capture is not running` |
+
+- The worker sets the icon, badge and title per Meet tab with `chrome.action`. It keeps the last
+  `call_status` and the app's reachability in `chrome.storage.session`, which the popup reads.
+- The app is not reachable after `app_unavailable`, a failed `connectNative`, or a native port
+  that closed before `welcome`. With a call open, the worker then shows one Chrome notification
+  per outage.
+- The popup shows the state and reason, the title, start time, caption count, the time since the
+  last caption, the caption source (`call` for the channels, `page` for the DOM), the app and
+  mc-meet versions, and the last 3 problems. An open popup keeps the native port open. Opening
+  it with no call starts the app if it is not running, since host mode starts the app.
+- "Save debug report" in the popup sends `save_debug_report` with the tab's session. The app
+  writes the report and reveals it in Finder or Explorer. With no answer in 30 s, the popup says
+  the report was not saved.
+
+## Debug material
+
+The app keeps debug material per call in `debug/<call>/` in the data folder. Raw frames hold call
+speech, so it never leaves the data folder unless the user saves a report. The app deletes debug
+folders after 14 days.
+
+| File | What |
+| --- | --- |
+| `frames.jsonl` | The first 20 `frame_failed` messages of the call, one per line, bytes included. |
+| `lead-up.jsonl` | The last 2 minutes of mc-meet events before the call's first problem, written once. Kept in memory until then. |
+| `page-snapshots.jsonl` | Up to 5 page snapshots per call, one per problem. |
+
+A page snapshot holds the captions button state and the last "captions unavailable" text Meet
+showed on it, the caption source policy's health, the caption region's element tree with each
+text replaced by its length, the last 30 data channels the hook saw with their state, the frame
+counters per channel, Meet's build label when the page exposes it, the Chrome version and the
+mc-meet version. It holds no caption text.
+
+"Save debug report" (tray, or popup) writes `debug-reports/<time>-<call>/` in the data folder:
+`call-status.json`, the `app.log` lines that name the call, the call's session logs and its debug
+files. By default the report keeps only strings under keys known to hold times, ids, versions and
+codes. Every other string becomes `[N chars]`: caption and chat text, speaker, sender and
+participant names, meeting titles and codes, Slack channels, workspaces and window titles, error
+messages and `detail`. Device and message IDs become `device-N` and `message-N`, the same number
+for the same ID across the report, since the DOM reader uses a speaker's name as the device ID.
+Frame bytes are dropped. "Save debug report with caption text" keeps everything.
+
+`just replay-frames <path>` runs the frames of a report folder, a call's debug folder or a
+`frames.jsonl` through `extension/page/wire.js` in Node, and prints what each frame decodes to
+now. A report without caption text has no bytes to replay.
 
 ## App rules
 
@@ -216,8 +301,8 @@ stored value the content script hides captions.
   event.
 - Attendees are every participant in any `roster` event, the local user included. Speakers and
   chat senders join the list when no roster arrived.
-- The tray shows: extension connected or not, the current call, the caption source (channel or
-  DOM), and the last health problem.
+- The tray shows whether mc-meet is connected, and one status line per open call. See
+  `docs/02-architecture.md`, "Call status".
 
 ## Install
 
@@ -237,6 +322,7 @@ To install:
    and opens `chrome://extensions` in Chrome.
 2. Turn on Developer mode.
 3. Drag the `mc-meet` folder onto the page, or click "Load unpacked" and pick it.
+4. Pin mc-meet from the extensions menu in the toolbar, so its call status stays in view.
 
 For Brave, Edge or another Chromium browser, open its extensions page and load the same folder.
 

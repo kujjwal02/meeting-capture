@@ -2,7 +2,8 @@
 // It wraps RTCPeerConnection to read Meet's data channels, opens the caption channels itself,
 // and reads two Meet RPC responses through a fetch wrapper. It sends what it reads to the
 // content script as JSON strings in "mc-meet:page" events, and takes commands from
-// "mc-meet:content" events. It makes no network requests of its own.
+// "mc-meet:content" events: listen, and snapshot for debug material. It makes no network
+// requests of its own.
 (() => {
   if (window.__mcMeetHookInstalled) return;
   window.__mcMeetHookInstalled = true;
@@ -18,6 +19,8 @@
   const MAX_EARLY_MESSAGES = 2000;
   const REOPEN_ATTEMPTS = 5;
   const REOPEN_DELAY_MS = 2000;
+  // Data channels a snapshot lists, newest last.
+  const SNAPSHOT_CHANNELS = 30;
 
   // Messages wait here until the content script says it listens.
   const earlyMessages = [];
@@ -26,6 +29,9 @@
   let captionChannelsOpenedAt;
   const ownChannels = new WeakSet();
   const watchedChannels = new WeakSet();
+  // { label, isOwn, channel } per channel seen, newest last. A closed channel's entry lets go of
+  // it, so Meet's closed channels and their connections can be freed.
+  const seenChannels = [];
 
   function post(message) {
     if (!isContentListening) {
@@ -94,6 +100,7 @@
     }
     channel.binaryType = "arraybuffer";
     ownChannels.add(channel);
+    noteChannel(channel);
     watchChannel(channel);
     channel.addEventListener("close", () => {
       const isLive =
@@ -109,12 +116,23 @@
   function adoptMeetingConnection(connection) {
     if (meetingConnection === connection) return;
     meetingConnection = connection;
+    reader.newCall();
     for (const label of CAPTION_LABELS) openCaptionChannel(connection, label, 0);
     captionChannelsOpenedAt = Date.now();
     postHookState();
   }
 
+  function noteChannel(channel) {
+    const entry = { label: channel.label, isOwn: ownChannels.has(channel), channel };
+    channel.addEventListener("close", () => {
+      entry.channel = null;
+    });
+    seenChannels.push(entry);
+    if (seenChannels.length > SNAPSHOT_CHANNELS) seenChannels.shift();
+  }
+
   function onChannel(connection, channel) {
+    noteChannel(channel);
     watchChannel(channel);
     if (channel.label === "collections") adoptMeetingConnection(connection);
   }
@@ -200,6 +218,10 @@
     } catch {
       return;
     }
+    if (command?.t === "snapshot") {
+      postSnapshot();
+      return;
+    }
     if (command?.t !== "listen") return;
     // A content script that starts after the hook (a reload of the extension) gets the
     // early messages once and the current roster again.
@@ -210,6 +232,26 @@
     const roster = reader.lastRoster();
     if (roster) post({ t: "reading", reading: roster });
   });
+
+  // Channel states, frame counters and Meet's build. No frame content.
+  function postSnapshot() {
+    post({
+      t: "page_snapshot",
+      page: {
+        channels: seenChannels.map((entry) => ({
+          label: entry.label,
+          ready_state: entry.channel?.readyState ?? "closed",
+          is_own: entry.isOwn,
+        })),
+        has_meeting_connection: meetingConnection !== undefined,
+        meeting_connection_state: meetingConnection?.connectionState ?? null,
+        caption_channels_opened_at: captionChannelsOpenedAt ?? null,
+        frame_counters: reader.counters(),
+        // Meet's front-end build label, when the page exposes it.
+        meet_build: window.WIZ_global_data?.cfb2h ?? null,
+      },
+    });
+  }
 
   // The content script may have loaded first and missed nothing but this signal.
   document.dispatchEvent(new CustomEvent("mc-meet:hook-ready"));

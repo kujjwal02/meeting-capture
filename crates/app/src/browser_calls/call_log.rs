@@ -7,12 +7,22 @@ use std::path::Path;
 use jiff::Timestamp;
 use serde::Serialize;
 use sources::append_log::AppendLog;
-use sources::browser_call::{self, EndReason, LogSummary};
+use sources::browser_call::{self, CallEvent, EndReason, LogSummary};
+
+use super::call_book::caption_line_key;
 
 pub(super) struct CallLog {
     log: AppendLog,
     /// Every extension `seq` in the log, so a resent event is not written twice.
     seqs: HashSet<u64>,
+}
+
+/// An existing log, opened for more lines.
+pub(super) struct Reopened {
+    pub(super) log: CallLog,
+    pub(super) summary: LogSummary,
+    /// The caption lines the log holds, by `caption_line_key`.
+    pub(super) caption_line_keys: Vec<String>,
 }
 
 /// One line as written. The app's own lines have no `seq`.
@@ -33,16 +43,36 @@ impl CallLog {
         })
     }
 
-    /// Opens an existing log for more lines, with the summary of the lines it has. A torn last
-    /// line is cut first.
-    pub(super) fn reopen(path: &Path) -> std::io::Result<(Self, LogSummary)> {
+    /// Opens an existing log for more lines, with what the lines it has say. A torn last line
+    /// is cut first.
+    pub(super) fn reopen(path: &Path) -> std::io::Result<Reopened> {
         let contents = std::fs::read(path)?;
         let lines = browser_call::read_lines(&contents).map_err(std::io::Error::other)?;
+        let caption_line_keys: HashSet<String> = lines
+            .iter()
+            .filter_map(|line| match &line.event {
+                CallEvent::Caption {
+                    device_id,
+                    utterance_id,
+                    ..
+                } => Some(caption_line_key(device_id, utterance_id)),
+                CallEvent::CallStarted { .. }
+                | CallEvent::Chat { .. }
+                | CallEvent::Roster { .. }
+                | CallEvent::Health { .. }
+                | CallEvent::CallEnded { .. }
+                | CallEvent::Unknown => None,
+            })
+            .collect();
         let log = Self {
             log: AppendLog::reopen(path, &contents)?,
             seqs: lines.iter().filter_map(|line| line.seq).collect(),
         };
-        Ok((log, browser_call::summarize(&lines)))
+        Ok(Reopened {
+            log,
+            summary: browser_call::summarize(&lines),
+            caption_line_keys: caption_line_keys.into_iter().collect(),
+        })
     }
 
     pub(super) fn path(&self) -> &Path {

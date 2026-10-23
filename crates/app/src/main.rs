@@ -6,6 +6,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod browser_calls;
+mod call_debug;
+mod call_status;
 mod calls;
 mod finished_logs;
 mod huddles;
@@ -17,7 +19,7 @@ mod tray;
 mod updates;
 
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 
 use pipeline::Pipeline;
 use pipeline::settings::{AppDirs, SettingsStore};
@@ -32,26 +34,10 @@ pub(crate) struct AppState {
     /// Exists without a pipeline, so the settings window can save a fix for settings that failed
     /// to load.
     pub settings: Arc<SettingsStore>,
-    pub huddle_status: Mutex<huddles::HuddleStatus>,
     pub browser_calls: browser_calls::BrowserCalls,
     pub calls: calls::Calls,
+    pub call_debug: call_debug::CallDebug,
     pub updates: updates::Updates,
-}
-
-impl AppState {
-    pub fn huddle_status(&self) -> huddles::HuddleStatus {
-        self.huddle_status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    pub fn set_huddle_status(&self, status: huddles::HuddleStatus) {
-        *self
-            .huddle_status
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = status;
-    }
 }
 
 // The env var `AppDirs::locate` reads. A dev run with its own home is a separate instance.
@@ -155,18 +141,21 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         settings_store.app_dirs().browser_call_log_dir(),
         settings_store.meet(),
     );
+    let call_debug = call_debug::CallDebug::new(settings_store.app_dirs());
     app.manage(AppState {
         pipeline: pipeline.clone(),
         pipeline_error,
         settings: settings_store,
-        huddle_status: Mutex::new(huddles::HuddleStatus::Idle),
         browser_calls,
         calls: calls::Calls::new(),
+        call_debug,
         updates: updates::Updates::default(),
     });
     tray::create(app.handle())?;
     updates::start(app.handle());
     meet_extension::start(app.handle());
+    call_status::start(app.handle());
+    call_debug::start(app.handle());
     if let Some(pipeline) = pipeline {
         check_google_accounts(app.handle().clone());
         huddles::start(app.handle(), &pipeline);

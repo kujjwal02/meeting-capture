@@ -19,6 +19,8 @@ pub(super) struct Book {
     overlay_logged: VecDeque<Caption>,
     overlay_live: Option<LiveOverlay>,
     overlay_lines: u64,
+    /// Changes to the live overlay line before it is final.
+    overlay_live_edits: u64,
     tiles: BTreeMap<String, Tile>,
     language: Option<String>,
 }
@@ -30,6 +32,16 @@ struct LiveOverlay {
 }
 
 impl Book {
+    pub(super) fn caption_lines(&self) -> u64 {
+        self.row_captions.len() as u64 + self.overlay_lines
+    }
+
+    /// Grows with every new or changed caption line, so one person talking on in one line
+    /// still counts as captions arriving.
+    pub(super) fn caption_changes(&self) -> u64 {
+        self.caption_lines() + self.row_edits + self.overlay_live_edits
+    }
+
     pub(super) fn has_tiles(&self) -> bool {
         !self.tiles.is_empty()
     }
@@ -154,7 +166,10 @@ impl Book {
         }
         let live = match live {
             Some(mut live) if !is_live_finished && live.caption.speaker == newest.speaker => {
-                live.caption = newest.clone();
+                if live.caption != *newest {
+                    self.overlay_live_edits += 1;
+                    live.caption = newest.clone();
+                }
                 live
             }
             previous => {

@@ -1,15 +1,19 @@
 //! Receives mc-meet's call events through host mode: appends each to its session log, acks it,
-//! ends calls, shows what the extension reports, and turns each finished log into a meeting.
+//! ends calls, feeds the call status board, and turns each finished log into a meeting. It also
+//! takes mc-meet's debug material and sends mc-meet the status it shows.
 
 mod call_book;
 mod call_log;
 mod log_folder;
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use native_host::frames::{LengthOrder, read_frame, write_frame};
 use native_host::socket::{AppEnd, CallListener};
 use pipeline::Pipeline;
@@ -18,18 +22,23 @@ use serde::{Deserialize, Serialize};
 use sources::browser_call::HealthSource;
 use tauri::{AppHandle, Manager as _};
 use tokio::io::{AsyncWrite, ReadHalf};
-use tokio::sync::watch;
+use tokio::sync::{broadcast, mpsc, watch};
 use tracing::Instrument as _;
 
-use self::call_book::{CallBook, EventError, Logged, Now};
+pub(crate) use self::call_book::InvalidSessionId;
+use self::call_book::{CallBook, EventError, Logged, Now, check_session_id};
 use self::log_folder::LogFolder;
 use crate::AppState;
+use crate::call_debug::{FailedFrame, FrameChannel};
+use crate::call_status::{BoardView, CallState, Moment, Observation, ProblemReason, clock};
 use crate::calls::{CallEndReason, CallPlatform};
 use crate::finished_logs::{self, LogSource};
 
 /// The protocol this app speaks. An extension that says an older one gets a tray warning.
 const PROTOCOL: u32 = 1;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+/// Snapshot requests a slow port may fall behind by before it misses some.
+const SNAPSHOT_REQUEST_BACKLOG: usize = 16;
 
 /// The call book, shared by every connection.
 pub(crate) struct BrowserCalls {
@@ -37,6 +46,10 @@ pub(crate) struct BrowserCalls {
     next_port_id: AtomicU64,
     /// Every welcomed port sends mc-meet the new value.
     meet_settings: watch::Sender<MeetSettings>,
+    /// The Meet calls' status, which every welcomed port sends mc-meet when it changes.
+    call_status: watch::Sender<CallStatusMessage>,
+    /// Session ids whose page snapshot the app wants. Every welcomed port forwards them.
+    snapshot_requests: broadcast::Sender<Vec<String>>,
 }
 
 /// What the tray shows for mc-meet.
@@ -44,15 +57,6 @@ pub(crate) struct BrowserCalls {
 pub(crate) struct BrowserCallStatus {
     pub is_connected: bool,
     pub is_extension_outdated: bool,
-    pub calls: Vec<CallStatus>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CallStatus {
-    /// The title Meet showed, else the meeting code.
-    pub title: Option<String>,
-    pub caption_source: Option<HealthSource>,
-    pub health_problem: Option<String>,
 }
 
 impl BrowserCalls {
@@ -62,7 +66,60 @@ impl BrowserCalls {
             book: Mutex::new(CallBook::new(LogFolder::new(log_dir))),
             next_port_id: AtomicU64::new(0),
             meet_settings: watch::Sender::new(meet_settings),
+            call_status: watch::Sender::new(CallStatusMessage::default()),
+            snapshot_requests: broadcast::channel(SNAPSHOT_REQUEST_BACKLOG).0,
         }
+    }
+
+    /// Sends mc-meet the Meet calls' status when it changed. Times in labels use `time_zone`.
+    pub fn publish_call_status(&self, view: &BoardView, time_zone: &TimeZone) {
+        let message = {
+            let book = self.lock();
+            CallStatusMessage {
+                calls: view
+                    .calls
+                    .iter()
+                    .filter(|call| call.platform == CallPlatform::Meet)
+                    .map(|call| MeetCallStatus::new(call, book.sessions_of(&call.id), time_zone))
+                    .collect(),
+            }
+        };
+        self.call_status.send_if_modified(|current| {
+            let is_changed = *current != message;
+            *current = message;
+            is_changed
+        });
+    }
+
+    /// Asks mc-meet for a page snapshot of each tab in the call.
+    pub fn request_page_snapshot(&self, call_id: &Path) {
+        let session_ids = self.lock().sessions_of(call_id);
+        if session_ids.is_empty() {
+            return;
+        }
+        // An error only means no port is open; the snapshot is then lost, as the page is.
+        let _unheard = self.snapshot_requests.send(session_ids);
+    }
+
+    /// The log a session writes to, open or ended. `session_id` is checked: it names files.
+    pub fn call_of_session(&self, session_id: &str) -> Result<Option<PathBuf>, InvalidSessionId> {
+        check_session_id("session_id", session_id)?;
+        let book = self.lock();
+        if let Some(log_path) = book.log_path_of(session_id) {
+            return Ok(Some(log_path));
+        }
+        Ok(book.logs().find(session_id).ok().flatten())
+    }
+
+    /// The sessions of a call: those writing to it now, and the one that created its log.
+    pub fn sessions_of_call(&self, call_id: &Path) -> Vec<String> {
+        let mut sessions = self.lock().sessions_of(call_id);
+        if let Some(first) = log_folder::first_session_id(call_id)
+            && !sessions.contains(&first)
+        {
+            sessions.push(first);
+        }
+        sessions
     }
 
     /// Sends the settings to every welcomed mc-meet port. A port stays open through a call, so a
@@ -95,11 +152,43 @@ enum ExtensionMessage {
         protocol: u32,
         #[serde(default)]
         extension_version: Option<String>,
+        /// The sessions the worker has open. Older extensions leave it out.
+        #[serde(default)]
+        sessions: Vec<String>,
     },
     Event {
         seq: u64,
         session_id: String,
         event: serde_json::Value,
+    },
+    /// A data channel frame that did not decode. Not queued: one lost on a disconnect is fine.
+    FrameFailed {
+        session_id: String,
+        channel: FrameChannel,
+        at: Timestamp,
+        reason: String,
+        skeleton: String,
+        byte_length: u64,
+        #[serde(default)]
+        bytes_base64: Option<String>,
+    },
+    /// The page's state, in reply to `snapshot_request`.
+    PageSnapshot {
+        session_id: String,
+        snapshot: serde_json::Value,
+    },
+    /// The sessions whose tab went away, every one each time the list changes, and after
+    /// `welcome`. mc-meet ends each in 5 minutes unless its tab comes back.
+    PagesAway {
+        session_ids: Vec<String>,
+    },
+    /// The popup's "Save debug report" button.
+    SaveDebugReport {
+        /// The popup's tab session, if the tab is in a call.
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default, rename = "with_text")]
+        is_with_text: bool,
     },
     /// A type from a newer extension.
     #[serde(other)]
@@ -123,6 +212,106 @@ enum AppMessage {
     Settings {
         settings: MeetSettingsMessage,
     },
+    CallStatus(CallStatusMessage),
+    SnapshotRequest {
+        session_ids: Vec<String>,
+    },
+    DebugReportSaved {
+        path: String,
+    },
+    DebugReportFailed {
+        error: String,
+    },
+}
+
+/// The open Meet calls, as mc-meet shows them on its icon and in its popup.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+struct CallStatusMessage {
+    calls: Vec<MeetCallStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct MeetCallStatus {
+    /// The tabs' sessions writing to the call. mc-meet finds each tab by its session.
+    session_ids: Vec<String>,
+    title: Option<String>,
+    state: StatusWord,
+    reason: Option<ProblemReason>,
+    reason_text: Option<&'static str>,
+    started_at: Timestamp,
+    started_at_label: String,
+    recording_since_label: Option<String>,
+    caption_count: u64,
+    last_caption_at: Option<Timestamp>,
+    caption_source: Option<CaptionSourceWord>,
+    /// The last problems, oldest first.
+    problems: Vec<ProblemStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StatusWord {
+    Waiting,
+    Recording,
+    Problem,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CaptionSourceWord {
+    Channel,
+    Dom,
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+struct ProblemStatus {
+    reason: ProblemReason,
+    reason_text: &'static str,
+    at: Timestamp,
+    at_label: String,
+}
+
+impl MeetCallStatus {
+    fn new(
+        call: &crate::call_status::CallView,
+        session_ids: Vec<String>,
+        time_zone: &TimeZone,
+    ) -> Self {
+        let (state, reason) = match call.state {
+            CallState::Waiting => (StatusWord::Waiting, None),
+            CallState::Recording => (StatusWord::Recording, None),
+            CallState::Problem(reason) => (StatusWord::Problem, Some(reason)),
+        };
+        let caption_source = call.caption_source.map(|source| match source {
+            HealthSource::Channel => CaptionSourceWord::Channel,
+            HealthSource::Dom => CaptionSourceWord::Dom,
+            HealthSource::None => CaptionSourceWord::None,
+        });
+        Self {
+            session_ids,
+            title: call.title.clone(),
+            state,
+            reason,
+            reason_text: reason.map(ProblemReason::describe),
+            started_at: call.started_at,
+            started_at_label: clock(call.started_at, time_zone),
+            recording_since_label: call.recording_since.map(|at| clock(at, time_zone)),
+            caption_count: call.caption_count,
+            last_caption_at: call.last_caption_at,
+            caption_source,
+            problems: call
+                .problems
+                .iter()
+                .map(|problem| ProblemStatus {
+                    reason: problem.reason,
+                    reason_text: problem.reason.describe(),
+                    at: problem.at,
+                    at_label: clock(problem.at, time_zone),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// The settings mc-meet acts on, as the extension reads them.
@@ -255,7 +444,24 @@ impl Port {
             Ok(()) => tracing::info!("port closed"),
             Err(error) => tracing::warn!(exception.message = %error, "port closed on an error"),
         }
-        self.calls().lock().close_port(self.id);
+        let (unheld, is_extension_connected) = {
+            let mut book = self.calls().lock();
+            (book.close_port(self.id), book.is_extension_connected())
+        };
+        let state = self.app.state::<AppState>();
+        state
+            .calls
+            .status()
+            .set_extension_connected(is_extension_connected);
+        for call_id in &unheld {
+            state
+                .calls
+                .status()
+                .observe(call_id, Observation::MeetPortHeld(false), Moment::now());
+            state
+                .call_debug
+                .remember(call_id, serde_json::json!({ "type": "port_closed" }));
+        }
         crate::tray::refresh(&self.app);
     }
 
@@ -269,10 +475,12 @@ impl Port {
         to_host: &mut (impl AsyncWrite + Unpin),
     ) -> std::io::Result<()> {
         let mut is_host_known = false;
-        let mut meet_settings = self.calls().meet_settings.subscribe();
-        let mut is_sending_settings = false;
+        // Debug reports are written off the runtime and answered through here.
+        let (reply_sender, replies) = mpsc::unbounded_channel::<AppMessage>();
+        let mut feeds = PortFeeds::new(self.calls(), replies);
+        let mut is_welcomed = false;
         // A frame read dropped halfway would lose its bytes, so one read lives across the
-        // settings sends and owns the read half until it finishes.
+        // other sends and owns the read half until it finishes.
         let mut next_frame = Box::pin(read_next_frame(from_host));
         loop {
             let frame = tokio::select! {
@@ -283,14 +491,8 @@ impl Port {
                         None => break,
                     }
                 },
-                changed = meet_settings.changed(), if is_sending_settings => {
-                    // A closed sender would end every later wait at once.
-                    if changed.is_err() {
-                        is_sending_settings = false;
-                        continue;
-                    }
-                    let settings = (*meet_settings.borrow_and_update()).into();
-                    send(to_host, &AppMessage::Settings { settings }).await?;
+                message = feeds.next(), if is_welcomed => {
+                    send(to_host, &message).await?;
                     continue;
                 }
             };
@@ -310,7 +512,12 @@ impl Port {
                     is_host_known = true;
                 }
                 // Only host mode connects here, and it always speaks first.
-                ExtensionMessage::Hello { .. } | ExtensionMessage::Event { .. }
+                ExtensionMessage::Hello { .. }
+                | ExtensionMessage::Event { .. }
+                | ExtensionMessage::FrameFailed { .. }
+                | ExtensionMessage::PageSnapshot { .. }
+                | ExtensionMessage::PagesAway { .. }
+                | ExtensionMessage::SaveDebugReport { .. }
                     if !is_host_known =>
                 {
                     tracing::warn!("refused a connection that skipped the host hello");
@@ -319,32 +526,36 @@ impl Port {
                 ExtensionMessage::Hello {
                     protocol,
                     extension_version,
+                    sessions,
                 } => {
-                    tracing::info!(
-                        browser.extension.version = extension_version,
-                        browser.extension.protocol = protocol,
-                        "mc-meet connected"
-                    );
-                    let open_sessions = self.calls().lock().greet(self.id, protocol);
-                    crate::tray::refresh(&self.app);
+                    let open_sessions =
+                        self.greet(protocol, extension_version.as_deref(), &sessions);
                     let welcome = AppMessage::Welcome {
                         protocol: PROTOCOL,
                         app_version: env!("CARGO_PKG_VERSION"),
                         folder_version: crate::meet_extension::folder_version(&self.app),
                         open_sessions,
-                        settings: (*meet_settings.borrow_and_update()).into(),
+                        settings: (*feeds.meet_settings.borrow_and_update()).into(),
                     };
                     send(to_host, &welcome).await?;
-                    is_sending_settings = true;
+                    let status = feeds.call_status.borrow_and_update().clone();
+                    send(to_host, &AppMessage::CallStatus(status)).await?;
+                    is_welcomed = true;
                 }
                 ExtensionMessage::Event {
                     seq,
                     session_id,
                     event,
                 } => {
-                    if self.take_event(seq, session_id, &event) {
+                    if self.take_event(seq, &session_id, &event) {
                         send(to_host, &AppMessage::Ack { seq }).await?;
                     }
+                }
+                ExtensionMessage::PagesAway { session_ids } => self.take_away_sessions(session_ids),
+                message @ (ExtensionMessage::FrameFailed { .. }
+                | ExtensionMessage::PageSnapshot { .. }
+                | ExtensionMessage::SaveDebugReport { .. }) => {
+                    self.take_debug_message(message, &reply_sender);
                 }
                 ExtensionMessage::Unknown => {}
             }
@@ -352,8 +563,132 @@ impl Port {
         Ok(())
     }
 
+    /// Records the hello and returns the open sessions for `welcome`.
+    fn greet(
+        &self,
+        protocol: u32,
+        extension_version: Option<&str>,
+        worker_sessions: &[String],
+    ) -> Vec<String> {
+        tracing::info!(
+            browser.extension.version = extension_version,
+            browser.extension.protocol = protocol,
+            "mc-meet connected"
+        );
+        let (open_sessions, held_calls) =
+            self.calls()
+                .lock()
+                .greet(self.id, protocol, worker_sessions);
+        let board = self.app.state::<AppState>().inner().calls.status();
+        board.set_extension_connected(true);
+        for call_id in &held_calls {
+            board.observe(call_id, Observation::MeetPortHeld(true), Moment::now());
+        }
+        crate::tray::refresh(&self.app);
+        open_sessions
+    }
+
+    fn take_away_sessions(&self, session_ids: Vec<String>) {
+        if let Some(invalid) = session_ids
+            .iter()
+            .find_map(|session_id| check_session_id("session_ids", session_id).err())
+        {
+            tracing::warn!(exception.message = %invalid, "ignored a pages_away message that is not valid");
+            return;
+        }
+        let calls = self
+            .calls()
+            .lock()
+            .note_away_sessions(self.id, session_ids.into_iter().collect::<HashSet<_>>());
+        let (board, now) = (
+            self.app.state::<AppState>().inner().calls.status(),
+            Moment::now(),
+        );
+        for (call_id, is_away) in &calls {
+            board.observe(call_id, Observation::MeetPagesAway(*is_away), now);
+        }
+    }
+
+    // Debug material and the popup's report button. None of it is acked or logged as an event.
+    fn take_debug_message(
+        &self,
+        message: ExtensionMessage,
+        reply_sender: &mpsc::UnboundedSender<AppMessage>,
+    ) {
+        match message {
+            ExtensionMessage::FrameFailed {
+                session_id,
+                channel,
+                at,
+                reason,
+                skeleton,
+                byte_length,
+                bytes_base64,
+            } => {
+                let frame = FailedFrame {
+                    channel,
+                    at,
+                    reason,
+                    skeleton,
+                    byte_length,
+                    bytes_base64,
+                };
+                self.take_failed_frame(&session_id, &frame);
+            }
+            ExtensionMessage::PageSnapshot {
+                session_id,
+                snapshot,
+            } => {
+                let Some(call_id) = self.calls().lock().log_path_of(&session_id) else {
+                    return;
+                };
+                self.app
+                    .state::<AppState>()
+                    .call_debug
+                    .record_page_snapshot(&call_id, &session_id, &snapshot);
+            }
+            ExtensionMessage::SaveDebugReport {
+                session_id,
+                is_with_text,
+            } => {
+                if let Some(Err(invalid)) = session_id
+                    .as_deref()
+                    .map(|session_id| check_session_id("session_id", session_id))
+                {
+                    tracing::warn!(exception.message = %invalid, "refused a debug report request");
+                    let _unheard = reply_sender.send(AppMessage::DebugReportFailed {
+                        error: invalid.to_string(),
+                    });
+                    return;
+                }
+                let (app, reply_sender) = (self.app.clone(), reply_sender.clone());
+                tauri::async_runtime::spawn_blocking(move || {
+                    let reply = match crate::call_debug::save_debug_report(
+                        &app,
+                        session_id.as_deref(),
+                        is_with_text,
+                    ) {
+                        Ok(folder) => AppMessage::DebugReportSaved {
+                            path: folder.display().to_string(),
+                        },
+                        Err(error) => AppMessage::DebugReportFailed {
+                            error: error.to_string(),
+                        },
+                    };
+                    // An error only means the port closed before the report was written.
+                    let _unheard = reply_sender.send(reply);
+                });
+            }
+            ExtensionMessage::HostHello { .. }
+            | ExtensionMessage::Hello { .. }
+            | ExtensionMessage::Event { .. }
+            | ExtensionMessage::PagesAway { .. }
+            | ExtensionMessage::Unknown => {}
+        }
+    }
+
     /// Logs one event and reports whether to ack it.
-    fn take_event(&self, seq: u64, session_id: String, event: &serde_json::Value) -> bool {
+    fn take_event(&self, seq: u64, session_id: &str, event: &serde_json::Value) -> bool {
         let span = tracing::info_span!(
             "browser_call.event",
             browser_call.seq = seq,
@@ -361,26 +696,69 @@ impl Port {
         );
         let _entered = span.enter();
         let state = self.app.state::<AppState>();
+        let lead_up_line = serde_json::json!({
+            "seq": seq,
+            "session_id": session_id,
+            "event": event,
+        });
         let logged = {
             let mut book = self.calls().lock();
             let logged = book.take_event(self.id, seq, session_id, event, Now::read());
             // Under the book lock, so the call stream sees opens and ends in the book's order.
             match &logged {
-                Ok(Logged::Opened { log_path, title }) => {
+                Ok(Logged::Opened {
+                    log_path,
+                    title,
+                    logged_caption_keys,
+                    ..
+                }) => {
                     state
                         .calls
                         .open(log_path, CallPlatform::Meet, title.clone());
+                    if !logged_caption_keys.is_empty() {
+                        state.calls.status().observe(
+                            log_path,
+                            Observation::MeetLoggedCaptions(logged_caption_keys.clone()),
+                            Moment::now(),
+                        );
+                    }
                 }
                 Ok(Logged::Ended { log_path, reason }) => {
                     state.calls.end(log_path, CallEndReason::from(*reason));
                 }
-                Ok(Logged::Appended | Logged::Duplicate) | Err(_) => {}
+                Ok(Logged::Appended { .. } | Logged::Duplicate) | Err(_) => {}
             }
             logged
         };
-        crate::tray::refresh(&self.app);
         match &logged {
-            Ok(Logged::Appended | Logged::Opened { .. } | Logged::Duplicate) => {}
+            Ok(
+                Logged::Appended {
+                    log_path,
+                    observation,
+                }
+                | Logged::Opened {
+                    log_path,
+                    observation,
+                    ..
+                },
+            ) => {
+                let (board, now) = (state.calls.status(), Moment::now());
+                board.observe(log_path, Observation::MeetPortHeld(true), now);
+                if let Some(observation) = observation {
+                    board.observe(log_path, observation.clone(), now);
+                }
+                state.call_debug.remember(log_path, lead_up_line);
+            }
+            Ok(Logged::Ended { log_path, .. }) => state.call_debug.forget_lead_up(log_path),
+            Ok(Logged::Duplicate) | Err(_) => {}
+        }
+        // Other events reach the tray with the status tick. A rebuild closes an open menu.
+        match &logged {
+            Ok(Logged::Opened { .. } | Logged::Ended { .. }) => crate::tray::refresh(&self.app),
+            Ok(Logged::Appended { .. } | Logged::Duplicate) | Err(_) => {}
+        }
+        match &logged {
+            Ok(Logged::Appended { .. } | Logged::Opened { .. } | Logged::Duplicate) => {}
             Ok(Logged::Ended { log_path, .. }) => {
                 let (app, pipeline) = (self.app.clone(), Arc::clone(&self.pipeline));
                 let log_path = log_path.clone();
@@ -397,6 +775,25 @@ impl Port {
         }
         is_acked(&logged)
     }
+
+    // A frame of a session the app has no open call for is dropped: its call ended, or its
+    // first event has not arrived yet.
+    fn take_failed_frame(&self, session_id: &str, frame: &FailedFrame) {
+        let Some(call_id) = self.calls().lock().log_path_of(session_id) else {
+            return;
+        };
+        tracing::warn!(
+            call.id = %call_id.display(),
+            browser_call.session_id = session_id,
+            browser_call.channel = frame.channel.label(),
+            error.type = frame.reason,
+            "mc-meet could not decode a frame"
+        );
+        self.app
+            .state::<AppState>()
+            .call_debug
+            .record_failed_frame(&call_id, frame);
+    }
 }
 
 // An event that cannot be written is not acked, so the extension resends it after the next
@@ -404,9 +801,78 @@ impl Port {
 // the extension's queue.
 fn is_acked(logged: &Result<Logged, EventError>) -> bool {
     match logged {
-        Ok(Logged::Appended | Logged::Opened { .. } | Logged::Duplicate | Logged::Ended { .. })
+        Ok(
+            Logged::Appended { .. }
+            | Logged::Opened { .. }
+            | Logged::Duplicate
+            | Logged::Ended { .. },
+        )
         | Err(EventError::InvalidSessionId(_) | EventError::InvalidEvent(_)) => true,
         Err(EventError::Write(_)) => false,
+    }
+}
+
+/// What the app sends a welcomed port unasked: settings, call status, snapshot requests and
+/// debug report replies.
+struct PortFeeds {
+    meet_settings: watch::Receiver<MeetSettings>,
+    call_status: watch::Receiver<CallStatusMessage>,
+    snapshot_requests: broadcast::Receiver<Vec<String>>,
+    replies: mpsc::UnboundedReceiver<AppMessage>,
+    // A closed sender would end every later wait at once.
+    is_settings_open: bool,
+    is_call_status_open: bool,
+    is_snapshot_open: bool,
+}
+
+impl PortFeeds {
+    fn new(calls: &BrowserCalls, replies: mpsc::UnboundedReceiver<AppMessage>) -> Self {
+        Self {
+            meet_settings: calls.meet_settings.subscribe(),
+            call_status: calls.call_status.subscribe(),
+            snapshot_requests: calls.snapshot_requests.subscribe(),
+            replies,
+            is_settings_open: true,
+            is_call_status_open: true,
+            is_snapshot_open: true,
+        }
+    }
+
+    /// The next message to send. Every wait in it can be dropped without losing a message.
+    async fn next(&mut self) -> AppMessage {
+        loop {
+            tokio::select! {
+                changed = self.meet_settings.changed(), if self.is_settings_open => {
+                    if changed.is_err() {
+                        self.is_settings_open = false;
+                        continue;
+                    }
+                    let settings = (*self.meet_settings.borrow_and_update()).into();
+                    return AppMessage::Settings { settings };
+                }
+                changed = self.call_status.changed(), if self.is_call_status_open => {
+                    if changed.is_err() {
+                        self.is_call_status_open = false;
+                        continue;
+                    }
+                    return AppMessage::CallStatus(self.call_status.borrow_and_update().clone());
+                }
+                request = self.snapshot_requests.recv(), if self.is_snapshot_open => {
+                    match request {
+                        Ok(session_ids) => return AppMessage::SnapshotRequest { session_ids },
+                        Err(broadcast::error::RecvError::Lagged(missed)) => {
+                            tracing::warn!(
+                                browser_call.missed_requests = missed,
+                                "dropped page snapshot requests"
+                            );
+                        }
+                        Err(broadcast::error::RecvError::Closed) => self.is_snapshot_open = false,
+                    }
+                }
+                Some(reply) = self.replies.recv() => return reply,
+                else => return std::future::pending().await,
+            }
+        }
     }
 }
 
@@ -437,6 +903,7 @@ async fn end_idle_calls(app: AppHandle, pipeline: Arc<Pipeline>) {
             // Under the book lock, so a late event cannot reopen the call before this ends it.
             for log_path in &ended {
                 state.calls.end(log_path, CallEndReason::Idle);
+                state.call_debug.forget_lead_up(log_path);
             }
             ended
         };

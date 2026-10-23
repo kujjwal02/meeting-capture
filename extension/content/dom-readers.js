@@ -151,3 +151,75 @@ globalThis.mcMeetReadDomRoster = () => {
   }
   return [...byName.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 };
+
+// The last "captions unavailable" text a hover tooltip showed, for page snapshots.
+let mcMeetUnavailableTooltip = null;
+
+// Reads Meet's captions button: { isOn, isUnavailable, isFound, tooltip }. Meet refuses captions
+// at times ("Live captions are temporarily unavailable"): it disables the button, or says so in
+// the button's own label. The state rests on those, which hold while the page shows the button.
+// A hover tooltip shows only under the pointer, so it would flip the state with each hover; it
+// is kept for the snapshot only.
+globalThis.mcMeetReadCaptionsButton = () => {
+  const selectors = globalThis.mcMeetSelectors;
+  const findIconButton = globalThis.mcMeetFindIconButton;
+  const sayUnavailable = (text) =>
+    text && selectors.captionsUnavailableText.test(text) ? text : null;
+  const hoverText = [...document.querySelectorAll(selectors.tooltip)]
+    .map((tooltip) => sayUnavailable(tooltip.textContent))
+    .find(Boolean);
+  if (hoverText) mcMeetUnavailableTooltip = hoverText.trim();
+  const onButton = findIconButton(selectors.captionsOnIcon);
+  const button = onButton ?? findIconButton(selectors.captionsOffIcon);
+  if (!button) {
+    return { isOn: false, isUnavailable: false, isFound: false, tooltip: mcMeetUnavailableTooltip };
+  }
+  const describedBy = button.getAttribute("aria-describedby");
+  const ownText = [
+    button.getAttribute("aria-label"),
+    button.getAttribute("data-tooltip"),
+    button.getAttribute("title"),
+    describedBy ? document.getElementById(describedBy)?.textContent : null,
+  ]
+    .map(sayUnavailable)
+    .find(Boolean);
+  if (ownText) mcMeetUnavailableTooltip = ownText.trim();
+  const isDisabled = button.disabled === true || button.getAttribute("aria-disabled") === "true";
+  const isUnavailable = isDisabled || Boolean(ownText);
+  return {
+    isOn: Boolean(onButton) && !isUnavailable,
+    isUnavailable,
+    isFound: true,
+    tooltip: mcMeetUnavailableTooltip,
+  };
+};
+
+const MC_MEET_REGION_DEPTH = 5;
+const MC_MEET_REGION_NODES = 60;
+
+// The caption region's element tree without its text: tags, roles and the length of each text
+// node. Shows how Meet laid out the region when the DOM reader reads nothing.
+globalThis.mcMeetDescribeCaptionRegion = () => {
+  const region = document.querySelector(globalThis.mcMeetSelectors.captionRegion);
+  if (!region) return null;
+  let nodes = 0;
+  function describe(element, depth) {
+    nodes += 1;
+    const role = element.getAttribute("role");
+    const ownTextChars = [...element.childNodes]
+      .filter((child) => child.nodeType === Node.TEXT_NODE)
+      .reduce((sum, child) => sum + child.textContent.length, 0);
+    const shape = { tag: element.tagName.toLowerCase(), text_chars: ownTextChars };
+    if (role) shape.role = role;
+    const children = [...element.children];
+    if (depth < MC_MEET_REGION_DEPTH && nodes < MC_MEET_REGION_NODES) {
+      shape.children = children
+        .filter(() => nodes < MC_MEET_REGION_NODES)
+        .map((child) => describe(child, depth + 1));
+    } else if (children.length > 0) {
+      shape.hidden_children = children.length;
+    }
+    return shape;
+  }
+  return describe(region, 0);
+};

@@ -2,11 +2,16 @@
 // acks it, and holds the native messaging port to the app. Chrome may stop this worker at any
 // time, so every piece of state that matters lives in storage. session-rules.js decides what each
 // tab message, tab change and alarm does; this file reads and writes storage and runs the effects.
+// It also shows each Meet tab's call status on the toolbar icon. The app decides that status;
+// the worker decides only that the app is not reachable.
 //
-// Storage keys: one per field of the session state in session-rules.js, plus
+// chrome.storage.local keys: one per field of the session state in session-rules.js, plus
 //   q:<seq>       an event message waiting for its ack
 //   settings      the app's [meet] settings, which main.js reads
 //   reloaded_for  the folder version mc-meet last reloaded itself for
+// chrome.storage.session keys, which the popup reads:
+//   call_status   the app's last call_status message
+//   app           { is_reachable, app_version, checked_at_ms }
 
 import { decide, hasOpenSessions, restoreState, STATE_KEYS } from "./session-rules.js";
 
@@ -19,6 +24,11 @@ const PENDING_END_ALARM = "mc-meet-pending-end";
 const QUEUE_PREFIX = "q:";
 const SETTINGS_KEY = "settings";
 const RELOADED_FOR_KEY = "reloaded_for";
+const CALL_STATUS_KEY = "call_status";
+const APP_KEY = "app";
+const APP_UNREACHABLE_NOTICE = "mc-meet-app-unreachable";
+const MEET_TABS = "https://meet.google.com/*";
+const BADGE_COLOURS = { recording: "#d93025", problem: "#f29900", off: "#5f6368" };
 
 let nativePort = null;
 let isWelcomed = false;
@@ -26,6 +36,12 @@ let backoffMs = BACKOFF_MIN_MS;
 let reconnectTimer = null;
 // The folder version to reload for once no call is open, or null.
 let pendingReloadFor = null;
+// Open popups. Each keeps the native port open, so it shows the app's live state.
+const popupPorts = new Set();
+// The content script port of each tab, for snapshot requests.
+const tabPorts = new Map();
+// The pages_away list last sent on the current native port, as JSON, or null after a connect.
+let sentPagesAway = null;
 
 // Every storage change and native send runs on this chain, so seq order holds on the wire.
 let chain = Promise.resolve();
@@ -75,6 +91,18 @@ async function apply(input, port) {
     else ensureNative();
   }
   for (const effect of decision.effects) await runEffect(effect, port);
+  if (decision.state !== state) sendPagesAway(decision.state);
+}
+
+// Tells the app which sessions wait for their tab to come back, so it does not take a closed or
+// reloaded tab for a call that stopped recording.
+function sendPagesAway(state) {
+  if (!nativePort || !isWelcomed) return;
+  const sessionIds = Object.keys(state.pendingEnds).sort();
+  const key = JSON.stringify(sessionIds);
+  if (key === sentPagesAway) return;
+  sentPagesAway = key;
+  nativePort.postMessage({ type: "pages_away", session_ids: sessionIds });
 }
 
 async function runEffect(effect, port) {
@@ -108,27 +136,180 @@ function tellTab(port, message) {
 // ---- Content script ports.
 
 chrome.runtime.onConnect.addListener((port) => {
+  if (port.name === "mc-meet-popup") {
+    connectPopup(port);
+    return;
+  }
   if (port.name !== "mc-meet-tab") return;
   const tabId = port.sender?.tab?.id;
+  if (tabId !== undefined) tabPorts.set(tabId, port);
   port.onMessage.addListener((message) => {
     if (tabId === undefined) return;
-    serially(() => apply({ kind: "tab_message", tabId, message }, port));
+    // Debug material: sent when the app listens, dropped otherwise.
+    if (message?.type === "frame_failed" || message?.type === "page_snapshot") {
+      if (nativePort && isWelcomed) nativePort.postMessage(message);
+      return;
+    }
+    serially(async () => {
+      await apply({ kind: "tab_message", tabId, message }, port);
+      if (message?.type === "resume" || message?.event?.kind === "call_started") {
+        await showStatusOnTabs();
+      }
+    });
   });
   port.onDisconnect.addListener(() => {
     void chrome.runtime.lastError;
-    if (tabId !== undefined) serially(() => apply({ kind: "tab_gone", tabId }));
+    if (tabId === undefined) return;
+    if (tabPorts.get(tabId) === port) tabPorts.delete(tabId);
+    serially(() => apply({ kind: "tab_gone", tabId }));
   });
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  tabPorts.delete(tabId);
   serially(() => apply({ kind: "tab_closed", tabId }));
 });
+
+// Chrome may reset a tab's icon when the tab loads a page.
+chrome.tabs.onUpdated.addListener((_tabId, change, tab) => {
+  if (change.status === "complete" && tab.url?.startsWith("https://meet.google.com/")) {
+    serially(showStatusOnTabs);
+  }
+});
+
+// ---- Toolbar icon and popup.
+
+async function readAppReachability() {
+  return (await chrome.storage.session.get(APP_KEY))[APP_KEY] ?? { is_reachable: true };
+}
+
+async function noteAppReachable(isReachable, appVersion) {
+  const previous = await readAppReachability();
+  const app = {
+    is_reachable: isReachable,
+    app_version: appVersion ?? previous.app_version ?? null,
+    checked_at_ms: Date.now(),
+  };
+  await chrome.storage.session.set({ [APP_KEY]: app });
+  if (isReachable) {
+    await chrome.notifications.clear(APP_UNREACHABLE_NOTICE);
+  } else if (previous.is_reachable !== false && (await hasWork())) {
+    // Once per outage, and only with a call to lose.
+    chrome.notifications.create(APP_UNREACHABLE_NOTICE, {
+      type: "basic",
+      iconUrl: "icons/off-32.png",
+      title: "Meeting Capture is not running",
+      message: "mc-meet keeps this call's events until the app starts.",
+    });
+  }
+  await showStatusOnTabs();
+}
+
+// The look of one tab: { icon, badge, title }.
+function lookOf(callStatus, isAppReachable) {
+  if (!isAppReachable) {
+    return { icon: "off", badge: "OFF", title: "Meeting Capture is not running" };
+  }
+  if (!callStatus) return { icon: "idle", badge: "", title: "mc-meet: connected" };
+  switch (callStatus.state) {
+    case "recording":
+      return {
+        icon: "recording",
+        badge: "REC",
+        title: `Recording since ${callStatus.recording_since_label ?? callStatus.started_at_label}`,
+      };
+    case "problem":
+      return { icon: "problem", badge: "!", title: `Not recording: ${callStatus.reason_text}` };
+    case "waiting":
+      return { icon: "idle", badge: "…", title: "Waiting for captions" };
+  }
+  return { icon: "idle", badge: "…", title: "Waiting for captions" };
+}
+
+async function showStatusOnTabs() {
+  const { tabSessions } = restoreState(await store.readState(), Date.now());
+  const callStatus = (await chrome.storage.session.get(CALL_STATUS_KEY))[CALL_STATUS_KEY];
+  const { is_reachable: isAppReachable } = await readAppReachability();
+  const tabs = await chrome.tabs.query({ url: MEET_TABS });
+  for (const tab of tabs) {
+    const sessionId = tabSessions[tab.id];
+    const status = sessionId
+      ? (callStatus?.calls.find((call) => call.session_ids.includes(sessionId)) ?? {
+          state: "waiting",
+        })
+      : undefined;
+    const look = lookOf(status, isAppReachable);
+    const tabId = tab.id;
+    await chrome.action
+      .setIcon({
+        tabId,
+        path: { 16: `icons/${look.icon}-16.png`, 32: `icons/${look.icon}-32.png` },
+      })
+      .catch(() => {});
+    await chrome.action.setBadgeText({ tabId, text: look.badge }).catch(() => {});
+    const colour = BADGE_COLOURS[look.icon];
+    if (colour)
+      await chrome.action.setBadgeBackgroundColor({ tabId, color: colour }).catch(() => {});
+    await chrome.action.setTitle({ tabId, title: look.title }).catch(() => {});
+  }
+}
+
+function connectPopup(port) {
+  popupPorts.add(port);
+  ensureNative();
+  port.onMessage.addListener((message) => {
+    if (message?.type !== "save_debug_report") return;
+    serially(async () => {
+      if (!nativePort || !isWelcomed) {
+        tellTab(port, {
+          type: "debug_report_failed",
+          error: "Meeting Capture is not running, or is still connecting.",
+        });
+        return;
+      }
+      const { tabSessions } = restoreState(await store.readState(), Date.now());
+      nativePort.postMessage({
+        type: "save_debug_report",
+        session_id: tabSessions[message.tab_id] ?? null,
+        with_text: message.with_text === true,
+      });
+    });
+  });
+  port.onDisconnect.addListener(() => {
+    popupPorts.delete(port);
+    serially(closeNativeIfIdle);
+  });
+}
+
+function tellPopups(message) {
+  for (const port of popupPorts) tellTab(port, message);
+}
+
+async function storeCallStatus(callStatus) {
+  await chrome.storage.session.set({ [CALL_STATUS_KEY]: callStatus });
+  await showStatusOnTabs();
+}
+
+async function requestSnapshots(sessionIds) {
+  const { tabSessions } = restoreState(await store.readState(), Date.now());
+  for (const [tabId, sessionId] of Object.entries(tabSessions)) {
+    if (!sessionIds.includes(sessionId)) continue;
+    tellTab(tabPorts.get(Number(tabId)), { type: "snapshot_request", session_id: sessionId });
+  }
+}
 
 // ---- Native port to the app.
 
 async function hasWork() {
+  if (popupPorts.size > 0) return true;
   if ((await store.unacked()).length > 0) return true;
   return hasOpenSessions(restoreState(await store.readState(), Date.now()));
+}
+
+// The sessions this worker holds open, for hello: the app then knows this port carries them.
+async function openSessionIds() {
+  const { tabSessions, pendingEnds } = restoreState(await store.readState(), Date.now());
+  return [...new Set([...Object.values(tabSessions), ...Object.keys(pendingEnds)])];
 }
 
 async function resendUnacked() {
@@ -140,6 +321,11 @@ async function onAck(seq) {
   // After the last call ends and nothing is left to send, close the port so the host can exit.
   // Only a call_ended ack can make the worker idle, so only that ack pays for the full check.
   if (acked?.event?.kind !== "call_ended") return;
+  await showStatusOnTabs();
+  await closeNativeIfIdle();
+}
+
+async function closeNativeIfIdle() {
   if (nativePort && !(await hasWork())) {
     nativePort.disconnect();
     nativePort = null;
@@ -182,12 +368,13 @@ function dropNative(port) {
   scheduleReconnect();
 }
 
-function connectNative() {
+function connectNative(sessions) {
   let port;
   try {
     port = chrome.runtime.connectNative(HOST_NAME);
   } catch (error) {
     console.warn("mc-meet: connectNative failed:", error);
+    serially(() => noteAppReachable(false));
     scheduleReconnect();
     return;
   }
@@ -196,29 +383,48 @@ function connectNative() {
   port.onMessage.addListener((message) => {
     if (message?.type === "welcome") {
       isWelcomed = true;
+      sentPagesAway = null;
       backoffMs = BACKOFF_MIN_MS;
       console.info("mc-meet: app", message.app_version, "open sessions", message.open_sessions);
       storeSettings(message.settings);
+      serially(() => noteAppReachable(true, message.app_version));
       serially(() => noteFolderVersion(message.folder_version));
       serially(resendUnacked);
+      serially(async () => sendPagesAway(restoreState(await store.readState(), Date.now())));
+      // A restarted app has no health for the calls; each tab resends its own.
+      for (const tabPort of tabPorts.values()) tellTab(tabPort, { type: "app_connected" });
+      tellPopups({ type: "app_changed" });
     } else if (message?.type === "settings") {
       storeSettings(message.settings);
     } else if (message?.type === "ack") {
       serially(() => onAck(message.seq));
+    } else if (message?.type === "call_status") {
+      serially(() => storeCallStatus({ calls: message.calls ?? [] }));
+    } else if (message?.type === "snapshot_request") {
+      serially(() => requestSnapshots(message.session_ids ?? []));
+    } else if (message?.type === "debug_report_saved" || message?.type === "debug_report_failed") {
+      tellPopups(message);
     } else if (message?.type === "app_unavailable") {
       console.warn("mc-meet: the app did not start");
       port.disconnect();
       dropNative(port);
+      serially(() => noteAppReachable(false));
+      tellPopups({ type: "app_changed" });
     }
   });
   port.onDisconnect.addListener(() => {
-    console.warn("mc-meet: native port closed:", chrome.runtime.lastError?.message ?? "no error");
+    const error = chrome.runtime.lastError?.message;
+    console.warn("mc-meet: native port closed:", error ?? "no error");
+    // A port closed before welcome means the host or the app is missing.
+    if (nativePort === port && !isWelcomed) serially(() => noteAppReachable(false));
     dropNative(port);
+    tellPopups({ type: "app_changed" });
   });
   port.postMessage({
     type: "hello",
     protocol: PROTOCOL,
     extension_version: chrome.runtime.getManifest().version,
+    sessions,
   });
 }
 
@@ -233,7 +439,7 @@ function storeSettings(settings) {
 function ensureNative() {
   if (nativePort || reconnectTimer !== null) return;
   serially(async () => {
-    if (!nativePort && (await hasWork())) connectNative();
+    if (!nativePort && (await hasWork())) connectNative(await openSessionIds());
   });
 }
 
@@ -266,4 +472,5 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 
 chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
 serially(holdSessionsOfMissingTabs);
+serially(showStatusOnTabs);
 ensureNative();

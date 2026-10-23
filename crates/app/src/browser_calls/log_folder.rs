@@ -167,6 +167,13 @@ fn log_file_name(started_at: Timestamp, session_id: &str) -> String {
     )
 }
 
+/// The session that created the log at `log_path`, from its name.
+pub(super) fn first_session_id(log_path: &Path) -> Option<String> {
+    let stem = log_path.file_stem()?.to_str()?;
+    let (_, session_id) = stem.split_once('-')?;
+    Some(session_id.to_owned())
+}
+
 // The start time that begins a log's name. The stamp holds no hyphen, and the session id may.
 fn name_started_at(log_path: &Path) -> Option<Timestamp> {
     let file_name = log_path.file_name()?.to_str()?;

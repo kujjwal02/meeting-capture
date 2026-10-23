@@ -65,7 +65,15 @@ pub enum CallEvent {
     Health {
         at: Timestamp,
         source: HealthSource,
+        /// Meet's captions button is on, and Meet does not refuse captions.
         captions_on: bool,
+        /// Meet refuses captions: its captions button is disabled, or says live captions are
+        /// unavailable. Older extensions leave it out.
+        #[serde(default)]
+        captions_unavailable: bool,
+        /// Frames on a caption channel fail to decode in a row, with no channel caption since.
+        #[serde(default)]
+        caption_frames_failing: bool,
         parse_failures: u64,
         #[serde(default)]
         detail: Option<String>,

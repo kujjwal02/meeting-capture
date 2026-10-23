@@ -198,6 +198,16 @@ impl HuddleTracker {
         self.book.saw_tiles(&mut self.log, tiles, seen_at)
     }
 
+    /// Caption rows and overlay lines logged so far.
+    pub(crate) fn caption_lines(&self) -> u64 {
+        self.book.caption_lines()
+    }
+
+    /// A count that grows with every new or changed caption line.
+    pub(crate) fn caption_changes(&self) -> u64 {
+        self.book.caption_changes()
+    }
+
     pub(crate) fn tile_names(&self) -> impl Iterator<Item = &str> {
         self.book.tile_names()
     }

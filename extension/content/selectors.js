@@ -7,6 +7,11 @@ globalThis.mcMeetSelectors = Object.freeze({
   // Icon text of the captions button while captions are off, and while they are on.
   captionsOffIcon: "closed_caption_off",
   captionsOnIcon: "closed_caption",
+  // Meet's hover tooltips. The captions button's one says when Meet refuses captions.
+  tooltip: '[role="tooltip"]',
+  // The text Meet shows on a disabled captions button, in English: "Live captions are
+  // temporarily unavailable". Other UI languages rely on the disabled state alone.
+  captionsUnavailableText: /captions (are )?(temporarily )?unavailable/i,
   // Elements that hold icon ligatures.
   icon: "i.google-symbols, i.material-icons-extended, i.material-symbols-outlined, i[aria-hidden='true']",
   // The caption region. Its children are speaker blocks: a name node, then a text node.

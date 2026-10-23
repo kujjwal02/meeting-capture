@@ -26,6 +26,8 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
   let source = "none";
   let parseFailures = 0;
   let detail = null;
+  // Caption frames arrive but fail to decode, and no caption decoded since.
+  let isCaptionFramesFailing = false;
   let pageStartedMs = 0;
   let channelsOpenedAtMs = null;
   let lastChannelCaptionMs = null;
@@ -36,7 +38,7 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
   // Hiding before the current channels carry a caption would stop them from ever starting.
   let hasCaptionOnOpenChannels = false;
 
-  const health = () => ({ source, parseFailures, detail });
+  const health = () => ({ source, parseFailures, detail, isCaptionFramesFailing });
 
   // Returns whether the source changed, which is when health is due.
   function useDom(reason) {
@@ -73,6 +75,7 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         lastChannelCaptionMs = null;
         isCaptionsHidden = false;
         hasCaptionOnOpenChannels = false;
+        isCaptionFramesFailing = false;
         return true;
       case "call_ended":
         source = "none";
@@ -86,18 +89,26 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         // New channels on a new peer connection need Meet's captions on to start streaming.
         isCaptionsHidden = false;
         hasCaptionOnOpenChannels = false;
+        isCaptionFramesFailing = false;
+        // "channel" says a caption arrived on the open channels. The new ones have to show it
+        // again, or the DOM reader takes over after the wait.
+        if (source === "channel") source = "none";
         return true;
       case "channel_open_failed":
         detail = `opening ${fact.label} failed: ${fact.error}`;
         return true;
-      case "channel_caption":
+      case "channel_caption": {
         lastChannelCaptionMs = fact.atMs;
         hasCaptionOnOpenChannels = true;
-        return useChannel();
+        const wasFailing = isCaptionFramesFailing;
+        isCaptionFramesFailing = false;
+        return useChannel() || wasFailing;
+      }
       case "parse_gap": {
         parseFailures = fact.parseFailures;
         detail = fact.detail;
         const isCaptionChannel = fact.channel === "captions" || fact.channel === "captions_v2";
+        if (isCaptionChannel) isCaptionFramesFailing = true;
         const isChannelQuiet =
           lastChannelCaptionMs === null ||
           fact.atMs - lastChannelCaptionMs > MC_MEET_CAPTION_WAIT_MS;

@@ -56,11 +56,22 @@ globalThis.mcMeetCallEvents = Object.freeze({
     participants,
   }),
 
-  health: ({ atMs, source, captionsOn, parseFailures, detail }) => ({
+  // captionsOn is false while Meet refuses captions, which captionsUnavailable reports.
+  health: ({
+    atMs,
+    source,
+    captionsOn,
+    captionsUnavailable,
+    captionFramesFailing,
+    parseFailures,
+    detail,
+  }) => ({
     kind: "health",
     at: new Date(atMs).toISOString(),
     source,
     captions_on: captionsOn,
+    captions_unavailable: captionsUnavailable,
+    caption_frames_failing: captionFramesFailing,
     parse_failures: parseFailures,
     detail,
   }),

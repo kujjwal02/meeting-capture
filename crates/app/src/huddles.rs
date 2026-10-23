@@ -1,5 +1,5 @@
-//! Runs the Slack huddle watcher, shows what it reports, and turns each finished huddle log into
-//! a meeting.
+//! Runs the Slack huddle watcher, feeds what it reports to the call status board, and turns
+//! each finished huddle log into a meeting.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -10,20 +10,10 @@ use pipeline::Pipeline;
 use tauri::{AppHandle, Manager as _};
 
 use crate::AppState;
+use crate::call_status::{Moment, Observation};
 use crate::calls::{CallEndReason, CallPlatform};
 use crate::finished_logs::{self, LogSource};
 use crate::notify;
-
-/// What the tray shows for Slack huddles.
-#[derive(Debug, Clone)]
-pub(crate) enum HuddleStatus {
-    Idle,
-    PermissionNeeded,
-    Reading {
-        channel: String,
-        health: Option<HuddleHealth>,
-    },
-}
 
 pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
     let state = app.state::<AppState>();
@@ -84,21 +74,32 @@ impl Reporter {
     fn report(&mut self, notice: Notice) {
         match notice {
             Notice::PermissionMissing => {
-                self.set_status(HuddleStatus::PermissionNeeded);
+                self.calls().status().set_huddle_permission_missing(true);
+                crate::tray::refresh(&self.app);
                 notify(
                     &self.app,
                     "Slack huddles need a permission",
                     "Allow Meeting Capture under Accessibility in System Settings to read huddle captions.",
                 );
             }
-            Notice::PermissionGranted => self.set_status(HuddleStatus::Idle),
+            Notice::PermissionGranted => {
+                self.calls().status().set_huddle_permission_missing(false);
+                crate::tray::refresh(&self.app);
+            }
             Notice::HuddleStarted { log_path, channel } => {
                 self.calls()
-                    .open(&log_path, CallPlatform::SlackHuddle, Some(channel.clone()));
-                self.set_status(HuddleStatus::Reading {
-                    channel,
-                    health: None,
-                });
+                    .open(&log_path, CallPlatform::SlackHuddle, Some(channel));
+                crate::tray::refresh(&self.app);
+            }
+            Notice::CaptionsRead {
+                log_path,
+                caption_lines,
+            } => {
+                self.calls().status().observe(
+                    &log_path,
+                    Observation::HuddleCaptionLines(caption_lines),
+                    Moment::now(),
+                );
             }
             Notice::Health {
                 log_path,
@@ -106,15 +107,20 @@ impl Reporter {
                 state,
                 reason,
             } => {
-                self.set_status(HuddleStatus::Reading {
-                    channel: channel.clone(),
-                    health: Some(state),
-                });
+                self.calls().status().observe(
+                    &log_path,
+                    Observation::HuddleHealth(state),
+                    Moment::now(),
+                );
+                crate::tray::refresh(&self.app);
+                // Captions off and an unreadable window stop the recording, so the status board
+                // announces them with the other "Not recording" notices.
                 let heading = match state {
-                    HuddleHealth::Healthy | HuddleHealth::Untested => return,
+                    HuddleHealth::Healthy
+                    | HuddleHealth::Untested
+                    | HuddleHealth::CaptionsOff
+                    | HuddleHealth::Broken => return,
                     HuddleHealth::Degraded => "Slack huddle captions: partly read",
-                    HuddleHealth::CaptionsOff => "Slack huddle captions are off",
-                    HuddleHealth::Broken => "Can't read Slack huddle captions",
                 };
                 if self.notified.insert((log_path, state)) {
                     notify(&self.app, heading, &format!("{channel}: {reason}"));
@@ -123,7 +129,7 @@ impl Reporter {
             Notice::HuddleEnded { log_path, .. } => {
                 // The watcher gives no reason; the window closing is the usual one.
                 self.calls().end(&log_path, CallEndReason::WindowClosed);
-                self.set_status(HuddleStatus::Idle);
+                crate::tray::refresh(&self.app);
                 self.notified.retain(|(path, _)| *path != log_path);
                 let (app, pipeline) = (self.app.clone(), Arc::clone(&self.pipeline));
                 tauri::async_runtime::spawn_blocking(move || {
@@ -136,11 +142,6 @@ impl Reporter {
 
     fn calls(&self) -> &crate::calls::Calls {
         &self.app.state::<AppState>().inner().calls
-    }
-
-    fn set_status(&self, status: HuddleStatus) {
-        self.app.state::<AppState>().set_huddle_status(status);
-        crate::tray::refresh(&self.app);
     }
 }
 

@@ -22,6 +22,8 @@ pub(super) struct Huddle {
     pub(super) tracker: HuddleTracker,
     pub(super) missed_discoveries: u32,
     pub(super) last_seen_at: Timestamp,
+    /// `HuddleTracker::caption_changes` when the app last heard of captions.
+    pub(super) reported_caption_changes: u64,
     list: Option<(Element, ListMatch)>,
     overlay: Option<Element>,
 }
@@ -49,6 +51,7 @@ impl Huddle {
             tracker,
             missed_discoveries: 0,
             last_seen_at: moment.seen_at,
+            reported_caption_changes: 0,
             list: None,
             overlay: None,
         })

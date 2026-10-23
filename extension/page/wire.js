@@ -378,6 +378,10 @@
   const REMOVED_STATUS = 7;
   const PARSE_GAP_FIRST = 10;
   const PARSE_GAP_REPEAT = 100;
+  // Failed frames reported with their bytes, per channel and call. The app keeps 20 per call.
+  const FAILED_FRAMES_REPORTED = 20;
+  // A larger frame is reported without its bytes: a native message to the app stays under 1 MB.
+  const MAX_REPORTED_FRAME_BYTES = 256 * 1024;
   const MAX_UTTERANCES = 5000;
   const MAX_CHATS = 5000;
 
@@ -388,13 +392,23 @@
   }
 
   function newCounters() {
-    return { raw: 0, parsed: 0, control: 0, rejected: 0, consecutive: 0 };
+    return { raw: 0, parsed: 0, control: 0, rejected: 0, consecutive: 0, reported: 0 };
+  }
+
+  function bytesToBase64(bytes) {
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
   }
 
   // emit(reading) receives caption, chat and roster readings: the fields of
   // call-events.js's builder of the same kind, plus kind. notice(notice)
-  // receives { kind: "parse_gap" | "self_removed" } notices for the content script, which never
-  // reach the app.
+  // receives { kind: "parse_gap" | "self_removed" | "frame_failed" } notices for the content
+  // script. Only frame_failed of a caption channel reaches the app, as debug material outside the
+  // call log.
   function createMeetReader({ now = () => Date.now(), emit, notice = () => {} }) {
     const devices = new Map();
     const utterances = new Map();
@@ -418,7 +432,8 @@
       return Object.values(counters).reduce((sum, c) => sum + c.rejected, 0);
     }
 
-    function noteResult(label, result, bytes) {
+    // bytes is the frame as decoded; rawBytes as received, before gzip inflation.
+    function noteResult(label, result, bytes, rawBytes) {
       const counter = counters[label];
       counter.raw += 1;
       if (result.ok) {
@@ -433,6 +448,19 @@
       counter.rejected += 1;
       counter.consecutive += 1;
       reasons.set(result.reason, (reasons.get(result.reason) ?? 0) + 1);
+      if (counter.reported < FAILED_FRAMES_REPORTED) {
+        counter.reported += 1;
+        notice({
+          kind: "frame_failed",
+          channel: label,
+          at_ms: now(),
+          reason: result.reason,
+          skeleton: skeleton(bytes),
+          byte_length: rawBytes.length,
+          bytes_base64:
+            rawBytes.length <= MAX_REPORTED_FRAME_BYTES ? bytesToBase64(rawBytes) : null,
+        });
+      }
       const run = counter.consecutive;
       if (run === PARSE_GAP_FIRST || (run > PARSE_GAP_FIRST && run % PARSE_GAP_REPEAT === 0)) {
         const reasonList = [...reasons.entries()].map(([r, n]) => `${r}:${n}`).join(",");
@@ -533,32 +561,32 @@
       try {
         bytes = await inflateFrame(data);
       } catch {
-        noteResult(label, { ok: false, reason: "gunzip-threw" }, data);
+        noteResult(label, { ok: false, reason: "gunzip-threw" }, data, data);
         return {};
       }
       if (label === "captions_v2") {
         const result = decodeCaptionV2(bytes);
-        noteResult(label, result, bytes);
+        noteResult(label, result, bytes, data);
         if (!result.ok) return {};
         emitCaption(label, result);
         return { ack: encodeCaptionV2Ack(result.utteranceId, result.version) };
       }
       if (label === "captions") {
         const result = decodeCaptionV1(bytes);
-        noteResult(label, result, bytes);
+        noteResult(label, result, bytes, data);
         if (result.ok) emitCaption(label, result);
         return {};
       }
       if (label === "collections") {
         const result = decodeCollections(bytes);
-        noteResult(label, result, bytes);
+        noteResult(label, result, bytes, data);
         if (!result.ok) return {};
         if (result.participants.length) mergeParticipants(result.participants);
         if (result.chats.length) emitChats(result.chats);
         return {};
       }
       const result = decodeMeetMessage(bytes);
-      noteResult(label, result, bytes);
+      noteResult(label, result, bytes, data);
       if (result.ok) emitChats(result.chats);
       return {};
     }
@@ -584,6 +612,10 @@
         if (!deviceId) return;
         selfDeviceId = deviceId;
         emitRosterIfChanged();
+      },
+      // A new meeting connection is a new call, with its own budget of reported failures.
+      newCall() {
+        for (const counter of Object.values(counters)) counter.reported = 0;
       },
       lastRoster: () => lastRoster,
       hasRoster: () => lastRoster !== undefined,

@@ -1,7 +1,7 @@
 // Content script, isolated world. It owns the call session of its tab: it finds call start and
 // end, forwards what the two caption readers emit, starts and stops the DOM reader as the caption
 // source policy decides, and reports health. Events go to the service worker over a port as they
-// happen.
+// happen. Debug material (failed frames, page snapshots) goes the same way but is never queued.
 (() => {
   if (globalThis.mcMeetContentStarted) return;
   globalThis.mcMeetContentStarted = true;
@@ -21,6 +21,13 @@
   const KEEPALIVE_MS = 20000;
   const MAX_OUTBOX = 5000;
   const MEETING_CODE_PATTERN = /^\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:\/|$)/;
+  // Failed frames sent to the app per session. The app keeps the first 20 per call.
+  const FAILED_FRAMES_SENT = 20;
+  // Only caption frame failures help debug a call that does not record. A chat or roster frame
+  // with nothing to read is common, and its bytes hold chat.
+  const CAPTION_CHANNELS = new Set(["captions", "captions_v2"]);
+  // The page hook answers a snapshot request at once; a hook from an older mc-meet never does.
+  const HOOK_SNAPSHOT_WAIT_MS = 2000;
 
   let call = null;
   let leaveMissingSinceMs = null;
@@ -37,6 +44,9 @@
   // The app's [meet] hide_captions. The worker stores it; on until the app says otherwise.
   let isHidingCaptions = true;
   const outbox = [];
+  const failedFramesSent = new Map();
+  // Snapshot requests waiting for the page hook's half, by session.
+  const pendingSnapshots = new Map();
 
   const captionSource = globalThis.mcMeetCreateCaptionSourcePolicy();
   const domCaptions = globalThis.mcMeetCreateDomCaptions({
@@ -63,6 +73,15 @@
   // ---- Worker port.
 
   function onWorkerMessage(message) {
+    if (message?.type === "snapshot_request") {
+      if (call?.session_id === message.session_id) requestSnapshot(call.session_id);
+      return;
+    }
+    // A restarted app knows nothing of the call's health; the next check resends it.
+    if (message?.type === "app_connected") {
+      lastHealthKey = "";
+      return;
+    }
     // The worker ended this session while the page was away. Start a new one on the next check.
     if (message?.type === "session_ended" && call?.session_id === message.session_id) {
       try {
@@ -196,14 +215,18 @@
 
   // ---- Caption source and health.
 
-  function areCaptionsOn() {
-    return Boolean(findIconButton(selectors.captionsOnIcon));
-  }
-
   function reportHealth() {
     if (!call) return;
-    const { source, parseFailures, detail } = captionSource.health();
-    const health = { source, captionsOn: areCaptionsOn(), parseFailures, detail };
+    const { source, parseFailures, detail, isCaptionFramesFailing } = captionSource.health();
+    const button = globalThis.mcMeetReadCaptionsButton();
+    const health = {
+      source,
+      captionsOn: button.isOn,
+      captionsUnavailable: button.isUnavailable,
+      captionFramesFailing: isCaptionFramesFailing,
+      parseFailures,
+      detail,
+    };
     const key = JSON.stringify(health);
     if (key === lastHealthKey) return;
     lastHealthKey = key;
@@ -254,8 +277,66 @@
     send(event);
   }
 
+  function forwardFailedFrame(notice) {
+    if (!call || !CAPTION_CHANNELS.has(notice.channel)) return;
+    const sent = failedFramesSent.get(call.session_id) ?? 0;
+    if (sent >= FAILED_FRAMES_SENT) return;
+    failedFramesSent.set(call.session_id, sent + 1);
+    postToWorker({
+      type: "frame_failed",
+      session_id: call.session_id,
+      channel: notice.channel,
+      at: new Date(notice.at_ms).toISOString(),
+      reason: notice.reason,
+      skeleton: notice.skeleton,
+      byte_length: notice.byte_length,
+      bytes_base64: notice.bytes_base64,
+    });
+  }
+
+  // ---- Page snapshot: what the page looked like when the app saw a problem. No caption text.
+
+  function requestSnapshot(sessionId) {
+    if (pendingSnapshots.has(sessionId)) return;
+    const timer = setTimeout(() => finishSnapshot(sessionId, null), HOOK_SNAPSHOT_WAIT_MS);
+    pendingSnapshots.set(sessionId, timer);
+    document.dispatchEvent(
+      new CustomEvent("mc-meet:content", { detail: JSON.stringify({ t: "snapshot" }) }),
+    );
+  }
+
+  function finishSnapshot(sessionId, page) {
+    const timer = pendingSnapshots.get(sessionId);
+    if (timer === undefined) return;
+    clearTimeout(timer);
+    pendingSnapshots.delete(sessionId);
+    const button = globalThis.mcMeetReadCaptionsButton();
+    const chromeVersion = navigator.userAgent.match(/Chrome\/([\d.]+)/)?.[1] ?? null;
+    postToWorker({
+      type: "page_snapshot",
+      session_id: sessionId,
+      snapshot: {
+        at: new Date().toISOString(),
+        captions_button: {
+          is_found: button.isFound,
+          is_on: button.isOn,
+          is_unavailable: button.isUnavailable,
+          tooltip: button.tooltip,
+        },
+        caption_source: captionSource.health(),
+        is_dom_reader_attached: domCaptions.isAttached(),
+        caption_region: globalThis.mcMeetDescribeCaptionRegion(),
+        page_hook: page,
+        chrome_version: chromeVersion,
+        extension_version: chrome.runtime.getManifest().version,
+      },
+    });
+  }
+
   function onPageNotice(notice) {
-    if (notice.kind === "self_removed") {
+    if (notice.kind === "frame_failed") {
+      forwardFailedFrame(notice);
+    } else if (notice.kind === "self_removed") {
       isSelfRemoved = true;
     } else if (notice.kind === "parse_gap") {
       follow(
@@ -305,6 +386,8 @@
       if (event) onReaderEvent("channel", event);
     } else if (message?.t === "notice") {
       onPageNotice(message.notice);
+    } else if (message?.t === "page_snapshot") {
+      for (const sessionId of [...pendingSnapshots.keys()]) finishSnapshot(sessionId, message.page);
     } else if (message?.t === "caption_channel_failed") {
       const { label, error } = message;
       follow(captionSource.decide({ kind: "channel_open_failed", label, error }));

@@ -77,3 +77,7 @@ blocks the same `close()`.
 
 `health.detail` carries a skeleton of a failing frame after 10 failures in a row on one channel:
 the tag and wire type tree with lengths, three levels deep, no text. Compare it with the table.
+
+The app also keeps the first 20 failing caption frames of each call, bytes included, in the
+call's debug folder. Save a debug report with caption text from the tray, then run `just replay-frames
+<report folder>` after a decoder change to see which frames decode now.

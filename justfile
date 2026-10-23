@@ -35,6 +35,12 @@ meet-e2e:
     cargo build -p meeting-capture
     node tools/meet-e2e/run.mjs
 
+# Replay failed Meet frames through the decoder. Takes a debug report folder, a call's debug
+# folder or a frames.jsonl.
+[no-cd]
+replay-frames path:
+    node "{{justfile_directory()}}/tools/replay-frames.mjs" "{{path}}"
+
 # Run the tray app in dev mode.
 dev:
     cd crates/app && cargo tauri dev

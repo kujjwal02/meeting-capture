@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>mc-meet</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <header>
+      <img id="state-icon" src="../icons/idle-32.png" alt="" width="16" height="16">
+      <h1 id="state-line">Loading</h1>
+    </header>
+    <p id="reason" hidden></p>
+    <dl id="call" hidden>
+      <dt>Call</dt>
+      <dd id="title"></dd>
+      <dt>Started</dt>
+      <dd id="started"></dd>
+      <dt>Captions</dt>
+      <dd id="captions"></dd>
+      <dt>Last caption</dt>
+      <dd id="last-caption"></dd>
+      <dt>Caption source</dt>
+      <dd id="source"></dd>
+    </dl>
+    <section id="problems" hidden>
+      <h2>Last problems</h2>
+      <ul id="problem-list"></ul>
+    </section>
+    <dl>
+      <dt>App</dt>
+      <dd id="app"></dd>
+      <dt>mc-meet</dt>
+      <dd id="extension"></dd>
+    </dl>
+    <div class="actions">
+      <button type="button" id="save-report">Save debug report</button>
+      <button type="button" id="save-report-with-text" class="secondary">With caption text</button>
+    </div>
+    <p id="report-outcome" hidden></p>
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,5 +1,6 @@
 //! One call stream from every call source: each source reports when a call opens and ends, and
-//! this logs `call.started`, `call.resumed` and `call.ended` and broadcasts them.
+//! this logs `call.started`, `call.resumed` and `call.ended` and broadcasts them. The status
+//! board hears the same opens and ends, so it never sees a call the stream has not.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -7,6 +8,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use sources::browser_call::EndReason;
 use tokio::sync::broadcast;
+
+use crate::call_status::{CallBoard, Moment};
 
 /// Events a slow subscriber may fall behind by before it misses some.
 const EVENT_BACKLOG: usize = 64;
@@ -57,6 +60,7 @@ pub(crate) enum CallEndReason {
 pub(crate) struct Calls {
     tally: Mutex<CallTally>,
     sender: broadcast::Sender<CallEvent>,
+    status: CallBoard,
 }
 
 #[derive(Default)]
@@ -72,7 +76,13 @@ impl Calls {
         Self {
             tally: Mutex::new(CallTally::default()),
             sender: broadcast::channel(EVENT_BACKLOG).0,
+            status: CallBoard::new(),
         }
+    }
+
+    /// Each open call's state, and the calls that ended in this run.
+    pub fn status(&self) -> &CallBoard {
+        &self.status
     }
 
     #[expect(dead_code, reason = "phase 3 capture subscribes")]
@@ -91,6 +101,8 @@ impl Calls {
             platform,
             title,
         };
+        self.status
+            .open(id, platform, call.title.clone(), Moment::now());
         tally.open.insert(call.id.clone(), call.clone());
         let event = if tally.ended.remove(id) {
             CallEvent::Resumed(call)
@@ -109,6 +121,7 @@ impl Calls {
             return;
         };
         tally.ended.insert(call.id.clone());
+        self.status.end(id, Moment::now());
         self.publish(CallEvent::Ended { call, reason });
     }
 
@@ -166,7 +179,7 @@ fn log(event: &CallEvent) {
 }
 
 impl CallPlatform {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Meet => "meet",
             Self::SlackHuddle => "slack_huddle",

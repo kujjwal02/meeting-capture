@@ -9,11 +9,12 @@ use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize as _;
-use sources::browser_call::{CallEvent, CallStart, EndReason, HealthSource};
+use sources::browser_call::{CallEvent, CallStart, EndReason};
 
 use super::call_log::CallLog;
 use super::log_folder::LogFolder;
-use super::{BrowserCallStatus, CallStatus, PROTOCOL};
+use super::{BrowserCallStatus, PROTOCOL};
+use crate::call_status::{MeetCaptions, Observation};
 
 /// A call no extension port holds ends this long after its last event.
 const IDLE_CALL_END: Duration = Duration::from_mins(5);
@@ -32,6 +33,9 @@ pub(super) struct CallBook {
     open_sessions: HashMap<String, PathBuf>,
     /// Ports that said `hello`, by port id, with the protocol each said.
     greeted_ports: HashMap<u64, u32>,
+    /// The sessions whose tab went away, by the port that said so. mc-meet ends each in 5
+    /// minutes unless its tab comes back.
+    away_sessions: HashMap<u64, HashSet<String>>,
 }
 
 struct OpenCall {
@@ -45,11 +49,11 @@ struct OpenCall {
     last_event_at: Instant,
     /// The latest event time in the call.
     last_at: Option<Timestamp>,
-    caption_source: Option<HealthSource>,
-    health_problem: Option<String>,
     /// Whether the book returned `Opened` for the call. Set only after a write, so a resent
     /// first event still reports it when the first write failed.
     is_reported: bool,
+    /// The caption line keys a reopened log already held, for `Opened`.
+    logged_caption_keys: Vec<String>,
 }
 
 /// One clock reading, taken by the caller for one input.
@@ -72,12 +76,18 @@ impl Now {
 
 /// What the book did with one event.
 pub(super) enum Logged {
-    Appended,
+    Appended {
+        log_path: PathBuf,
+        observation: Option<Observation>,
+    },
     /// The call's first event written since it opened in this run, other than an end.
     Opened {
         log_path: PathBuf,
         /// The title Meet showed, else the meeting code.
         title: Option<String>,
+        observation: Option<Observation>,
+        /// The caption line keys the log held before this run, when the call was reopened.
+        logged_caption_keys: Vec<String>,
     },
     /// The log already had the event's `seq`.
     Duplicate,
@@ -88,13 +98,32 @@ pub(super) enum Logged {
     },
 }
 
+/// A session id names files, so only a checked one reaches a path.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "field `{field}` must hold 1 to {MAX_SESSION_ID_CHARS} letters, digits or hyphens, not {id:?}"
+)]
+pub(crate) struct InvalidSessionId {
+    field: &'static str,
+    id: String,
+}
+
+/// Checks a session id from the extension, which `field` of its message held.
+pub(super) fn check_session_id(field: &'static str, id: &str) -> Result<(), InvalidSessionId> {
+    if is_valid_session_id(id) {
+        Ok(())
+    } else {
+        Err(InvalidSessionId {
+            field,
+            id: id.to_owned(),
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum EventError {
-    #[error(
-        "field `session_id` must be 1 to {MAX_SESSION_ID_CHARS} letters, digits or hyphens, \
-         not {0:?}"
-    )]
-    InvalidSessionId(String),
+    #[error(transparent)]
+    InvalidSessionId(#[from] InvalidSessionId),
     #[error("field `event` is not a valid call event: {0}")]
     InvalidEvent(serde_json::Error),
     #[error("could not write the browser call log: {0}")]
@@ -108,6 +137,7 @@ impl CallBook {
             open_calls: HashMap::new(),
             open_sessions: HashMap::new(),
             greeted_ports: HashMap::new(),
+            away_sessions: HashMap::new(),
         }
     }
 
@@ -115,19 +145,83 @@ impl CallBook {
         &self.logs
     }
 
-    /// Records the protocol `port_id` said and returns the open sessions, which the extension
-    /// resends events for.
-    pub(super) fn greet(&mut self, port_id: u64, protocol: u32) -> Vec<String> {
+    /// Records the protocol `port_id` said, and that it holds the calls of `worker_sessions`,
+    /// the sessions its worker has open. Returns the open sessions, which the extension resends
+    /// events for, and the calls the port holds.
+    pub(super) fn greet(
+        &mut self,
+        port_id: u64,
+        protocol: u32,
+        worker_sessions: &[String],
+    ) -> (Vec<String>, Vec<PathBuf>) {
         self.greeted_ports.insert(port_id, protocol);
-        self.open_sessions.keys().cloned().collect()
+        let mut held = Vec::new();
+        for session_id in worker_sessions {
+            let Some(log_path) = self.open_sessions.get(session_id) else {
+                continue;
+            };
+            if let Some(call) = self.open_calls.get_mut(log_path) {
+                call.holder_ports.insert(port_id);
+                held.push(log_path.clone());
+            }
+        }
+        (self.open_sessions.keys().cloned().collect(), held)
     }
 
-    /// Forgets `port_id`. A call no port holds can end as idle.
-    pub(super) fn close_port(&mut self, port_id: u64) {
+    /// Forgets `port_id`, and returns the calls no port holds now. A call no port holds can end
+    /// as idle.
+    pub(super) fn close_port(&mut self, port_id: u64) -> Vec<PathBuf> {
         self.greeted_ports.remove(&port_id);
-        for call in self.open_calls.values_mut() {
-            call.holder_ports.remove(&port_id);
-        }
+        self.away_sessions.remove(&port_id);
+        self.open_calls
+            .iter_mut()
+            .filter_map(|(log_path, call)| {
+                let is_unheld = call.holder_ports.remove(&port_id) && call.holder_ports.is_empty();
+                is_unheld.then(|| log_path.clone())
+            })
+            .collect()
+    }
+
+    /// Records the sessions `port_id` says went away, all of them each time. Returns each open
+    /// call with whether all of its sessions went away.
+    pub(super) fn note_away_sessions(
+        &mut self,
+        port_id: u64,
+        session_ids: HashSet<String>,
+    ) -> Vec<(PathBuf, bool)> {
+        self.away_sessions.insert(port_id, session_ids);
+        self.open_calls
+            .iter()
+            .map(|(log_path, call)| {
+                let is_away = call.sessions.iter().all(|session_id| {
+                    self.away_sessions
+                        .values()
+                        .any(|away| away.contains(session_id))
+                });
+                (log_path.clone(), is_away)
+            })
+            .collect()
+    }
+
+    /// Whether any port said `hello` and is still open.
+    pub(super) fn is_extension_connected(&self) -> bool {
+        !self.greeted_ports.is_empty()
+    }
+
+    /// The log of an open session.
+    pub(super) fn log_path_of(&self, session_id: &str) -> Option<PathBuf> {
+        self.open_sessions.get(session_id).cloned()
+    }
+
+    /// The sessions writing to an open call's log.
+    pub(super) fn sessions_of(&self, log_path: &Path) -> Vec<String> {
+        let mut sessions: Vec<String> = self
+            .open_calls
+            .get(log_path)
+            .map(|call| call.sessions.iter().cloned().collect())
+            .unwrap_or_default();
+        sessions.sort();
+        sessions
     }
 
     /// Appends one event from `port_id` to its session's log.
@@ -135,20 +229,18 @@ impl CallBook {
         &mut self,
         port_id: u64,
         seq: u64,
-        session_id: String,
+        session_id: &str,
         raw_event: &serde_json::Value,
         now: Now,
     ) -> Result<Logged, EventError> {
-        if !is_valid_session_id(&session_id) {
-            return Err(EventError::InvalidSessionId(session_id));
-        }
+        check_session_id("session_id", session_id)?;
         let event = CallEvent::deserialize(raw_event).map_err(EventError::InvalidEvent)?;
         let end_reason = event.end_reason();
         let is_end = end_reason.is_some();
-        let log_path = if let Some(log_path) = self.open_sessions.get(&session_id) {
+        let log_path = if let Some(log_path) = self.open_sessions.get(session_id) {
             log_path.clone()
         } else {
-            let Some(log_path) = self.open_session(&session_id, seq, &event, now)? else {
+            let Some(log_path) = self.open_session(session_id, seq, &event, now)? else {
                 return Ok(Logged::Duplicate);
             };
             log_path
@@ -167,20 +259,29 @@ impl CallBook {
         call.last_at = call.last_at.max(event.at());
         call.note_event(&event);
         let Some(reason) = end_reason else {
+            let observation = observation_of(&event);
             if !call.is_reported {
                 call.is_reported = true;
                 return Ok(Logged::Opened {
                     title: call.title(),
                     log_path,
+                    observation,
+                    logged_caption_keys: std::mem::take(&mut call.logged_caption_keys),
                 });
             }
-            return Ok(Logged::Appended);
+            return Ok(Logged::Appended {
+                log_path,
+                observation,
+            });
         };
-        call.sessions.remove(&session_id);
-        self.open_sessions.remove(&session_id);
+        call.sessions.remove(session_id);
+        self.open_sessions.remove(session_id);
         if !call.sessions.is_empty() {
             tracing::info!("browser call session ended; another session goes on");
-            return Ok(Logged::Appended);
+            return Ok(Logged::Appended {
+                log_path,
+                observation: None,
+            });
         }
         self.close_call(&log_path);
         tracing::info!("browser call ended");
@@ -228,14 +329,6 @@ impl CallBook {
                 .greeted_ports
                 .values()
                 .any(|&protocol| protocol < PROTOCOL),
-            calls: calls
-                .into_iter()
-                .map(|(_, call)| CallStatus {
-                    title: call.title(),
-                    caption_source: call.caption_source,
-                    health_problem: call.health_problem.clone(),
-                })
-                .collect(),
         }
     }
 
@@ -270,7 +363,7 @@ impl CallBook {
             tracing::info!(file.path = %log.path().display(), "browser call started");
             let log_path = log.path().to_path_buf();
             self.open_calls
-                .insert(log_path.clone(), OpenCall::new(log, None, now));
+                .insert(log_path.clone(), OpenCall::new(log, None, Vec::new(), now));
             log_path
         };
         let call = match self.open_calls.entry(log_path.clone()) {
@@ -278,12 +371,17 @@ impl CallBook {
             // One that already ended: a resend after a quit, late events after an idle end, or
             // a rejoin.
             Entry::Vacant(ended) => {
-                let (log, summary) = CallLog::reopen(&log_path)?;
-                if log.has_seq(seq) {
+                let reopened = CallLog::reopen(&log_path)?;
+                if reopened.log.has_seq(seq) {
                     return Ok(None);
                 }
                 tracing::info!(file.path = %log_path.display(), "browser call reopened");
-                ended.insert(OpenCall::new(log, summary.start, now))
+                ended.insert(OpenCall::new(
+                    reopened.log,
+                    reopened.summary.start,
+                    reopened.caption_line_keys,
+                    now,
+                ))
             }
         };
         if call.log.has_seq(seq) {
@@ -318,7 +416,12 @@ impl CallBook {
 }
 
 impl OpenCall {
-    fn new(log: CallLog, start: Option<CallStart>, now: Now) -> Self {
+    fn new(
+        log: CallLog,
+        start: Option<CallStart>,
+        logged_caption_keys: Vec<String>,
+        now: Now,
+    ) -> Self {
         Self {
             log,
             sessions: HashSet::new(),
@@ -326,9 +429,8 @@ impl OpenCall {
             holder_ports: HashSet::new(),
             last_event_at: now.instant,
             last_at: None,
-            caption_source: None,
-            health_problem: None,
             is_reported: false,
+            logged_caption_keys,
         }
     }
 
@@ -337,47 +439,63 @@ impl OpenCall {
         start.title.clone().or_else(|| start.meeting_code.clone())
     }
 
-    // Keeps what the tray shows about the call current.
+    // Keeps the call's title current.
     fn note_event(&mut self, event: &CallEvent) {
-        match event {
-            CallEvent::CallStarted { .. } => {
-                if self.start.is_none() {
-                    self.start = CallStart::from_event(event);
-                }
-            }
-            CallEvent::Health {
-                source,
-                captions_on,
-                parse_failures,
-                detail,
-                ..
-            } => {
-                self.caption_source = Some(*source);
-                let problem = match source {
-                    HealthSource::None => Some("no captions found"),
-                    HealthSource::Channel | HealthSource::Dom if !captions_on => {
-                        Some("captions are off")
-                    }
-                    HealthSource::Channel | HealthSource::Dom if *parse_failures > 0 => {
-                        Some("some captions could not be read")
-                    }
-                    HealthSource::Channel | HealthSource::Dom => None,
-                };
-                self.health_problem = problem.map(|problem| match detail {
-                    Some(detail) if !detail.trim().is_empty() => format!("{problem}: {detail}"),
-                    Some(_) | None => problem.to_owned(),
-                });
-                if let Some(problem) = &self.health_problem {
-                    tracing::warn!(exception.message = problem, "mc-meet health problem");
-                }
-            }
-            CallEvent::Caption { .. }
-            | CallEvent::Chat { .. }
-            | CallEvent::Roster { .. }
-            | CallEvent::CallEnded { .. }
-            | CallEvent::Unknown => {}
+        if self.start.is_none() {
+            self.start = CallStart::from_event(event);
         }
     }
+}
+
+// What the status board learns from one event.
+fn observation_of(event: &CallEvent) -> Option<Observation> {
+    match event {
+        CallEvent::Caption {
+            device_id,
+            utterance_id,
+            ..
+        } => Some(Observation::MeetCaption {
+            line_key: caption_line_key(device_id, utterance_id),
+        }),
+        CallEvent::Health {
+            source,
+            captions_on,
+            captions_unavailable,
+            caption_frames_failing,
+            parse_failures,
+            detail,
+            ..
+        } => {
+            if *parse_failures > 0 || *captions_unavailable {
+                tracing::warn!(
+                    browser_call.parse_failures = parse_failures,
+                    browser_call.captions_unavailable = captions_unavailable,
+                    exception.message = detail.as_deref().unwrap_or_default(),
+                    "mc-meet health report"
+                );
+            }
+            let captions = match (*captions_unavailable, *captions_on) {
+                (true, _) => MeetCaptions::Unavailable,
+                (false, true) => MeetCaptions::On,
+                (false, false) => MeetCaptions::Off,
+            };
+            Some(Observation::MeetHealth {
+                source: *source,
+                captions,
+                is_caption_frames_failing: *caption_frames_failing,
+            })
+        }
+        CallEvent::CallStarted { .. }
+        | CallEvent::Chat { .. }
+        | CallEvent::Roster { .. }
+        | CallEvent::CallEnded { .. }
+        | CallEvent::Unknown => None,
+    }
+}
+
+/// Names one caption line: every version of an utterance has the same key.
+pub(super) fn caption_line_key(device_id: &str, utterance_id: &str) -> String {
+    format!("{device_id}|{utterance_id}")
 }
 
 // The session id names the log file, so it must not hold a path separator.

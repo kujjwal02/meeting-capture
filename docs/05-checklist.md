@@ -196,7 +196,14 @@ Done when:
   without a port, closed after a crash. `InputKind::BrowserCallLog` and its parser.
 - [x] mc-meet extension: data channel decoder, DOM fallback, session per tab, acked resend, no
   telemetry.
-- [x] Tray line: extension connected, current call, caption source, last health problem.
+- [x] Tray line: extension connected, and one status line per open call.
+- [x] Call status board for Meet calls and huddles: waiting, recording, problem with a reason,
+  ended. Tray icon colour, tooltip, "Recent calls", and deduplicated notifications.
+- [x] mc-meet reports Meet refusing captions as `captions_unavailable`, and never reports
+  `captions_on` while Meet refuses them.
+- [x] mc-meet shows each tab's call status on its toolbar icon and in a popup.
+- [x] Debug material per call: failing frames with bytes, the 2-minute lead-up, page snapshots.
+  "Save debug report" in the tray and the popup. `just replay-frames`. Deleted after 14 days.
 - [x] A rejoin of the same meeting within 10 minutes goes into the same log and note.
 - [x] Captions turn on when the call starts, so the first words are kept.
 - [x] `[meet] hide_captions`, default on: captions go off after the first channel caption and
@@ -209,6 +216,8 @@ Done when:
 
 - [x] 3 Meet calls, one with a second Meet tab, one browser restart and one app quit mid-call,
   each give one note whose attendees joined the call.
+- [ ] A Meet call where Meet refuses captions shows amber in the tray and on the mc-meet icon,
+  and a "Not recording" notification names the reason within 1 minute.
 
 ## Phase 2: call detection
 

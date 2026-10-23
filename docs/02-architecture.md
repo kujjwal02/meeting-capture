@@ -121,6 +121,37 @@ flowchart LR
   left open and records any with no meeting.
 - macOS only. On Windows the crate starts nothing until a UI Automation adapter exists.
 
+### Call status
+
+The app tracks each open Meet call and huddle in one status board
+(`crates/app/src/call_status.rs`), and ticks it once a second.
+
+- States: waiting (no caption since the call opened or resumed), recording, problem with a
+  reason, and ended with a caption count and length. Each call keeps its start time, caption
+  count, last caption time and its last 3 problems. A Meet call the app reopens after a restart
+  counts the caption lines its log already holds.
+- Reasons: captions off, Meet captions unavailable (Google), caption frames fail to decode, no
+  caption for 2 minutes while captions are on, no caption for 2 minutes with the caption state
+  unknown (a huddle with no health verdict yet), mc-meet disconnected, the Meet tab closed or
+  reloaded, Slack huddle captions unreadable. A Meet call checks the reasons after 20 s without a
+  caption, except a disconnect, which counts at once. Captions off counts until mc-meet reports
+  its caption channels as the source: mc-meet hides Meet's captions only after a caption arrived
+  on them, and they keep streaming.
+- The tray icon is a grey dot when idle, red while recording and amber at a problem or a missing
+  huddle permission. The tooltip and the menu hold one status line per call, with times in the
+  settings time zone. "Recent calls" lists the last 5 calls that ended in this run. The menu is
+  rebuilt only when a call opens or ends; the status tick changes the text of its call lines in
+  place, so an open menu stays open. On Windows the tooltip is cut to 127 UTF-16 units.
+- Notifications: "Recording" once per call at its first caption. "Not recording" after a problem
+  lasts 30 s, once per reason in one outage. "Recording again" at the first caption after it,
+  which ends the outage, so a later outage is announced again. "No transcript captured" when a
+  call ends with no caption. A Meet tab that closed or reloaded gets no "Not recording", since
+  mc-meet ends the call in 5 minutes unless the tab comes back. "mc-meet disconnected" gets one
+  only while another mc-meet port is connected: with none, the browser quit.
+- mc-meet gets the status of its calls as `call_status` messages and shows it on its toolbar
+  icon. At a Meet call's first problem the app writes the lead-up and asks for a page snapshot.
+  [mc-meet](09-meet-extension.md) has the debug material and the debug report.
+
 ### Audio (phases 2, 3, 3b, 5, 7)
 
 ```mermaid
@@ -221,7 +252,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 | pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `minijinja`, `toml`, `directories` |
 | jobs | 1 | One row per meeting with a closed state enum and the extraction retry schedule. Runs a meeting's steps under its lease: one run per meeting across processes, renewed from a second thread, given back however the run ends | `rusqlite`, `tracing` |
 | cli | 1 | `mc`: rerun any job step or ingest a file, without Tauri | `clap` |
-| app | 1 | Tray, settings, "Note written" notifications, permission prompts, review of extracted commitments | Tauri 2, plugin `notification` 2 |
+| app | 1 | Tray, call status, debug reports, settings, notifications, permission prompts, review of extracted commitments | Tauri 2, plugin `notification` 2 |
 | detect | 3b | Emit "call started" and "call ended" when an app takes or releases the mic | Vendored from Anarlog `crates/detect` (MIT) |
 | capture | 3, 5 | One `CallAudioSource` trait; per-OS adapters emit timestamped PCM frames | Mac: Core Audio tap via `cidre`. Windows: WASAPI process loopback via `wasapi`. Mic: `cpal`. Adapted from Anarlog `crates/audio-actual` |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV, flushed every few seconds | `hound` |

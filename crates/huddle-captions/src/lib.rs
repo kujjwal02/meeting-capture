@@ -58,6 +58,12 @@ pub enum Notice {
         state: HuddleHealth,
         reason: String,
     },
+    /// Caption lines were logged or changed since the last report.
+    CaptionsRead {
+        log_path: PathBuf,
+        /// Caption rows and overlay lines logged in the huddle so far.
+        caption_lines: u64,
+    },
     /// The huddle window closed, or reading stopped. The log is complete.
     HuddleEnded {
         log_path: PathBuf,

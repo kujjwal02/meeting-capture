@@ -127,6 +127,19 @@ impl AppDirs {
         self.data_dir.join("logs")
     }
 
+    /// One folder per call with a problem: failing frames, the events before the problem, page
+    /// snapshots. They hold call speech, so they stay here and never go to the vault.
+    #[must_use]
+    pub fn call_debug_dir(&self) -> PathBuf {
+        self.data_dir.join("debug")
+    }
+
+    /// Debug reports the user saved from the tray or mc-meet.
+    #[must_use]
+    pub fn debug_report_dir(&self) -> PathBuf {
+        self.data_dir.join("debug-reports")
+    }
+
     /// The empty working folder for Claude Code, so it reads no project files.
     #[must_use]
     pub fn claude_code_dir(&self) -> PathBuf {

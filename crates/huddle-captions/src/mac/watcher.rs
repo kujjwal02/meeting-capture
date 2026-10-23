@@ -282,6 +282,16 @@ impl<N: FnMut(Notice)> Watcher<N> {
             }
             Err(error) => huddle.tracker.report_log_error(&mut self.notify, &error),
         }
+        // The app tells a recording huddle from a silent one by captions arriving. A row that
+        // grows is a caption arriving too, though the line count stays.
+        let caption_changes = huddle.tracker.caption_changes();
+        if caption_changes > huddle.reported_caption_changes {
+            huddle.reported_caption_changes = caption_changes;
+            (self.notify)(Notice::CaptionsRead {
+                log_path: huddle.tracker.log_path().to_path_buf(),
+                caption_lines: huddle.tracker.caption_lines(),
+            });
+        }
     }
 
     fn end_huddles(&mut self, is_over: impl Fn(&Huddle) -> bool) {

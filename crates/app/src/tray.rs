@@ -1,24 +1,39 @@
-//! The tray icon and its menu. The menu is rebuilt on every job state change, since a macOS tray
-//! menu does not refresh while it is open.
+//! The tray icon and its menu. The menu is rebuilt on every job change and whenever a call opens
+//! or ends. Dropping a menu closes it if it is open, so the once-a-second call status update
+//! changes the text of the existing call lines instead. The icon shows the worst call state: grey
+//! idle, a red dot while recording, amber at a problem.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
-use huddle_captions::HuddleHealth;
+use jiff::tz::TimeZone;
 use jobs::{JobState, Meeting, MeetingId};
 use pipeline::settings::SettingsStore;
 use pipeline::{Pipeline, has_user_edits};
-use sources::browser_call::HealthSource;
+use tauri::image::Image;
 use tauri::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 
-use crate::huddles::HuddleStatus;
+use crate::call_status::{BoardView, Moment, TrayLook, display_time_zone};
 use crate::launch::{LaunchTarget, launch};
 use crate::{AppState, meetings, updates};
 
 const TRAY_ID: &str = "main";
+const TOOLTIP_HEADING: &str = "Meeting Capture";
+/// Big enough for a 22 pt menu bar on a 2x display.
+const TRAY_ICON_PX: u32 = 44;
+/// Each pixel's coverage is sampled on a grid this many samples wide, for a smooth edge.
+const ICON_SUBSAMPLES: u32 = 4;
+const ICON_DOT_PERCENT: u32 = 32;
+
+// The look last set, so a rebuild sets the icon only when it changes.
+static SHOWN_LOOK: Mutex<Option<TrayLook>> = Mutex::new(None);
+// The call lines of the menu last composed, so a status update can change their text in place.
+static CALL_LINES: Mutex<Option<CallLines>> = Mutex::new(None);
+/// Windows copies at most 128 UTF-16 units of a tooltip, the terminator included.
+const MAX_WINDOWS_TOOLTIP_UNITS: usize = 127;
 const RECENT_MEETINGS: u32 = 5;
 const MAX_TITLE_CHARS: usize = 40;
 const MAX_FAILURE_CHARS: usize = 90;
@@ -37,6 +52,8 @@ enum MenuAction {
     StartAtLogin,
     OpenSettings,
     ShowLogFile,
+    SaveDebugReport,
+    SaveDebugReportWithText,
     Quit,
 }
 
@@ -54,6 +71,8 @@ impl MenuAction {
             MenuAction::StartAtLogin => "start-at-login".to_owned(),
             MenuAction::OpenSettings => "open-settings".to_owned(),
             MenuAction::ShowLogFile => "show-log-file".to_owned(),
+            MenuAction::SaveDebugReport => "save-debug-report".to_owned(),
+            MenuAction::SaveDebugReportWithText => "save-debug-report-with-text".to_owned(),
             MenuAction::Quit => "quit".to_owned(),
         }
     }
@@ -78,6 +97,8 @@ impl MenuAction {
             MenuAction::StartAtLogin,
             MenuAction::OpenSettings,
             MenuAction::ShowLogFile,
+            MenuAction::SaveDebugReport,
+            MenuAction::SaveDebugReportWithText,
             MenuAction::Quit,
         ]
         .into_iter()
@@ -85,18 +106,88 @@ impl MenuAction {
     }
 }
 
+/// The open call lines of a composed menu, and what else of the menu follows the call board.
+struct CallLines {
+    shape: CallMenuShape,
+    entries: Vec<MenuItem<Wry>>,
+}
+
+/// The parts of the menu that change only when a call opens or ends.
+#[derive(PartialEq, Eq)]
+struct CallMenuShape {
+    open_calls: usize,
+    recent_lines: Vec<String>,
+    is_huddle_permission_missing: bool,
+}
+
+impl CallMenuShape {
+    fn of(view: &BoardView, time_zone: &TimeZone) -> Self {
+        Self {
+            open_calls: view.calls.len(),
+            recent_lines: view
+                .recent
+                .iter()
+                .map(|call| call.summary_line(time_zone))
+                .collect(),
+            is_huddle_permission_missing: view.is_huddle_permission_missing,
+        }
+    }
+}
+
 pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
-    let icon = app
-        .default_window_icon()
-        .cloned()
-        .ok_or_else(|| tauri::Error::AssetNotFound("app icon".to_owned()))?;
+    let view = board_view(app);
     TrayIconBuilder::with_id(TRAY_ID)
-        .icon(icon)
-        .tooltip("Meeting Capture")
-        .menu(&compose_menu(app)?)
+        .icon(tray_icon(TrayLook::Idle))
+        .tooltip(TOOLTIP_HEADING)
+        .menu(&compose_menu(app, &view)?)
         .on_menu_event(|app, event| handle_menu_event(app, &event))
         .build(app)?;
+    *SHOWN_LOOK.lock().unwrap_or_else(PoisonError::into_inner) = Some(TrayLook::Idle);
     Ok(())
+}
+
+fn board_view(app: &AppHandle) -> BoardView {
+    app.state::<AppState>().calls.status().view(Moment::now())
+}
+
+/// Updates the icon, the tooltip and the call lines from the call board. Rebuilds the menu only
+/// when a call opened or ended since it was composed. Safe from any thread.
+pub(crate) fn show_call_status(app: &AppHandle) {
+    let main_app = app.clone();
+    let queued = app.run_on_main_thread(move || {
+        let Some(tray) = main_app.tray_by_id(TRAY_ID) else {
+            return;
+        };
+        let view = board_view(&main_app);
+        if let Err(error) = show_look(&main_app, &tray, &view) {
+            tracing::error!(exception.message = %error, "could not set the tray icon");
+        }
+        let time_zone = display_time_zone(&main_app.state::<AppState>());
+        let shape = CallMenuShape::of(&view, &time_zone);
+        let is_updated = {
+            let lines = CALL_LINES.lock().unwrap_or_else(PoisonError::into_inner);
+            match lines.as_ref() {
+                Some(lines) if lines.shape == shape => {
+                    for (entry, call) in lines.entries.iter().zip(&view.calls) {
+                        if let Err(error) = entry.set_text(call.status_line(&time_zone)) {
+                            tracing::error!(exception.message = %error, "could not update a tray menu line");
+                        }
+                    }
+                    true
+                }
+                Some(_) | None => false,
+            }
+        };
+        if !is_updated
+            && let Err(error) =
+                compose_menu(&main_app, &view).and_then(|menu| tray.set_menu(Some(menu)))
+        {
+            tracing::error!(exception.message = %error, "could not rebuild the tray menu");
+        }
+    });
+    if let Err(error) = queued {
+        tracing::error!(exception.message = %error, "could not queue a tray status update");
+    }
 }
 
 /// Rebuilds the menu from the job store. Safe from any thread.
@@ -109,7 +200,13 @@ pub(crate) fn refresh(app: &AppHandle) {
             // The listener can report before the tray exists; `create` composes the first menu.
             return;
         };
-        if let Err(error) = compose_menu(&main_app).and_then(|menu| tray.set_menu(Some(menu))) {
+        let view = board_view(&main_app);
+        if let Err(error) = show_look(&main_app, &tray, &view) {
+            tracing::error!(exception.message = %error, "could not set the tray icon");
+        }
+        if let Err(error) =
+            compose_menu(&main_app, &view).and_then(|menu| tray.set_menu(Some(menu)))
+        {
             tracing::error!(exception.message = %error, "could not rebuild the tray menu");
         }
     });
@@ -118,15 +215,89 @@ pub(crate) fn refresh(app: &AppHandle) {
     }
 }
 
-fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
+// The icon follows the worst call state, and the tooltip carries each call's status line.
+fn show_look(app: &AppHandle, tray: &TrayIcon, view: &BoardView) -> tauri::Result<()> {
+    let look = view.tray_look();
+    let mut shown = SHOWN_LOOK.lock().unwrap_or_else(PoisonError::into_inner);
+    if *shown != Some(look) {
+        tray.set_icon(Some(tray_icon(look)))?;
+        *shown = Some(look);
+    }
+    let time_zone = display_time_zone(&app.state::<AppState>());
+    let mut tooltip = vec![TOOLTIP_HEADING.to_owned()];
+    if view.is_huddle_permission_missing {
+        tooltip.push(HUDDLE_PERMISSION_LINE.to_owned());
+    }
+    tooltip.extend(view.calls.iter().map(|call| call.status_line(&time_zone)));
+    let tooltip = tooltip.join("\n");
+    // Windows copies a longer tooltip with no terminator, which shows garbage after it.
+    let tooltip = if cfg!(windows) {
+        truncate_utf16(&tooltip, MAX_WINDOWS_TOOLTIP_UNITS)
+    } else {
+        tooltip
+    };
+    tray.set_tooltip(Some(tooltip))
+}
+
+// The longest prefix of whole characters that fits in `max_units` UTF-16 units.
+fn truncate_utf16(text: &str, max_units: usize) -> String {
+    let mut units = 0;
+    text.chars()
+        .take_while(|character| {
+            units += character.len_utf16();
+            units <= max_units
+        })
+        .collect()
+}
+
+// A dot in the middle of a clear square.
+fn tray_icon(look: TrayLook) -> Image<'static> {
+    let [red, green, blue] = match look {
+        TrayLook::Idle => [142, 142, 147],
+        TrayLook::Recording => [255, 59, 48],
+        TrayLook::Problem => [255, 159, 10],
+    };
+    // In half-sample units, so sample centres fall on whole numbers.
+    let centre = i64::from(TRAY_ICON_PX * ICON_SUBSAMPLES);
+    let radius = i64::from(TRAY_ICON_PX * ICON_SUBSAMPLES * 2 * ICON_DOT_PERCENT / 100);
+    let samples_per_pixel = ICON_SUBSAMPLES * ICON_SUBSAMPLES;
+    let mut rgba = Vec::new();
+    for y in 0..TRAY_ICON_PX {
+        for x in 0..TRAY_ICON_PX {
+            let mut covered = 0;
+            for sample_y in 0..ICON_SUBSAMPLES {
+                for sample_x in 0..ICON_SUBSAMPLES {
+                    let dx = i64::from(2 * (x * ICON_SUBSAMPLES + sample_x) + 1) - centre;
+                    let dy = i64::from(2 * (y * ICON_SUBSAMPLES + sample_y) + 1) - centre;
+                    if dx * dx + dy * dy <= radius * radius {
+                        covered += 1;
+                    }
+                }
+            }
+            let alpha = u8::try_from(covered * 255 / samples_per_pixel).unwrap_or(u8::MAX);
+            rgba.extend([red, green, blue, alpha]);
+        }
+    }
+    Image::new_owned(rgba, TRAY_ICON_PX, TRAY_ICON_PX)
+}
+
+fn compose_menu(app: &AppHandle, view: &BoardView) -> tauri::Result<Menu<Wry>> {
     let state = app.state::<AppState>();
     let menu = Menu::new(app)?;
     if let Some(reason) = &state.pipeline_error {
         let label = format!("Not running: {}", shorten(reason, MAX_REASON_CHARS));
         menu.append(&label_entry(app, &label)?)?;
     }
-    append_huddle_status(app, &menu, &state)?;
+    if view.is_huddle_permission_missing {
+        menu.append(&action_entry(
+            app,
+            &MenuAction::OpenAccessibilitySettings,
+            HUDDLE_PERMISSION_LINE,
+            true,
+        )?)?;
+    }
     append_browser_call_status(app, &menu, &state)?;
+    append_calls(app, &menu, &state, view)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
 
     if let Some(pipeline) = &state.pipeline {
@@ -166,45 +337,27 @@ fn compose_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         "Show log file",
         true,
     )?)?;
+    let has_call = view.current_or_last_call().is_some();
+    menu.append(&action_entry(
+        app,
+        &MenuAction::SaveDebugReport,
+        "Save debug report",
+        has_call,
+    )?)?;
+    menu.append(&action_entry(
+        app,
+        &MenuAction::SaveDebugReportWithText,
+        "Save debug report with caption text",
+        has_call,
+    )?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&action_entry(app, &MenuAction::Quit, "Quit", true)?)?;
     Ok(menu)
 }
 
-// One line while a huddle runs or the watcher cannot run; nothing otherwise.
-fn append_huddle_status(app: &AppHandle, menu: &Menu<Wry>, state: &AppState) -> tauri::Result<()> {
-    let label = match state.huddle_status() {
-        HuddleStatus::Idle => return Ok(()),
-        HuddleStatus::PermissionNeeded => {
-            return menu.append(&action_entry(
-                app,
-                &MenuAction::OpenAccessibilitySettings,
-                "Slack huddles: allow Accessibility to read captions",
-                true,
-            )?);
-        }
-        HuddleStatus::Reading { channel, health } => {
-            let title = shorten(&channel, MAX_TITLE_CHARS);
-            match health {
-                None => format!("Slack huddle {title}: looking for captions"),
-                Some(HuddleHealth::Healthy) => format!("Slack huddle {title}: reading captions"),
-                Some(HuddleHealth::Untested) => {
-                    format!("Slack huddle {title}: reading captions (untested Slack version)")
-                }
-                Some(HuddleHealth::Degraded) => {
-                    format!("Slack huddle {title}: captions partly read")
-                }
-                Some(HuddleHealth::CaptionsOff) => {
-                    format!("Slack huddle {title}: captions are off")
-                }
-                Some(HuddleHealth::Broken) => format!("Slack huddle {title}: can't read captions"),
-            }
-        }
-    };
-    menu.append(&label_entry(app, &label)?)
-}
+const HUDDLE_PERMISSION_LINE: &str = "Slack huddles: allow Accessibility to read captions";
 
-// One line for the extension, and one per open Meet call.
+// One line for the extension.
 fn append_browser_call_status(
     app: &AppHandle,
     menu: &Menu<Wry>,
@@ -216,25 +369,35 @@ fn append_browser_call_status(
         (true, false) => "mc-meet: connected",
         (true, true) => "mc-meet: connected, reload it in chrome://extensions",
     };
-    menu.append(&label_entry(app, extension_label)?)?;
-    for call in status.calls {
-        let title = shorten(call.title.as_deref().unwrap_or("call"), MAX_TITLE_CHARS);
-        let label = match (call.health_problem, call.caption_source) {
-            (Some(problem), _) => {
-                format!("Meet {title}: {}", shorten(&problem, MAX_REASON_CHARS))
-            }
-            (None, None) => format!("Meet {title}: waiting for captions"),
-            (None, Some(HealthSource::Channel)) => {
-                format!("Meet {title}: reading captions from the call")
-            }
-            (None, Some(HealthSource::Dom)) => {
-                format!("Meet {title}: reading captions from the page")
-            }
-            (None, Some(HealthSource::None)) => format!("Meet {title}: no captions found"),
-        };
-        menu.append(&label_entry(app, &label)?)?;
+    menu.append(&label_entry(app, extension_label)?)
+}
+
+// A status line per open call, then the calls that ended in this run.
+fn append_calls(
+    app: &AppHandle,
+    menu: &Menu<Wry>,
+    state: &AppState,
+    view: &BoardView,
+) -> tauri::Result<()> {
+    let time_zone = display_time_zone(state);
+    let mut entries = Vec::new();
+    for call in &view.calls {
+        let entry = label_entry(app, &call.status_line(&time_zone))?;
+        menu.append(&entry)?;
+        entries.push(entry);
     }
-    Ok(())
+    *CALL_LINES.lock().unwrap_or_else(PoisonError::into_inner) = Some(CallLines {
+        shape: CallMenuShape::of(view, &time_zone),
+        entries,
+    });
+    if view.recent.is_empty() {
+        return Ok(());
+    }
+    let recent = Submenu::new(app, "Recent calls", true)?;
+    for call in &view.recent {
+        recent.append(&label_entry(app, &call.summary_line(&time_zone))?)?;
+    }
+    menu.append(&recent)
 }
 
 // A line per account. One that needs to sign in again opens the settings window.
@@ -439,6 +602,8 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
         }
         MenuAction::StartAtLogin => toggle_start_at_login(app),
         MenuAction::OpenSettings => crate::settings_window::open(app),
+        MenuAction::SaveDebugReport => save_debug_report(app, false),
+        MenuAction::SaveDebugReportWithText => save_debug_report(app, true),
         MenuAction::ShowLogFile => launch(
             app,
             &LaunchTarget::RevealFile(
@@ -451,6 +616,16 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
         ),
         MenuAction::Quit => app.exit(0),
     }
+}
+
+fn save_debug_report(app: &AppHandle, is_with_text: bool) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = crate::call_debug::save_debug_report(&app, None, is_with_text) {
+            tracing::error!(exception.message = %error, "could not save a debug report");
+            crate::notify(&app, "Debug report not saved", &error.to_string());
+        }
+    });
 }
 
 fn open_note(app: &AppHandle, state: &AppState, id: MeetingId) {

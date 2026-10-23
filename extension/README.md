@@ -16,7 +16,9 @@ to the meeting-capture app over native messaging. The design is in `docs/09-meet
 | `content/caption-source.js` | Meet tab, isolated world, or plain Node | Caption source policy: picks the channel or the DOM reader, and owns the health fields. No DOM. |
 | `content/main.js` | Meet tab, isolated world | Call start and end, session, runs the DOM reader the policy picks, sends health events. |
 | `session-rules.js` | Service worker, or plain Node | Session rules and event numbers, with no `chrome.*` calls. |
-| `background.js` | Service worker | Storage, native port, queue, resend. Runs the effects `session-rules.js` returns. |
+| `background.js` | Service worker | Storage, native port, queue, resend. Runs the effects `session-rules.js` returns. Sets each Meet tab's toolbar icon from the app's call status. |
+| `popup/` | Toolbar popup | The active tab's call status and a "Save debug report" button. |
+| `icons/` | | Toolbar icons: idle, recording, problem and off, at 16 and 32 px. |
 | `PROTOCOL-NOTES.md` | | Field numbers the decoder relies on, with sources. |
 
 ## Load it unpacked
@@ -52,11 +54,13 @@ was not running when the tab opened.
 4. Leave the call. A `call_ended` line with `"reason":"left"` follows within about 4 s.
 
 A `health` event with a `skeleton` in `detail` means Meet changed a frame format. Compare the
-skeleton with `PROTOCOL-NOTES.md`.
+skeleton with `PROTOCOL-NOTES.md`. "Save debug report with caption text" in the tray keeps the
+failing frames; `just replay-frames <report folder>` runs them through `page/wire.js`.
 
 ## Rules
 
-- No network requests, telemetry, remote config, popup or downloads.
+- No network requests, telemetry, remote config or downloads. The popup shows what the app
+  reports and talks only to the service worker.
 - The extension never changes the caption language. It turns Meet's captions on when the call
   starts, because Meet streams no captions until they are on. With the app's `[meet]
   hide_captions` on, it turns them off after the first channel caption and keeps recording.
