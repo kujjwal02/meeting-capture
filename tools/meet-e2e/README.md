@@ -25,14 +25,18 @@ set `MEET_E2E_SIGNING_IDENTITY` to use another.
 
 ## What it does
 
-1. Copies the dev binary into the work folder and starts it with its own home and vault.
+1. Copies the dev binary and `mc-capture` into the work folder and starts the app with its own
+   home and vault. The app records the call's audio with `mc-capture` and the built-in mic.
 2. Writes a `com.meetingcapture.app` host manifest into the host browser's data folder. Chrome
    reads it before the global one, so only the host browser starts the dev app.
 3. Loads `extension/` into the host browser and gives the host a fake microphone that reads a
    `say` recording.
 4. The host opens a new meeting. The guest asks to join, muted, and the host admits it from the
-   toast or the People panel. The guest sends a chat message.
-5. Both leave. The run waits for `call_ended` in the call log and for the note in the vault.
+   toast or the People panel. The guest sends a chat message. Both pages keep their media
+   elements muted, so no call audio plays out loud.
+5. The run sends `stop_recording` and then `resume_recording` the way mc-meet's popup does. A
+   script cannot click the tray menu, since it is not in the accessibility tree.
+6. Both leave. The run waits for `call_ended` in the call log and for the note in the vault.
 
 The dev app rewrites the global host manifests of Chrome, Chromium, Brave and Edge at start. The
 run restores them and the host browser's manifest at the end, also after a failure. While it runs,
@@ -44,7 +48,14 @@ mc-meet in your own browsers starts the dev binary without the dev home.
 - The log has at least 3 captions, all from the data channel.
 - A roster lists both people.
 - The chat time is within 15 s of sending.
-- The last health event has captions on.
+- mc-meet hid Meet's captions: a health event has `captions_on` false after one had it true.
+- At least 3 captions arrived on the data channel after Meet's captions were hidden.
+- The last health event has `captions_on` false.
+- macOS holds off idle sleep while the call records, and not after a stop or after the call.
+- The stop ends the helper and closes the segment, and the app logs `recording_stopped`.
+- No caption lands between `recording_stopped` and `recording_resumed`.
+- After the call, `audio.json` lists at least 2 segments, all closed, and each segment's
+  `NNN-mic.wav` and `NNN-remote.wav` are not empty.
 - The note holds the chat message.
 
 On a failure it prints the Meet tab's errors and mc-meet's stored sessions, and saves

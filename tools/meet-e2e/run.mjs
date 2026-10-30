@@ -15,11 +15,12 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoDir = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const appBinary = process.argv[2] ?? join(repoDir, "target", "debug", "meeting-capture");
+const helperBinary = join(dirname(appBinary), "mc-capture");
 // Outside ~/Documents: macOS privacy controls stop Chrome from starting a host there.
 const workDir = process.env.MEET_E2E_DIR ?? join(homedir(), ".cache", "meeting-capture-e2e");
 const hostProfile = process.env.MEET_E2E_HOST_PROFILE ?? "mcdev";
@@ -113,6 +114,19 @@ function pressIfShown(who, pattern) {
   if (button) patchrome(who, "click", `@${button.ref}`);
 }
 
+// Neither browser plays call audio out loud: the guest would play the host's speech.
+const muteMediaScript = `(() => {
+  const play = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function () {
+    this.muted = true;
+    return play.call(this);
+  };
+  setInterval(() => {
+    for (const media of document.querySelectorAll("audio, video")) media.muted = true;
+  }, 100);
+  return true;
+})()`;
+
 // ---- Chrome DevTools protocol on the host browser: loading mc-meet and the fake microphone.
 
 async function devtools() {
@@ -199,12 +213,18 @@ function startApp() {
   mkdirSync(dirname(binary), { recursive: true });
   writeFileSync(join(bundle, "Contents", "Info.plist"), devInfoPlist());
   copyFileSync(appBinary, binary);
+  // The app starts the audio helper from its own folder, as in a release bundle.
+  const helper = join(dirname(binary), "mc-capture");
+  copyFileSync(helperBinary, helper);
   // The linker's ad-hoc signature changes with each build, so macOS asks for Accessibility again
-  // on every run. A stable identity keeps the grant across builds.
+  // on every run. A stable identity keeps the grant across builds. The bundle's signature covers
+  // the helper, so the helper is signed first.
   try {
-    execFileSync("codesign", ["--force", "--sign", signingIdentity, bundle], {
-      stdio: ["ignore", "ignore", "pipe"],
-    });
+    for (const path of [helper, bundle]) {
+      execFileSync("codesign", ["--force", "--sign", signingIdentity, path], {
+        stdio: ["ignore", "ignore", "pipe"],
+      });
+    }
   } catch (error) {
     step(
       `could not sign the dev app with "${signingIdentity}", so macOS may ask for Accessibility: ${String(error.stderr).trim()}`,
@@ -281,6 +301,62 @@ function pointHostAt(wrapper, appBinaryPath, profileManifestPath) {
 
 // ---- What the app wrote.
 
+// The app records a call's stems in a folder named after its call log.
+const callDirOf = (logPath) => join(homeDir, "data", "calls", basename(logPath, ".jsonl"));
+
+function readAudio(callDir) {
+  const path = join(callDir, "audio.json");
+  return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) : null;
+}
+
+function audioHelperPids(appPid) {
+  try {
+    return execFileSync("pgrep", ["-P", String(appPid), "-f", "mc-capture audio"], {
+      encoding: "utf8",
+    })
+      .split("\n")
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+// The helper's "prevent idle sleep" assertions, as pmset lists them.
+const idleSleepHolds = () =>
+  execFileSync("pmset", ["-g", "assertions"], { encoding: "utf8" })
+    .split("\n")
+    .filter((line) => line.includes("Meeting Capture is recording a call"));
+
+// Sends what mc-meet's popup button sends: `stop_recording` or `resume_recording` for the Meet
+// tab. The app handles it as the tray's "Stop recording this call" and "Resume recording". A
+// script cannot click the tray: a Tauri tray menu is not in the accessibility tree.
+async function pressRecordingButton(cdp, extensionId, type) {
+  const { result: created } = await cdp.send("Target.createTarget", {
+    url: `chrome-extension://${extensionId}/popup/popup.html`,
+  });
+  const { result: attached } = await cdp.send("Target.attachToTarget", {
+    targetId: created.targetId,
+    flatten: true,
+  });
+  const { result } = await cdp.send(
+    "Runtime.evaluate",
+    {
+      expression: `(async () => {
+        const [meet] = await chrome.tabs.query({ url: "https://meet.google.com/*" });
+        const port = chrome.runtime.connect({ name: "mc-meet-popup" });
+        port.postMessage({ type: ${JSON.stringify(type)}, tab_id: meet.id });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        return meet.id;
+      })()`,
+      awaitPromise: true,
+      returnByValue: true,
+    },
+    attached.sessionId,
+  );
+  await cdp.send("Target.closeTarget", { targetId: created.targetId });
+  if (result?.exceptionDetails) throw new Error(`${type} failed in the popup page`);
+}
+
 function readLog(meetingCode) {
   if (!existsSync(logDir)) return null;
   for (const name of readdirSync(logDir).filter((file) => file.endsWith(".jsonl"))) {
@@ -319,6 +395,8 @@ const manifestsBefore = new Map(
     .filter((path) => existsSync(path))
     .map((path) => [path, readFileSync(path, "utf8")]),
 );
+// The host profile has no daemon, and so no devtools address, until a page is open.
+patchrome("host", "open", "about:blank");
 const cdp = await devtools();
 const { app, binary, wrapper } = startApp();
 const profileManifestPath = join(
@@ -376,6 +454,7 @@ try {
   await cdp.send("Page.enable", {}, tab);
   await cdp.send("Runtime.enable", {}, tab);
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: fakeMicScript() }, tab);
+  await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: muteMediaScript }, tab);
   await cdp.send("Page.navigate", { url: "https://meet.new" }, tab);
   const meetingUrl = await until("the host gets a meeting code", 30000, async () => {
     const { result } = await cdp.send(
@@ -409,6 +488,7 @@ try {
   await until("the guest sees the join screen", 60000, () =>
     findButton("guest", /^(Ask to join|Join now)$/),
   );
+  patchrome("guest", "eval", muteMediaScript, "--main-world");
   pressIfShown("guest", /^Not now$/);
   pressIfShown("guest", /^Turn off microphone$/);
   pressIfShown("guest", /^Turn off camera$/);
@@ -435,6 +515,15 @@ try {
     return log && log.events.filter((event) => event.kind === "caption").length >= 3 ? log : null;
   });
   step(`call log ${withCaptions.path}`);
+  const callDir = callDirOf(withCaptions.path);
+  await until("the audio helper records segment 1", 30000, () => {
+    const audio = readAudio(callDir);
+    return audioHelperPids(app.pid).length === 1 &&
+      audio?.segments.some((segment) => segment.state === "open")
+      ? audio
+      : null;
+  });
+  expect(idleSleepHolds().length > 0, "macOS holds off idle sleep while recording");
 
   await press("guest", /^Chat with everyone$/);
   const sentMs = Date.now();
@@ -452,12 +541,47 @@ try {
     readLog(meetingCode)?.events.find((event) => event.kind === "chat" && event.text === chatText),
   );
 
+  await pressRecordingButton(cdp, loaded.result.id, "stop_recording");
+  step("pressed Stop recording this call in mc-meet's popup");
+  const afterStop = await until("the helper exits with every segment closed", 15000, () => {
+    const audio = readAudio(callDir);
+    return audioHelperPids(app.pid).length === 0 &&
+      audio?.segments.every((segment) => segment.state === "closed")
+      ? audio
+      : null;
+  });
+  const stoppedEvent = await until("recording_stopped in the call log", 15000, () =>
+    readLog(meetingCode)?.events.find((event) => event.kind === "recording_stopped"),
+  );
+  expect(idleSleepHolds().length === 0, "macOS may idle sleep once recording stops");
+  await sleep(10000);
+  await pressRecordingButton(cdp, loaded.result.id, "resume_recording");
+  step("pressed Resume recording in mc-meet's popup");
+  await until("the helper records the next segment", 30000, () => {
+    const audio = readAudio(callDir);
+    return audio && audio.segments.length > afterStop.segments.length ? audio : null;
+  });
+  const resumedEvent = await until("a caption after recording_resumed", 60000, () => {
+    const events = readLog(meetingCode)?.events ?? [];
+    const resumed = events.find((event) => event.kind === "recording_resumed");
+    return resumed && events.some((event) => event.kind === "caption" && event.at > resumed.at)
+      ? resumed
+      : null;
+  });
+
   await sleep(10000);
   await press("guest", /^Leave call$/);
   await press("host", /^Leave call$/);
   const ended = await until("call_ended in the call log", 60000, () => {
     const log = readLog(meetingCode);
     return log?.events.at(-1)?.kind === "call_ended" ? log : null;
+  });
+  const audio = await until("every segment closed after the call", 15000, () => {
+    const audio = readAudio(callDir);
+    return audioHelperPids(app.pid).length === 0 &&
+      audio?.segments.every((segment) => segment.state === "closed")
+      ? audio
+      : null;
   });
   const notePath = await until("the note in the vault", 180000, () => findNote(meetingCode));
 
@@ -497,6 +621,28 @@ try {
   );
   expect(healths.at(-1)?.captions_on === false, "the last health event has captions off");
   expect(note.includes(chatText), "the note has the chat message");
+  expect(
+    audio.segments.length >= 2,
+    `${audio.segments.length} audio segments, one each side of the stop`,
+  );
+  for (const segment of audio.segments) {
+    const sizes = segment.stems.map((stem) => {
+      const path = join(callDir, stem.file);
+      return `${stem.file} ${existsSync(path) ? statSync(path).size : 0} B`;
+    });
+    expect(
+      segment.stems.length === 2 && sizes.every((size) => !size.endsWith(" 0 B")),
+      `segment ${segment.number} has both stems: ${sizes.join(", ")}`,
+    );
+  }
+  expect(
+    !events.some(
+      (event) =>
+        event.kind === "caption" && event.at > stoppedEvent.at && event.at < resumedEvent.at,
+    ),
+    "no caption while recording was stopped",
+  );
+  expect(idleSleepHolds().length === 0, "macOS may idle sleep after the call");
   step(`note ${notePath}`);
 } catch (error) {
   failures.push(error.message);

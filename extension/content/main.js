@@ -1,6 +1,7 @@
 // Content script, isolated world. It owns the call session of its tab: it finds call start and
 // end, forwards what the two caption readers emit, starts and stops the DOM reader as the caption
-// source policy decides, and reports health. Events go to the service worker over a port as they
+// source policy decides, and reports health. While the app reports the call as stopped by the
+// user, it sends no caption or chat. Events go to the service worker over a port as they
 // happen. Debug material (failed frames, page snapshots) goes the same way but is never queued.
 (() => {
   if (globalThis.mcMeetContentStarted) return;
@@ -31,6 +32,12 @@
   const HOOK_SNAPSHOT_WAIT_MS = 2000;
 
   let call = null;
+  // Kept out of the stored session: the worker tells a reloaded tab again.
+  let isRecordingStopped = false;
+  // Caption lines seen since the last stop or resume, and the lines a stop or resume cut. A cut
+  // line that grows on would mix words from both sides of the change, so it is dropped.
+  let liveUtterances = new Set();
+  const cutUtterances = new Set();
   let leaveMissingSinceMs = null;
   let lastHealthKey = "";
   let isSelfRemoved = false;
@@ -74,6 +81,10 @@
   // ---- Worker port.
 
   function onWorkerMessage(message) {
+    if (message?.type === "recording_state") {
+      if (call?.session_id === message.session_id) setRecordingStopped(message.is_stopped === true);
+      return;
+    }
     if (message?.type === "snapshot_request") {
       if (call?.session_id === message.session_id) requestSnapshot(call.session_id);
       return;
@@ -179,6 +190,8 @@
     const code = meetingCode();
     const stored = readStoredSession();
     leaveMissingSinceMs = null;
+    // A stopped call stays stopped in the app, which drops its captions until the worker says.
+    isRecordingStopped = false;
     if (stored?.meeting_code === code && Date.now() - stored.last_seen_ms < RESUME_WINDOW_MS) {
       call = stored;
       storeSession();
@@ -212,6 +225,16 @@
     call = null;
     follow(captionSource.decide({ kind: "call_ended" }));
     isSelfRemoved = false;
+  }
+
+  // ---- Stop and resume. The app decides and logs both. The tab only stops sending captions and
+  // chat, which the app would drop anyway.
+
+  function setRecordingStopped(isStopped) {
+    if (isStopped === isRecordingStopped) return;
+    isRecordingStopped = isStopped;
+    for (const key of liveUtterances) cutUtterances.add(key);
+    liveUtterances = new Set();
   }
 
   // ---- Caption source and health.
@@ -301,6 +324,12 @@
       return;
     }
     if (!call) return;
+    if (event.kind === "caption") {
+      const key = `${event.device_id}/${event.utterance_id}`;
+      if (cutUtterances.has(key)) return;
+      liveUtterances.add(key);
+    }
+    if (isRecordingStopped && (event.kind === "caption" || event.kind === "chat")) return;
     if (event.kind === "caption") {
       if (origin === "channel") {
         follow(captionSource.decide({ kind: "channel_caption", atMs: Date.now() }));

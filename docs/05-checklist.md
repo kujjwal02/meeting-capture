@@ -237,13 +237,13 @@ Done when:
 - [x] Spike: tap format, helper prompt attribution, CPU with the tap open.
 - [x] Spike: tap across a switch to AirPods, AirPods HFP rate.
 - [x] Usage strings in both plists; minimum macOS 14.4; the audio-input entitlement.
-- [ ] `capture` with one `CallAudioSource` trait; global tap for remote audio, `cpal` for the mic.
-- [ ] `stem-writer` writes numbered `NNN-mic.wav` and `NNN-remote.wav` segments and `audio.json`.
-- [ ] `mc-capture` helper, supervised by the app with 1, 2 and 4 s restarts.
+- [x] `capture` with one `CallAudioSource` type; global tap for remote audio, `cpal` for the mic.
+- [x] `stem-writer` writes numbered `NNN-mic.wav` and `NNN-remote.wav` segments and `audio.json`.
+- [x] `mc-capture` helper, supervised by the app with 1, 2 and 4 s restarts.
 - [ ] Built-in mic when the default input is Bluetooth; new mic stream opens before the old closes.
 - [ ] Orphan WAVs repaired at launch.
 - [ ] System-audio and mic permission checked at launch, with a tray warning.
-- [ ] Tray recording dot and "Stop recording this call".
+- [x] Tray recording dot and "Stop recording this call".
 
 Done when:
 

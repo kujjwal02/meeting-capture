@@ -581,7 +581,8 @@ impl SegmentRecord {
     }
 }
 
-/// One past the highest segment number in the folder's `audio.json` or in any `NNN-*.wav`.
+/// One past the highest segment number in the folder's `audio.json` or in any `NNN-*` file
+/// name. Any extension counts, so audio never takes a number another capture process used.
 ///
 /// # Errors
 ///
@@ -594,7 +595,9 @@ pub fn next_segment_number(folder: &Path) -> Result<u32, StemWriterError> {
     Ok(highest_segment_number(folder, &manifest)? + 1)
 }
 
-fn stem_file_name(number: u32, stem: Stem) -> String {
+/// The file name of one stem of segment `number`, such as `001-mic.wav`.
+#[must_use]
+pub fn stem_file_name(number: u32, stem: Stem) -> String {
     format!("{number:03}-{stem}.wav")
 }
 
@@ -610,7 +613,7 @@ fn utc_timestamp(utc: SystemTime) -> Result<Timestamp, StemWriterError> {
     Timestamp::try_from(utc).map_err(|_| StemWriterError::ClockOutOfRange)
 }
 
-/// The highest segment number in the manifest or in any `NNN-*.wav` in the folder. A file whose
+/// The highest segment number in the manifest or in any `NNN-*` name in the folder. A file whose
 /// segment never reached the manifest still counts, so it is never overwritten.
 fn highest_segment_number(folder: &Path, manifest: &AudioManifest) -> Result<u32, StemWriterError> {
     let io_error = |source| StemWriterError::Io {
@@ -629,9 +632,6 @@ fn highest_segment_number(folder: &Path, manifest: &AudioManifest) -> Result<u32
             continue;
         };
         if let Some((prefix, _)) = name.split_once('-')
-            && Path::new(name)
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
             && prefix.len() >= 3
             && prefix.bytes().all(|byte| byte.is_ascii_digit())
             && let Ok(number) = prefix.parse::<u32>()

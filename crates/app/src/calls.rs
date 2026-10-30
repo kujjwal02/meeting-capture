@@ -85,13 +85,20 @@ impl Calls {
         &self.status
     }
 
-    #[expect(dead_code, reason = "phase 3 capture subscribes")]
     pub fn subscribe(&self) -> broadcast::Receiver<CallEvent> {
         self.sender.subscribe()
     }
 
     /// Reports a call a source has open. Repeats for a call already open do nothing.
-    pub fn open(&self, id: &Path, platform: CallPlatform, title: Option<String>) {
+    /// `is_stopped_by_user` is what the call's log says, and reaches the status board before any
+    /// subscriber hears of the call.
+    pub fn open(
+        &self,
+        id: &Path,
+        platform: CallPlatform,
+        title: Option<String>,
+        is_stopped_by_user: bool,
+    ) {
         let mut tally = self.lock();
         if tally.open.contains_key(id) {
             return;
@@ -101,8 +108,13 @@ impl Calls {
             platform,
             title,
         };
-        self.status
-            .open(id, platform, call.title.clone(), Moment::now());
+        self.status.open(
+            id,
+            platform,
+            call.title.clone(),
+            is_stopped_by_user,
+            Moment::now(),
+        );
         tally.open.insert(call.id.clone(), call.clone());
         let event = if tally.ended.remove(id) {
             CallEvent::Resumed(call)
@@ -111,6 +123,11 @@ impl Calls {
         };
         // Under the lock, so an end and a resume of one call cannot reach subscribers swapped.
         self.publish(event);
+    }
+
+    /// The open calls, for a subscriber that fell behind the stream.
+    pub fn open_calls(&self) -> Vec<Call> {
+        self.lock().open.values().cloned().collect()
     }
 
     /// Reports a call a source ended. A call not open in this run is ignored: its end reaches

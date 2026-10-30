@@ -1,10 +1,12 @@
 //! Tray app with no Dock icon and no window. Receives mc-meet's call events and Slack huddle
-//! captions, and runs the pipeline for each meeting. Starts at login once "Start at login" is on.
+//! captions, records each call's audio through the `mc-capture` sidecar, and runs the pipeline
+//! for each meeting. Starts at login once "Start at login" is on.
 //! Started by a browser with an extension origin as its argument, it runs host mode instead.
 
 // Release builds on Windows would otherwise open a console window next to the tray icon.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod audio_capture;
 mod browser_calls;
 mod call_debug;
 mod call_status;
@@ -36,6 +38,7 @@ pub(crate) struct AppState {
     pub settings: Arc<SettingsStore>,
     pub browser_calls: browser_calls::BrowserCalls,
     pub calls: calls::Calls,
+    pub audio_capture: audio_capture::AudioCapture,
     pub call_debug: call_debug::CallDebug,
     pub updates: updates::Updates,
 }
@@ -148,6 +151,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         settings: settings_store,
         browser_calls,
         calls: calls::Calls::new(),
+        audio_capture: audio_capture::AudioCapture::new(),
         call_debug,
         updates: updates::Updates::default(),
     });
@@ -156,6 +160,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     meet_extension::start(app.handle());
     call_status::start(app.handle());
     call_debug::start(app.handle());
+    // Before the call sources, so it hears every call from the first.
+    audio_capture::start(app.handle());
     if let Some(pipeline) = pipeline {
         check_google_accounts(app.handle().clone());
         huddles::start(app.handle(), &pipeline);

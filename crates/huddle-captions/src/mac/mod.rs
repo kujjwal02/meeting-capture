@@ -20,7 +20,7 @@ pub(crate) fn run(
     let mut watcher = watcher::Watcher::new(paths, notify);
     loop {
         // AppKit hands back autoreleased objects, and this thread has no run loop to drain them.
-        objc2::rc::autoreleasepool(|_| watcher.tick(settings()));
+        objc2::rc::autoreleasepool(|_| watcher.tick(&settings()));
         std::thread::sleep(POLL_INTERVAL);
     }
 }

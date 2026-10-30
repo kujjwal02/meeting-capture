@@ -28,7 +28,7 @@ flowchart LR
 | Content script | `extension/content/`, isolated world | Finds call start and end, reads the DOM when the channels give nothing, and owns the call session for its tab. |
 | Session rules | `extension/session-rules.js`, service worker | Decides what each tab message, tab change and alarm does to the worker's sessions. Numbers events. Makes no `chrome.*` calls and reads no clock, so it also runs in Node. |
 | Service worker | `extension/background.js` | Stores the session state and queued events in one write, holds the native port, resends after a reconnect. Shows each Meet tab's call status on the toolbar icon. |
-| Popup | `extension/popup/` | The active tab's call status, and a "Save debug report" button. |
+| Popup | `extension/popup/` | The active tab's call status, a "Stop recording this call" or "Resume recording" button, and a "Save debug report" button. |
 | Host mode | `crates/native-host`, run by the app binary | Chrome starts `meeting-capture chrome-extension://<id>/`. `main` sees the argument and relays frames between stdio and the app socket before Tauri starts. |
 | Call log | `crates/app/src/browser_calls.rs` | Listens on the socket, appends each event to the session log, acks it, ends calls, hands logs to intake. |
 | Parser | `crates/sources/src/browser_call.rs` | Turns a session log into a `Transcript`. |
@@ -84,6 +84,8 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `frame_failed` | `session_id`, `channel` (`captions` or `captions_v2`), `at`, `reason`, `skeleton`, `byte_length`, `bytes_base64` (the frame as received, or null above 256 KB) | A caption channel frame that did not decode. At most 20 per channel per call from the page, and 20 per session from the content script. Failures on `collections` and `meet_messages` stay in the page: a chat or roster frame with nothing to read is common. Not queued: sent only while the app is connected. |
 | `pages_away` | `session_ids`: every session whose tab closed, reloaded or crashed and may still come back | After `welcome`, and whenever the list changes. Not queued. A call all of whose sessions are away shows "the Meet tab closed or reloaded", with no notification. |
 | `page_snapshot` | `session_id`, `snapshot` | Reply to `snapshot_request`. See "Debug material". |
+| `stop_recording` | `session_id` | The popup's "Stop recording this call" button. The app handles it as the tray row of the same name. |
+| `resume_recording` | `session_id` | The popup's "Resume recording" button. |
 | `save_debug_report` | `session_id` (the popup's tab session, or null), `with_text` | The popup's "Save debug report" button. The app answers `debug_report_failed` for a `session_id` that is not 1 to 64 letters, digits or hyphens. |
 
 `event.kind` is one of the kinds below. `extension/call-events.js` builds each of them.
@@ -95,6 +97,8 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `chat` | `at`, `message_id`, `device_id` (channel only), `sender`, `text`, `source` |
 | `roster` | `at`, `participants`: list of `{device_id, name, is_self}`, the whole list each time it changes |
 | `health` | `at`, `source` (`channel`, `dom` or `none`), `captions_on` (Meet's captions button is on, and Meet does not refuse captions), `captions_unavailable` (Meet refuses captions), `caption_frames_failing` (caption frames fail to decode, with no caption decoded since), `parse_failures`, `detail` |
+| `recording_stopped` | `at`; the app writes it, with no `seq` |
+| `recording_resumed` | `at`; the app writes it, with no `seq` |
 | `call_ended` | `at`, `reason` (`left`, `tab_closed`, `kicked`, `page_unload`; the app writes `idle` and `app_restarted`) |
 
 - `caption`: `utterance_id` is a string and `version` an integer. `at` is when the utterance first
@@ -125,6 +129,14 @@ unknown fields are ignored on both sides, so either side can be newer.
   goes back to `none` until one of them carries a caption.
 - After each `welcome` the worker tells every Meet tab, and each tab sends `health` again: a
   restarted app has none for the call.
+- At each `call_status` the worker sends each Meet tab with a session a `recording_state` with
+  `is_stopped`. A tab whose call is `stopped` sends no caption or chat.
+- The app writes `recording_stopped` and `recording_resumed` in the call log at each stop and
+  resume. It refuses both kinds from the extension. While a call is stopped, the app acks and
+  drops its captions and chat.
+- A call reopened from its log, after a restart or a rejoin, is stopped when the log's last stop
+  or resume is a stop.
+- The popup port is accepted only from the extension's own popup page.
 
 ### App to extension
 
@@ -139,8 +151,8 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `debug_report_saved` | `path` | Reply to `save_debug_report`. |
 | `debug_report_failed` | `error` | Reply to `save_debug_report`. |
 
-Each `call_status` entry has `session_ids`, `title`, `state` (`waiting`, `recording` or
-`problem`), `reason` and `reason_text` (null unless `problem`), `started_at`, `started_at_label`,
+Each `call_status` entry has `session_ids`, `title`, `state` (`waiting`, `recording`, `problem`
+or `stopped`), `reason` and `reason_text` (null unless `problem`), `started_at`, `started_at_label`,
 `recording_since_label`, `caption_count`, `last_caption_at`, `caption_source` (`channel`, `dom`,
 `none` or null), and `problems` (the last 3, oldest first, each `{reason, reason_text, at,
 at_label}`). Labels are clock times such as `21:02 IST` in the app's settings time zone.
@@ -234,6 +246,7 @@ app is not reachable.
 | Waiting | grey ring | `…` | `Waiting for captions` |
 | Recording | red dot | `REC` | `Recording since 21:02 IST` |
 | Problem | amber | `!` | `Not recording: <reason>` |
+| Stopped by the user | grey ring | none | `Recording stopped` |
 | App not reachable | grey ring, crossed out | `OFF` | `Meeting Capture is not running` |
 
 - The worker sets the icon, badge and title per Meet tab with `chrome.action`. It keeps the last
@@ -245,6 +258,8 @@ app is not reachable.
   last caption, the caption source (`call` for the channels, `page` for the DOM), the app and
   mc-meet versions, and the last 3 problems. An open popup keeps the native port open. Opening
   it with no call starts the app if it is not running, since host mode starts the app.
+- "Stop recording this call" in the popup sends `stop_recording` with the tab's session. Once
+  the call is `stopped`, the button reads "Resume recording" and sends `resume_recording`.
 - "Save debug report" in the popup sends `save_debug_report` with the tab's session. The app
   writes the report and reveals it in Finder or Explorer. With no answer in 30 s, the popup says
   the report was not saved.

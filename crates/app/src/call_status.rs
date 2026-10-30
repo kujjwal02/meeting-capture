@@ -3,7 +3,7 @@
 //! timestamped observations and says what to announce; the tray, the notifications and mc-meet
 //! only show it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -105,6 +105,9 @@ pub(crate) enum CallState {
     /// A caption arrived, and no problem is in view.
     Recording,
     Problem(ProblemReason),
+    /// The user stopped recording the call. No caption is expected and no problem counts until
+    /// they resume.
+    Stopped,
 }
 
 /// How an ended call went, for the recent calls list.
@@ -154,6 +157,8 @@ pub(crate) enum Observation {
     /// Caption lines arrived or changed, and the huddle log holds this many.
     HuddleCaptionLines(u64),
     HuddleHealth(HuddleHealth),
+    /// The user stopped recording the call (`true`) or resumed it (`false`).
+    RecordingStopped(bool),
 }
 
 /// What the user hears about a call.
@@ -322,6 +327,9 @@ struct TrackedCall {
     problem: Option<ActiveProblem>,
     problems: VecDeque<ProblemRecord>,
     notices: CallNotices,
+    /// "Stop recording this call" was chosen and "Resume recording" was not. A rejoin
+    /// (`call.resumed`) keeps it.
+    is_stopped_by_user: bool,
 }
 
 /// What the call announced, so each notification goes out once, even when a state flips back
@@ -379,11 +387,13 @@ impl CallBoard {
     }
 
     /// A call opened, or one that ended in this run opened again and keeps its counts.
+    /// `is_stopped_by_user` comes from the call's log, so a stop survives a restart.
     pub(crate) fn open(
         &self,
         id: &Path,
         platform: CallPlatform,
         title: Option<String>,
+        is_stopped_by_user: bool,
         now: Moment,
     ) {
         let mut board = self.lock();
@@ -395,13 +405,14 @@ impl CallBoard {
             .iter()
             .position(|ended| ended.call.id == id)
             .and_then(|index| board.recent.remove(index));
-        let call = match resumed {
+        let mut call = match resumed {
             Some(EndedCall { mut call, .. }) => {
                 call.resume(title, now);
                 call
             }
             None => TrackedCall::new(id, platform, title, now),
         };
+        call.is_stopped_by_user = is_stopped_by_user;
         board.open.insert(id.to_path_buf(), call);
     }
 
@@ -440,6 +451,25 @@ impl CallBoard {
         if let Some(call) = board.open.get_mut(id) {
             call.observe(observation, now);
         }
+    }
+
+    /// Whether the user stopped recording this open call. The one answer the supervisor, the
+    /// huddle watcher and the tray all read.
+    pub(crate) fn is_stopped_by_user(&self, id: &Path) -> bool {
+        self.lock()
+            .open
+            .get(id)
+            .is_some_and(|call| call.is_stopped_by_user)
+    }
+
+    /// The open calls the user stopped recording.
+    pub(crate) fn stopped_call_ids(&self) -> BTreeSet<PathBuf> {
+        self.lock()
+            .open
+            .values()
+            .filter(|call| call.is_stopped_by_user)
+            .map(|call| call.id.clone())
+            .collect()
     }
 
     pub(crate) fn set_huddle_permission_missing(&self, is_missing: bool) {
@@ -520,6 +550,7 @@ impl TrackedCall {
             problem: None,
             problems: VecDeque::new(),
             notices: CallNotices::default(),
+            is_stopped_by_user: false,
         }
     }
 
@@ -557,6 +588,15 @@ impl TrackedCall {
 
     fn observe(&mut self, observation: Observation, now: Moment) {
         match (observation, &mut self.signals) {
+            (Observation::RecordingStopped(is_stopped), _) => {
+                // A resume waits for a fresh caption, as a rejoin does.
+                if self.is_stopped_by_user && !is_stopped {
+                    self.waiting_since = now.instant;
+                    self.recording_since = None;
+                }
+                self.is_stopped_by_user = is_stopped;
+                self.problem = None;
+            }
             (Observation::MeetCaption { line_key }, Signals::Meet(meet)) => {
                 meet.line_keys.insert(line_key);
                 let count = meet.line_keys.len() as u64;
@@ -584,8 +624,11 @@ impl TrackedCall {
                 meet.line_keys.extend(line_keys);
                 self.caption_count = self.caption_count.max(meet.line_keys.len() as u64);
             }
+            // The watcher reads rows while stopped but logs none, so they are not captions.
             (Observation::HuddleCaptionLines(count), Signals::Huddle(_)) => {
-                self.saw_captions(count, now);
+                if !self.is_stopped_by_user {
+                    self.saw_captions(count, now);
+                }
             }
             (Observation::HuddleHealth(health), Signals::Huddle(huddle)) => {
                 huddle.health = Some(health);
@@ -623,6 +666,9 @@ impl TrackedCall {
     }
 
     fn current_problem(&self, now: Moment) -> Option<ProblemReason> {
+        if self.is_stopped_by_user {
+            return None;
+        }
         let quiet_for = self.quiet_for(now);
         match &self.signals {
             Signals::Meet(meet) => {
@@ -669,6 +715,7 @@ impl TrackedCall {
 
     fn state(&self) -> CallState {
         match &self.problem {
+            _ if self.is_stopped_by_user => CallState::Stopped,
             Some(problem) => CallState::Problem(problem.reason),
             None if self.has_caption_since_wait() => CallState::Recording,
             None => CallState::Waiting,
@@ -801,10 +848,14 @@ impl TrackedCall {
             (None, CallState::Waiting) => "waiting",
             (None, CallState::Recording) => "recording",
             (None, CallState::Problem(_)) => "problem",
+            (None, CallState::Stopped) => "stopped",
         };
         let reason = match self.state() {
             CallState::Problem(reason) if ended_at.is_none() => Some(reason.code()),
-            CallState::Problem(_) | CallState::Waiting | CallState::Recording => None,
+            CallState::Problem(_)
+            | CallState::Waiting
+            | CallState::Recording
+            | CallState::Stopped => None,
         };
         serde_json::json!({
             "call_id": self.id,
@@ -876,6 +927,7 @@ impl CallView {
             CallState::Problem(reason) => {
                 format!("{name}: not recording, {}; {captions}", reason.describe())
             }
+            CallState::Stopped => format!("{name}: recording stopped by you; {captions}"),
         }
     }
 }

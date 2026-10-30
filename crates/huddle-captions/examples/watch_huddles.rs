@@ -24,6 +24,7 @@ fn main() {
         move || WatchSettings {
             read_captions: true,
             auto_start_captions,
+            stopped_logs: std::collections::BTreeSet::new(),
         },
         |notice| println!("{notice:?}"),
     );

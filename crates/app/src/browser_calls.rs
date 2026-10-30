@@ -26,11 +26,13 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::Instrument as _;
 
 pub(crate) use self::call_book::InvalidSessionId;
-use self::call_book::{CallBook, EventError, Logged, Now, check_session_id};
+use self::call_book::{CallBook, EventError, Logged, Now, OpenedCall, check_session_id};
 use self::log_folder::LogFolder;
 use crate::AppState;
 use crate::call_debug::{FailedFrame, FrameChannel};
-use crate::call_status::{BoardView, CallState, Moment, Observation, ProblemReason, clock};
+use crate::call_status::{
+    BoardView, CallBoard, CallState, Moment, Observation, ProblemReason, clock,
+};
 use crate::calls::{CallEndReason, CallPlatform};
 use crate::finished_logs::{self, LogSource};
 
@@ -89,6 +91,25 @@ impl BrowserCalls {
             *current = message;
             is_changed
         });
+    }
+
+    /// Takes the user's stop or resume onto the board. Logs it first in an open Meet call's
+    /// log, so a reopened call keeps it. Both happen under the book lock, so an event between
+    /// them cannot see the book and the board disagree.
+    pub fn set_recording_stopped(&self, board: &CallBoard, call_id: &Path, is_stopped: bool) {
+        let mut book = self.lock();
+        if let Err(error) = book.set_recording_stopped(call_id, is_stopped, Now::read()) {
+            tracing::error!(
+                call.id = %call_id.display(),
+                exception.message = %error,
+                "could not log a recording stop or resume"
+            );
+        }
+        board.observe(
+            call_id,
+            Observation::RecordingStopped(is_stopped),
+            Moment::now(),
+        );
     }
 
     /// Asks mc-meet for a page snapshot of each tab in the call.
@@ -190,6 +211,14 @@ enum ExtensionMessage {
         #[serde(default, rename = "with_text")]
         is_with_text: bool,
     },
+    /// The popup's "Stop recording this call" for its tab's session.
+    StopRecording {
+        session_id: String,
+    },
+    /// The popup's "Resume recording" for its tab's session.
+    ResumeRecording {
+        session_id: String,
+    },
     /// A type from a newer extension.
     #[serde(other)]
     Unknown,
@@ -254,6 +283,8 @@ enum StatusWord {
     Waiting,
     Recording,
     Problem,
+    /// mc-meet stops reading captions and chat for the call's sessions while this holds.
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -282,6 +313,7 @@ impl MeetCallStatus {
             CallState::Waiting => (StatusWord::Waiting, None),
             CallState::Recording => (StatusWord::Recording, None),
             CallState::Problem(reason) => (StatusWord::Problem, Some(reason)),
+            CallState::Stopped => (StatusWord::Stopped, None),
         };
         let caption_source = call.caption_source.map(|source| match source {
             HealthSource::Channel => CaptionSourceWord::Channel,
@@ -518,6 +550,8 @@ impl Port {
                 | ExtensionMessage::PageSnapshot { .. }
                 | ExtensionMessage::PagesAway { .. }
                 | ExtensionMessage::SaveDebugReport { .. }
+                | ExtensionMessage::StopRecording { .. }
+                | ExtensionMessage::ResumeRecording { .. }
                     if !is_host_known =>
                 {
                     tracing::warn!("refused a connection that skipped the host hello");
@@ -552,6 +586,12 @@ impl Port {
                     }
                 }
                 ExtensionMessage::PagesAway { session_ids } => self.take_away_sessions(session_ids),
+                ExtensionMessage::StopRecording { session_id } => {
+                    self.set_recording_stopped(&session_id, true);
+                }
+                ExtensionMessage::ResumeRecording { session_id } => {
+                    self.set_recording_stopped(&session_id, false);
+                }
                 message @ (ExtensionMessage::FrameFailed { .. }
                 | ExtensionMessage::PageSnapshot { .. }
                 | ExtensionMessage::SaveDebugReport { .. }) => {
@@ -606,6 +646,29 @@ impl Port {
         );
         for (call_id, is_away) in &calls {
             board.observe(call_id, Observation::MeetPagesAway(*is_away), now);
+        }
+    }
+
+    /// The popup's stop or resume, for the call its tab's session writes to.
+    fn set_recording_stopped(&self, session_id: &str, is_stopped: bool) {
+        let call_id = match self.calls().call_of_session(session_id) {
+            Ok(Some(call_id)) => call_id,
+            Ok(None) => {
+                tracing::warn!(
+                    browser_call.session_id = session_id,
+                    "a recording stop or resume names a session with no call"
+                );
+                return;
+            }
+            Err(invalid) => {
+                tracing::warn!(exception.message = %invalid, "refused a recording stop or resume");
+                return;
+            }
+        };
+        if is_stopped {
+            crate::audio_capture::stop_call(&self.app, &call_id);
+        } else {
+            crate::audio_capture::resume_call(&self.app, &call_id);
         }
     }
 
@@ -683,6 +746,8 @@ impl Port {
             | ExtensionMessage::Hello { .. }
             | ExtensionMessage::Event { .. }
             | ExtensionMessage::PagesAway { .. }
+            | ExtensionMessage::StopRecording { .. }
+            | ExtensionMessage::ResumeRecording { .. }
             | ExtensionMessage::Unknown => {}
         }
     }
@@ -706,30 +771,23 @@ impl Port {
             let logged = book.take_event(self.id, seq, session_id, event, Now::read());
             // Under the book lock, so the call stream sees opens and ends in the book's order.
             match &logged {
-                Ok(Logged::Opened {
-                    log_path,
-                    title,
-                    logged_caption_keys,
-                    ..
-                }) => {
-                    state
-                        .calls
-                        .open(log_path, CallPlatform::Meet, title.clone());
-                    if !logged_caption_keys.is_empty() {
-                        state.calls.status().observe(
-                            log_path,
-                            Observation::MeetLoggedCaptions(logged_caption_keys.clone()),
-                            Moment::now(),
-                        );
-                    }
-                }
+                Ok(
+                    Logged::Opened { opened, .. }
+                    | Logged::Withheld {
+                        opened: Some(opened),
+                    },
+                ) => open_on_stream(&state, opened),
                 Ok(Logged::Ended { log_path, reason }) => {
                     state.calls.end(log_path, CallEndReason::from(*reason));
                 }
-                Ok(Logged::Appended { .. } | Logged::Duplicate) | Err(_) => {}
+                Ok(
+                    Logged::Appended { .. } | Logged::Duplicate | Logged::Withheld { opened: None },
+                )
+                | Err(_) => {}
             }
             logged
         };
+        let board = state.calls.status();
         match &logged {
             Ok(
                 Logged::Appended {
@@ -737,28 +795,39 @@ impl Port {
                     observation,
                 }
                 | Logged::Opened {
-                    log_path,
+                    opened: OpenedCall { log_path, .. },
                     observation,
-                    ..
                 },
             ) => {
-                let (board, now) = (state.calls.status(), Moment::now());
+                let now = Moment::now();
                 board.observe(log_path, Observation::MeetPortHeld(true), now);
                 if let Some(observation) = observation {
                     board.observe(log_path, observation.clone(), now);
                 }
                 state.call_debug.remember(log_path, lead_up_line);
             }
+            // Its caption text stays out of the lead-up: the user stopped recording.
+            Ok(Logged::Withheld {
+                opened: Some(OpenedCall { log_path, .. }),
+            }) => board.observe(log_path, Observation::MeetPortHeld(true), Moment::now()),
             Ok(Logged::Ended { log_path, .. }) => state.call_debug.forget_lead_up(log_path),
-            Ok(Logged::Duplicate) | Err(_) => {}
+            Ok(Logged::Duplicate | Logged::Withheld { opened: None }) | Err(_) => {}
         }
         // Other events reach the tray with the status tick. A rebuild closes an open menu.
         match &logged {
-            Ok(Logged::Opened { .. } | Logged::Ended { .. }) => crate::tray::refresh(&self.app),
-            Ok(Logged::Appended { .. } | Logged::Duplicate) | Err(_) => {}
+            Ok(
+                Logged::Opened { .. } | Logged::Withheld { opened: Some(_) } | Logged::Ended { .. },
+            ) => crate::tray::refresh(&self.app),
+            Ok(Logged::Appended { .. } | Logged::Duplicate | Logged::Withheld { opened: None })
+            | Err(_) => {}
         }
         match &logged {
-            Ok(Logged::Appended { .. } | Logged::Opened { .. } | Logged::Duplicate) => {}
+            Ok(
+                Logged::Appended { .. }
+                | Logged::Opened { .. }
+                | Logged::Duplicate
+                | Logged::Withheld { .. },
+            ) => {}
             Ok(Logged::Ended { log_path, .. }) => {
                 let (app, pipeline) = (self.app.clone(), Arc::clone(&self.pipeline));
                 let log_path = log_path.clone();
@@ -766,7 +835,11 @@ impl Port {
                     record_and_run(&app, &pipeline, &log_path);
                 });
             }
-            Err(error @ (EventError::InvalidSessionId(_) | EventError::InvalidEvent(_))) => {
+            Err(
+                error @ (EventError::InvalidSessionId(_)
+                | EventError::InvalidEvent(_)
+                | EventError::AppOnlyEvent),
+            ) => {
                 tracing::warn!(exception.message = %error, "dropped an event that is not valid");
             }
             Err(error @ EventError::Write(_)) => {
@@ -805,9 +878,14 @@ fn is_acked(logged: &Result<Logged, EventError>) -> bool {
             Logged::Appended { .. }
             | Logged::Opened { .. }
             | Logged::Duplicate
+            | Logged::Withheld { .. }
             | Logged::Ended { .. },
         )
-        | Err(EventError::InvalidSessionId(_) | EventError::InvalidEvent(_)) => true,
+        | Err(
+            EventError::InvalidSessionId(_)
+            | EventError::InvalidEvent(_)
+            | EventError::AppOnlyEvent,
+        ) => true,
         Err(EventError::Write(_)) => false,
     }
 }
@@ -923,4 +1001,21 @@ async fn end_idle_calls(app: AppHandle, pipeline: Arc<Pipeline>) {
 // No minimum length: the caption count alone tells a real call from a misclick.
 fn record_and_run(app: &AppHandle, pipeline: &Pipeline, log_path: &Path) {
     finished_logs::record_and_run(app, pipeline, LogSource::MeetCall, log_path, 0);
+}
+
+// Under the book lock, so the call stream sees opens and ends in the book's order.
+fn open_on_stream(state: &AppState, opened: &OpenedCall) {
+    state.calls.open(
+        &opened.log_path,
+        CallPlatform::Meet,
+        opened.title.clone(),
+        opened.is_recording_stopped,
+    );
+    if !opened.logged_caption_keys.is_empty() {
+        state.calls.status().observe(
+            &opened.log_path,
+            Observation::MeetLoggedCaptions(opened.logged_caption_keys.clone()),
+            Moment::now(),
+        );
+    }
 }

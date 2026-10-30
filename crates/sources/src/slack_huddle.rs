@@ -71,9 +71,21 @@ pub enum LogLine {
         layout_profile: String,
     },
     /// The watcher pressed the Captions tab to show the caption panel.
-    CaptionsTabPressed { seen_at: Timestamp },
+    CaptionsTabPressed {
+        seen_at: Timestamp,
+    },
+    /// The user stopped recording the huddle. No row or overlay line is logged until
+    /// `recording_resumed`.
+    RecordingStopped {
+        seen_at: Timestamp,
+    },
+    RecordingResumed {
+        seen_at: Timestamp,
+    },
     /// The huddle window closed.
-    Ended { seen_at: Timestamp },
+    Ended {
+        seen_at: Timestamp,
+    },
 }
 
 impl LogLine {
@@ -89,6 +101,8 @@ impl LogLine {
             | LogLine::Overlay { seen_at, .. }
             | LogLine::LayoutProfile { seen_at, .. }
             | LogLine::CaptionsTabPressed { seen_at }
+            | LogLine::RecordingStopped { seen_at }
+            | LogLine::RecordingResumed { seen_at }
             | LogLine::Ended { seen_at } => *seen_at,
         }
     }
@@ -333,6 +347,8 @@ fn collect(lines: &[LogLine]) -> Collected {
             LogLine::Started { .. }
             | LogLine::TileGone { .. }
             | LogLine::CaptionsTabPressed { .. }
+            | LogLine::RecordingStopped { .. }
+            | LogLine::RecordingResumed { .. }
             | LogLine::Ended { .. } => {}
         }
     }
