@@ -14,6 +14,8 @@ pub enum Stem {
 }
 
 impl Stem {
+    pub const ALL: [Stem; 2] = [Stem::Mic, Stem::Remote];
+
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {

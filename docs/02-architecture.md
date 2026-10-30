@@ -127,7 +127,8 @@ The app tracks each open Meet call and huddle in one status board
 (`crates/app/src/call_status.rs`), and ticks it once a second.
 
 - States: waiting (no caption since the call opened or resumed), recording, problem with a
-  reason, and ended with a caption count and length. Each call keeps its start time, caption
+  reason, stopped by the user, and ended with a caption count and length. A stopped call has no
+  problem until the user resumes it. Each call keeps its start time, caption
   count, last caption time and its last 3 problems. A Meet call the app reopens after a restart
   counts the caption lines its log already holds.
 - Reasons: captions off, Meet captions unavailable (Google), caption frames fail to decode, no
@@ -138,10 +139,14 @@ The app tracks each open Meet call and huddle in one status board
   its caption channels as the source: mc-meet hides Meet's captions only after a caption arrived
   on them, and they keep streaming.
 - The tray icon is a grey dot when idle, red while recording and amber at a problem or a missing
-  huddle permission. The tooltip and the menu hold one status line per call, with times in the
-  settings time zone. "Recent calls" lists the last 5 calls that ended in this run. The menu is
-  rebuilt only when a call opens or ends; the status tick changes the text of its call lines in
-  place, so an open menu stays open. On Windows the tooltip is cut to 127 UTF-16 units.
+  huddle permission. Audio that records turns an idle dot red. Audio that keeps failing turns it
+  amber.
+- On macOS only, each open call has an audio row. Each open call has "Stop recording this call".
+  A stopped call shows "Resume recording" instead. The tooltip and the menu hold one status line
+  per call, with times in the settings time zone. "Recent calls" lists the last 5 calls that
+  ended in this run. The menu is rebuilt only when a call opens or ends; the status tick changes
+  the text of its call lines in place, so an open menu stays open. On Windows the tooltip is cut
+  to 127 UTF-16 units.
 - Notifications: "Recording" once per call at its first caption. "Not recording" after a problem
   lasts 30 s, once per reason in one outage. "Recording again" at the first caption after it,
   which ends the outage, so a later outage is announced again. "No transcript captured" when a
@@ -177,6 +182,11 @@ flowchart LR
   Windows module uses WASAPI process loopback. Both use `cpal` for the mic.
 - `mc-capture` is a helper process the app spawns and restarts. It connects `capture` to
   `stem-writer`; neither crate knows about the other. A crash in capture never stops the tray.
+- The app's `audio_capture` module supervises `mc-capture audio` over JSON lines on stdin and
+  stdout. The `capture-protocol` crate holds the line types. [Phase 3
+  detail](03-roadmap.md#phase-3-detail) has the messages and the restart rules.
+- Call folders live in the app data folder under `calls/`, one per call, named after the
+  call log. They never go in the vault.
 - `capture` and `stem-writer` both depend on `stem-timing`, which holds the types they share:
   `Stem`, `BufferStamp`, `StemLosses` and `UtcAnchor`.
 - `obs-control` starts and stops OBS video recording with the call.

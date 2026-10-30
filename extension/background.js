@@ -137,6 +137,16 @@ function tellTab(port, message) {
 
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name === "mc-meet-popup") {
+    // Only the popup page may stop or resume recording. A content script has a tab.
+    const popupPrefix = chrome.runtime.getURL("popup/");
+    if (
+      port.sender?.id !== chrome.runtime.id ||
+      port.sender.tab ||
+      !port.sender.url?.startsWith(popupPrefix)
+    ) {
+      port.disconnect();
+      return;
+    }
     connectPopup(port);
     return;
   }
@@ -222,10 +232,15 @@ function lookOf(callStatus, isAppReachable) {
       return { icon: "problem", badge: "!", title: `Not recording: ${callStatus.reason_text}` };
     case "waiting":
       return { icon: "idle", badge: "…", title: "Waiting for captions" };
+    case "stopped":
+      return { icon: "idle", badge: "", title: "Recording stopped" };
   }
   return { icon: "idle", badge: "…", title: "Waiting for captions" };
 }
 
+// Also tells each tab whether the app has its call stopped, so the tab stops or resumes its
+// captions and chat. The app's status is the only record of a stop, so a reloaded tab or a
+// restarted worker learns it again here.
 async function showStatusOnTabs() {
   const { tabSessions } = restoreState(await store.readState(), Date.now());
   const callStatus = (await chrome.storage.session.get(CALL_STATUS_KEY))[CALL_STATUS_KEY];
@@ -238,6 +253,13 @@ async function showStatusOnTabs() {
           state: "waiting",
         })
       : undefined;
+    if (sessionId && callStatus) {
+      tellTab(tabPorts.get(tab.id), {
+        type: "recording_state",
+        session_id: sessionId,
+        is_stopped: status.state === "stopped",
+      });
+    }
     const look = lookOf(status, isAppReachable);
     const tabId = tab.id;
     await chrome.action
@@ -258,6 +280,15 @@ function connectPopup(port) {
   popupPorts.add(port);
   ensureNative();
   port.onMessage.addListener((message) => {
+    if (message?.type === "stop_recording" || message?.type === "resume_recording") {
+      serially(async () => {
+        if (!nativePort || !isWelcomed) return;
+        const { tabSessions } = restoreState(await store.readState(), Date.now());
+        const sessionId = tabSessions[message.tab_id];
+        if (sessionId) nativePort.postMessage({ type: message.type, session_id: sessionId });
+      });
+      return;
+    }
     if (message?.type !== "save_debug_report") return;
     serially(async () => {
       if (!nativePort || !isWelcomed) {

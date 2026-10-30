@@ -29,6 +29,9 @@ pub(super) struct Book {
 struct LiveOverlay {
     caption: Caption,
     first_seen_at: Timestamp,
+    /// A stop or resume came while the line grew, so it holds words from both sides of the
+    /// change. It is never logged.
+    is_cut: bool,
 }
 
 impl Book {
@@ -156,11 +159,13 @@ impl Book {
             let is_live_speaker = live
                 .as_ref()
                 .is_some_and(|live| live.caption.speaker == line.speaker);
-            let line_seen_at = match &live {
-                Some(live) if is_live_speaker && !is_live_finished => live.first_seen_at,
-                Some(_) | None => seen_at,
+            let (line_seen_at, is_cut) = match &live {
+                Some(live) if is_live_speaker && !is_live_finished => {
+                    (live.first_seen_at, live.is_cut)
+                }
+                Some(_) | None => (seen_at, false),
             };
-            if self.log_overlay(log, line.clone(), line_seen_at)? && is_live_speaker {
+            if self.log_overlay(log, line.clone(), line_seen_at, is_cut)? && is_live_speaker {
                 is_live_finished = true;
             }
         }
@@ -177,11 +182,17 @@ impl Book {
                 if let Some(previous) = previous
                     && !is_live_finished
                 {
-                    self.log_overlay(log, previous.caption, previous.first_seen_at)?;
+                    self.log_overlay(
+                        log,
+                        previous.caption,
+                        previous.first_seen_at,
+                        previous.is_cut,
+                    )?;
                 }
                 LiveOverlay {
                     caption: newest.clone(),
                     first_seen_at: seen_at,
+                    is_cut: false,
                 }
             }
         };
@@ -193,9 +204,16 @@ impl Book {
     pub(super) fn flush_overlay(&mut self, log: &mut HuddleLog) -> std::io::Result<()> {
         match self.overlay_live.take() {
             Some(live) => self
-                .log_overlay(log, live.caption, live.first_seen_at)
+                .log_overlay(log, live.caption, live.first_seen_at, live.is_cut)
                 .map(|_| ()),
             None => Ok(()),
+        }
+    }
+
+    /// Marks the newest overlay line as cut by a stop or resume, so it is never logged.
+    pub(super) fn cut_live_overlay(&mut self) {
+        if let Some(live) = &mut self.overlay_live {
+            live.is_cut = true;
         }
     }
 
@@ -208,22 +226,26 @@ impl Book {
         );
     }
 
-    /// Returns whether the line was new. Final lines stay on screen for several reads.
+    /// Returns whether the line was new. Final lines stay on screen for several reads. A cut
+    /// line is remembered as seen and not written.
     fn log_overlay(
         &mut self,
         log: &mut HuddleLog,
         caption: Caption,
         seen_at: Timestamp,
+        is_cut: bool,
     ) -> std::io::Result<bool> {
         if self.overlay_logged.contains(&caption) {
             return Ok(false);
         }
-        log.append(&LogLine::Overlay {
-            seen_at,
-            speaker: caption.speaker.clone(),
-            text: caption.text.clone(),
-        })?;
-        self.overlay_lines += 1;
+        if !is_cut {
+            log.append(&LogLine::Overlay {
+                seen_at,
+                speaker: caption.speaker.clone(),
+                text: caption.text.clone(),
+            })?;
+            self.overlay_lines += 1;
+        }
         self.overlay_logged.push_back(caption);
         if self.overlay_logged.len() > OVERLAY_MEMORY {
             self.overlay_logged.pop_front();

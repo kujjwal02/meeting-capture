@@ -56,7 +56,7 @@ impl<N: FnMut(Notice)> Watcher<N> {
         watcher
     }
 
-    pub(super) fn tick(&mut self, settings: WatchSettings) {
+    pub(super) fn tick(&mut self, settings: &WatchSettings) {
         if !settings.read_captions {
             self.end_huddles(|_| true);
             return;
@@ -72,7 +72,8 @@ impl<N: FnMut(Notice)> Watcher<N> {
             self.discover(settings);
         }
         for huddle in &mut self.huddles {
-            if let Err(error) = huddle.read_captions() {
+            let is_stopped = settings.stopped_logs.contains(huddle.tracker.log_path());
+            if let Err(error) = huddle.read_captions(is_stopped) {
                 huddle.tracker.report_log_error(&mut self.notify, &error);
             }
         }
@@ -106,7 +107,7 @@ impl<N: FnMut(Notice)> Watcher<N> {
         is_trusted
     }
 
-    fn discover(&mut self, settings: WatchSettings) {
+    fn discover(&mut self, settings: &WatchSettings) {
         let Some(slack) = ax::find_slack() else {
             self.end_huddles(|_| true);
             return;
@@ -133,7 +134,7 @@ impl<N: FnMut(Notice)> Watcher<N> {
         slack: &SlackProcess,
         windows: &[Element],
         window: &Element,
-        settings: WatchSettings,
+        settings: &WatchSettings,
     ) -> Option<usize> {
         let known = self
             .huddles

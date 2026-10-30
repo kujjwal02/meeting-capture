@@ -11,7 +11,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize as _;
 use sources::browser_call::{CallEvent, CallStart, EndReason};
 
-use super::call_log::CallLog;
+use super::call_log::{self, CallLog};
 use super::log_folder::LogFolder;
 use super::{BrowserCallStatus, PROTOCOL};
 use crate::call_status::{MeetCaptions, Observation};
@@ -49,11 +49,18 @@ struct OpenCall {
     last_event_at: Instant,
     /// The latest event time in the call.
     last_at: Option<Timestamp>,
-    /// Whether the book returned `Opened` for the call. Set only after a write, so a resent
-    /// first event still reports it when the first write failed.
+    /// Whether the book returned the call in `Opened` or `Withheld`. `Opened` sets it only after
+    /// its write, so a resent first event still reports it when the first write failed.
     is_reported: bool,
-    /// The caption line keys a reopened log already held, for `Opened`.
+    /// The caption line keys a reopened log already held, for the call stream.
     logged_caption_keys: Vec<String>,
+    /// The user stopped recording the call. Its log takes no caption or chat until a resume.
+    is_recording_stopped: bool,
+    /// Caption lines, by device and utterance id, seen since the last stop or resume.
+    live_utterances: HashSet<(String, String)>,
+    /// Caption lines a stop or resume cut. One that grows on would mix words from both sides of
+    /// the change, so its later versions are withheld.
+    cut_utterances: HashSet<(String, String)>,
 }
 
 /// One clock reading, taken by the caller for one input.
@@ -82,20 +89,31 @@ pub(super) enum Logged {
     },
     /// The call's first event written since it opened in this run, other than an end.
     Opened {
-        log_path: PathBuf,
-        /// The title Meet showed, else the meeting code.
-        title: Option<String>,
+        opened: OpenedCall,
         observation: Option<Observation>,
-        /// The caption line keys the log held before this run, when the call was reopened.
-        logged_caption_keys: Vec<String>,
     },
     /// The log already had the event's `seq`.
     Duplicate,
+    /// A caption or chat message of a call the user stopped recording, or a caption line a stop
+    /// or resume cut. Acked, not logged. `opened` is set when it was the call's first event in
+    /// this run, as after a restart while the call was stopped.
+    Withheld { opened: Option<OpenedCall> },
     /// The event ended its call; the log is complete.
     Ended {
         log_path: PathBuf,
         reason: EndReason,
     },
+}
+
+/// A call the book opened in this run, for the call stream.
+pub(super) struct OpenedCall {
+    pub(super) log_path: PathBuf,
+    /// The title Meet showed, else the meeting code.
+    pub(super) title: Option<String>,
+    /// The caption line keys the log held before this run, when the call was reopened.
+    pub(super) logged_caption_keys: Vec<String>,
+    /// The log's last stop or resume was a stop, so the call opens stopped.
+    pub(super) is_recording_stopped: bool,
 }
 
 /// A session id names files, so only a checked one reaches a path.
@@ -126,6 +144,8 @@ pub(super) enum EventError {
     InvalidSessionId(#[from] InvalidSessionId),
     #[error("field `event` is not a valid call event: {0}")]
     InvalidEvent(serde_json::Error),
+    #[error("only the app writes recording_stopped and recording_resumed")]
+    AppOnlyEvent,
     #[error("could not write the browser call log: {0}")]
     Write(#[from] std::io::Error),
 }
@@ -235,6 +255,12 @@ impl CallBook {
     ) -> Result<Logged, EventError> {
         check_session_id("session_id", session_id)?;
         let event = CallEvent::deserialize(raw_event).map_err(EventError::InvalidEvent)?;
+        if matches!(
+            event,
+            CallEvent::RecordingStopped { .. } | CallEvent::RecordingResumed { .. }
+        ) {
+            return Err(EventError::AppOnlyEvent);
+        }
         let end_reason = event.end_reason();
         let is_end = end_reason.is_some();
         let log_path = if let Some(log_path) = self.open_sessions.get(session_id) {
@@ -252,21 +278,23 @@ impl CallBook {
         if call.log.has_seq(seq) {
             return Ok(Logged::Duplicate);
         }
-        call.log
-            .append(Some(seq), raw_event, is_end, now.timestamp)?;
+        let is_withheld = call.is_withheld(&event);
         call.holder_ports.insert(port_id);
         call.last_event_at = now.instant;
+        if is_withheld {
+            let opened = (!call.is_reported).then(|| call.take_opened(&log_path));
+            return Ok(Logged::Withheld { opened });
+        }
+        call.log
+            .append(Some(seq), raw_event, is_end, now.timestamp)?;
         call.last_at = call.last_at.max(event.at());
         call.note_event(&event);
         let Some(reason) = end_reason else {
             let observation = observation_of(&event);
             if !call.is_reported {
-                call.is_reported = true;
                 return Ok(Logged::Opened {
-                    title: call.title(),
-                    log_path,
+                    opened: call.take_opened(&log_path),
                     observation,
-                    logged_caption_keys: std::mem::take(&mut call.logged_caption_keys),
                 });
             }
             return Ok(Logged::Appended {
@@ -286,6 +314,31 @@ impl CallBook {
         self.close_call(&log_path);
         tracing::info!("browser call ended");
         Ok(Logged::Ended { log_path, reason })
+    }
+
+    /// Logs the user's stop or resume of an open call, when it changes the call.
+    pub(super) fn set_recording_stopped(
+        &mut self,
+        log_path: &Path,
+        is_stopped: bool,
+        now: Now,
+    ) -> std::io::Result<()> {
+        let Some(call) = self.open_calls.get_mut(log_path) else {
+            return Ok(());
+        };
+        if call.is_recording_stopped != is_stopped {
+            let at = now.timestamp;
+            call.log.append(
+                None,
+                &call_log::recording_event(is_stopped, at),
+                false,
+                now.timestamp,
+            )?;
+            call.is_recording_stopped = is_stopped;
+            let cut = std::mem::take(&mut call.live_utterances);
+            call.cut_utterances.extend(cut);
+        }
+        Ok(())
     }
 
     /// Ends each call no port has held for `IDLE_CALL_END` since its last event: the browser
@@ -376,12 +429,14 @@ impl CallBook {
                     return Ok(None);
                 }
                 tracing::info!(file.path = %log_path.display(), "browser call reopened");
-                ended.insert(OpenCall::new(
+                let mut call = OpenCall::new(
                     reopened.log,
                     reopened.summary.start,
                     reopened.caption_line_keys,
                     now,
-                ))
+                );
+                call.is_recording_stopped = reopened.summary.is_recording_stopped;
+                ended.insert(call)
             }
         };
         if call.log.has_seq(seq) {
@@ -431,6 +486,47 @@ impl OpenCall {
             last_at: None,
             is_reported: false,
             logged_caption_keys,
+            is_recording_stopped: false,
+            live_utterances: HashSet::new(),
+            cut_utterances: HashSet::new(),
+        }
+    }
+
+    /// Whether the event is a caption or chat message the log must not take. Notes each
+    /// caption line it lets through.
+    fn is_withheld(&mut self, event: &CallEvent) -> bool {
+        match event {
+            CallEvent::Caption {
+                device_id,
+                utterance_id,
+                ..
+            } => {
+                let key = (device_id.clone(), utterance_id.clone());
+                if self.cut_utterances.contains(&key) {
+                    return true;
+                }
+                self.live_utterances.insert(key);
+                self.is_recording_stopped
+            }
+            CallEvent::Chat { .. } => self.is_recording_stopped,
+            CallEvent::CallStarted { .. }
+            | CallEvent::Roster { .. }
+            | CallEvent::Health { .. }
+            | CallEvent::RecordingStopped { .. }
+            | CallEvent::RecordingResumed { .. }
+            | CallEvent::CallEnded { .. }
+            | CallEvent::Unknown => false,
+        }
+    }
+
+    /// The call as the call stream first hears of it. Marks it reported.
+    fn take_opened(&mut self, log_path: &Path) -> OpenedCall {
+        self.is_reported = true;
+        OpenedCall {
+            log_path: log_path.to_path_buf(),
+            title: self.title(),
+            logged_caption_keys: std::mem::take(&mut self.logged_caption_keys),
+            is_recording_stopped: self.is_recording_stopped,
         }
     }
 
@@ -488,6 +584,8 @@ fn observation_of(event: &CallEvent) -> Option<Observation> {
         CallEvent::CallStarted { .. }
         | CallEvent::Chat { .. }
         | CallEvent::Roster { .. }
+        | CallEvent::RecordingStopped { .. }
+        | CallEvent::RecordingResumed { .. }
         | CallEvent::CallEnded { .. }
         | CallEvent::Unknown => None,
     }

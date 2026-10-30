@@ -78,6 +78,15 @@ pub enum CallEvent {
         #[serde(default)]
         detail: Option<String>,
     },
+    /// Written by the app: the user stopped recording the call. Captions and chat are not
+    /// logged until `recording_resumed`.
+    RecordingStopped {
+        at: Timestamp,
+    },
+    /// Written by the app: the user resumed recording the call.
+    RecordingResumed {
+        at: Timestamp,
+    },
     CallEnded {
         at: Timestamp,
         reason: EndReason,
@@ -97,6 +106,8 @@ impl CallEvent {
             | CallEvent::Chat { at, .. }
             | CallEvent::Roster { at, .. }
             | CallEvent::Health { at, .. }
+            | CallEvent::RecordingStopped { at }
+            | CallEvent::RecordingResumed { at }
             | CallEvent::CallEnded { at, .. } => Some(*at),
             CallEvent::Unknown => None,
         }
@@ -112,6 +123,8 @@ impl CallEvent {
             | CallEvent::Chat { .. }
             | CallEvent::Roster { .. }
             | CallEvent::Health { .. }
+            | CallEvent::RecordingStopped { .. }
+            | CallEvent::RecordingResumed { .. }
             | CallEvent::Unknown => None,
         }
     }
@@ -167,6 +180,8 @@ impl CallStart {
             | CallEvent::Chat { .. }
             | CallEvent::Roster { .. }
             | CallEvent::Health { .. }
+            | CallEvent::RecordingStopped { .. }
+            | CallEvent::RecordingResumed { .. }
             | CallEvent::CallEnded { .. }
             | CallEvent::Unknown => None,
         }
@@ -185,6 +200,8 @@ pub struct LogSummary {
     pub last_at: Option<Timestamp>,
     /// Whether the last line ends the call.
     pub has_ended: bool,
+    /// Whether the user's last stop or resume was a stop.
+    pub is_recording_stopped: bool,
 }
 
 /// Summarises the lines of one log.
@@ -203,6 +220,21 @@ pub fn summarize(lines: &[LogLine]) -> LogSummary {
         started_at,
         last_at: event_times().max(),
         has_ended: lines.last().is_some_and(|line| line.event.ends_call()),
+        is_recording_stopped: lines
+            .iter()
+            .rev()
+            .find_map(|line| match line.event {
+                CallEvent::RecordingStopped { .. } => Some(true),
+                CallEvent::RecordingResumed { .. } => Some(false),
+                CallEvent::CallStarted { .. }
+                | CallEvent::Caption { .. }
+                | CallEvent::Chat { .. }
+                | CallEvent::Roster { .. }
+                | CallEvent::Health { .. }
+                | CallEvent::CallEnded { .. }
+                | CallEvent::Unknown => None,
+            })
+            .unwrap_or(false),
     }
 }
 
@@ -429,8 +461,11 @@ fn collect(lines: &[LogLine]) -> Collected {
                     }
                 }
             }
+            // The app logs no caption or chat between a stop and a resume.
             CallEvent::CallStarted { .. }
             | CallEvent::Health { .. }
+            | CallEvent::RecordingStopped { .. }
+            | CallEvent::RecordingResumed { .. }
             | CallEvent::CallEnded { .. }
             | CallEvent::Unknown => {}
         }

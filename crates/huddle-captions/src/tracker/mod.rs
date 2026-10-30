@@ -142,6 +142,17 @@ impl HuddleTracker {
         self.log.path()
     }
 
+    pub(crate) fn set_recording_stopped(
+        &mut self,
+        is_stopped: bool,
+        seen_at: Timestamp,
+    ) -> std::io::Result<()> {
+        if self.log.set_recording_stopped(is_stopped, seen_at)? {
+            self.book.cut_live_overlay();
+        }
+        Ok(())
+    }
+
     pub(crate) fn profile(&self) -> Option<Rc<LayoutProfile>> {
         self.profile.clone()
     }

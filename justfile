@@ -32,7 +32,7 @@ hooks:
 
 # Run a live Meet call through mc-meet and a dev app, then check the log and note (Mac only).
 meet-e2e:
-    cargo build -p meeting-capture
+    cargo build -p meeting-capture -p mc-capture
     node tools/meet-e2e/run.mjs
 
 # Replay failed Meet frames through the decoder. Takes a debug report folder, a call's debug
@@ -43,6 +43,7 @@ replay-frames path:
 
 # Run the tray app in dev mode.
 dev:
+    cargo build -p mc-capture
     cd crates/app && cargo tauri dev
 
 # The self-signed identity that signs the Mac app, here and in the release workflow.
@@ -67,7 +68,14 @@ bundle:
     export TAURI_SIGNING_PRIVATE_KEY="${TAURI_SIGNING_PRIVATE_KEY:-$(cat ~/.tauri/meeting-capture-updater.key)}"
     export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-$(cat ~/.tauri/meeting-capture-updater.key.password)}"
     version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "meeting-capture") | .version')
-    (cd crates/app && APPLE_SIGNING_IDENTITY="{{signing-identity}}" cargo tauri build --bundles app,dmg)
+    # Tauri copies the sidecar into Contents/MacOS/ and signs it with the app's identity. It
+    # wants the file named with the target triple. The sidecar entry lives in its own config:
+    # tauri-build fails every cargo build of the app while the listed file is missing.
+    cargo build --release --locked -p mc-capture
+    triple=$(rustc -vV | sed -n 's/^host: //p')
+    mkdir -p crates/app/binaries
+    cp target/release/mc-capture "crates/app/binaries/mc-capture-$triple"
+    (cd crates/app && APPLE_SIGNING_IDENTITY="{{signing-identity}}" cargo tauri build --bundles app,dmg --config tauri.bundle.conf.json)
     bundle=target/release/bundle
     rm -rf target/dist && mkdir -p target/dist
     # GitHub turns spaces in asset names into dots, which would break the checksum file.

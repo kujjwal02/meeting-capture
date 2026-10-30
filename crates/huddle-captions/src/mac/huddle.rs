@@ -70,7 +70,7 @@ impl Huddle {
     pub(super) fn check_window(
         &mut self,
         nodes: &[Node],
-        settings: WatchSettings,
+        settings: &WatchSettings,
     ) -> std::io::Result<Option<HealthChange>> {
         let moment = Moment::now();
         let Some(profile) = self.tracker.profile() else {
@@ -131,8 +131,11 @@ impl Huddle {
         }
     }
 
-    /// Reads the cached caption list, or the overlay while the list is missing.
-    pub(super) fn read_captions(&mut self) -> std::io::Result<()> {
+    /// Reads the cached caption list, or the overlay while the list is missing. While the user
+    /// has recording stopped, the rows are read so they count as seen, but not logged.
+    pub(super) fn read_captions(&mut self, is_recording_stopped: bool) -> std::io::Result<()> {
+        self.tracker
+            .set_recording_stopped(is_recording_stopped, Timestamp::now())?;
         let Some(profile) = self.tracker.profile() else {
             return Ok(());
         };

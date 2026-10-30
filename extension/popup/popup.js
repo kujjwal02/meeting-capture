@@ -1,6 +1,6 @@
-// Toolbar popup: the active tab's call status as the app last reported it, and a button that
-// asks the app for a debug report. It keeps a port to the worker open, which keeps the native
-// port to the app open while the popup shows.
+// Toolbar popup: the active tab's call status as the app last reported it, "Stop recording this
+// call" or "Resume recording", and a button that asks the app for a debug report. It keeps a
+// port to the worker open, which keeps the native port to the app open while the popup shows.
 (() => {
   const CALL_STATUS_KEY = "call_status";
   const APP_KEY = "app";
@@ -8,9 +8,10 @@
     waiting: "Waiting for captions",
     recording: "Recording",
     problem: "Not recording",
+    stopped: "Recording stopped",
   };
   const SOURCE_WORDS = { channel: "call", dom: "page", none: "none yet" };
-  const ICONS = { waiting: "idle", recording: "recording", problem: "problem" };
+  const ICONS = { waiting: "idle", recording: "recording", problem: "problem", stopped: "idle" };
   // The app answers once the report is written; a long call log takes a few seconds.
   const REPORT_WAIT_MS = 30000;
 
@@ -63,6 +64,11 @@
       show("last-caption", call.last_caption_at ? secondsAgo(call.last_caption_at) : "none yet");
       show("source", call.caption_source ? SOURCE_WORDS[call.caption_source] : "none yet");
     }
+
+    const recordingButton = byId("recording-control");
+    recordingButton.hidden = !call || !app.is_reachable;
+    recordingButton.textContent =
+      call?.state === "stopped" ? "Resume recording" : "Stop recording this call";
 
     const problems = call?.problems ?? [];
     byId("problems").hidden = problems.length === 0;
@@ -126,6 +132,12 @@
 
   port = chrome.runtime.connect({ name: "mc-meet-popup" });
   port.onMessage.addListener(onWorkerMessage);
+  byId("recording-control").addEventListener("click", () => {
+    const call = callStatus?.calls?.find((candidate) => candidate.session_ids.includes(sessionId));
+    if (!call) return;
+    const type = call.state === "stopped" ? "resume_recording" : "stop_recording";
+    port.postMessage({ type, tab_id: tabId });
+  });
   byId("save-report").addEventListener("click", () => saveReport(false));
   byId("save-report-with-text").addEventListener("click", () => saveReport(true));
   // Queued events change local storage many times a second during a call.

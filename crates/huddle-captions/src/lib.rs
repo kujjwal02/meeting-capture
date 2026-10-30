@@ -18,6 +18,7 @@ pub mod profile;
 )]
 mod tracker;
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub use log::finish_open_logs;
@@ -25,11 +26,14 @@ pub use sources::append_log::FinishedLogs;
 pub use sources::slack_huddle::HuddleHealth;
 
 /// Read before each huddle step, so a settings change applies without a restart.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct WatchSettings {
     pub read_captions: bool,
     /// Press Slack's Captions tab when captions are on but the caption panel is hidden.
     pub auto_start_captions: bool,
+    /// The logs of huddles the user stopped recording. Their captions are read but not logged,
+    /// so a resume does not log what was said while stopped.
+    pub stopped_logs: BTreeSet<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

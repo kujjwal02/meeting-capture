@@ -45,10 +45,12 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
     }
     let settings_app = app.clone();
     let settings = move || {
-        let slack = settings_app.state::<AppState>().settings.slack();
+        let state = settings_app.state::<AppState>();
+        let slack = state.settings.slack();
         WatchSettings {
             read_captions: slack.read_captions,
             auto_start_captions: slack.auto_start_captions,
+            stopped_logs: state.calls.status().stopped_call_ids(),
         }
     };
     let mut reporter = Reporter {
@@ -87,8 +89,9 @@ impl Reporter {
                 crate::tray::refresh(&self.app);
             }
             Notice::HuddleStarted { log_path, channel } => {
+                // Each huddle gets a new log, so none starts stopped.
                 self.calls()
-                    .open(&log_path, CallPlatform::SlackHuddle, Some(channel));
+                    .open(&log_path, CallPlatform::SlackHuddle, Some(channel), false);
                 crate::tray::refresh(&self.app);
             }
             Notice::CaptionsRead {

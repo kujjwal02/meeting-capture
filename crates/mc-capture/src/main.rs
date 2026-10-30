@@ -1,8 +1,11 @@
 //! The capture helper. The app spawns it, so a crash or a hung Core Audio call never takes the
-//! tray down. `probe` records the stems at their native rates and reports what the devices did;
-//! `record` writes one segment of a call folder through the stem writer; `devices` lists the Core
-//! Audio devices.
+//! tray down. `audio` is the process the app supervises: commands on stdin, reports on stdout.
+//! `probe` records the stems at their native rates and reports what the devices did; `record`
+//! writes one segment of a call folder through the stem writer; `devices` lists the Core Audio
+//! devices.
 
+#[cfg(target_os = "macos")]
+mod audio;
 #[cfg(target_os = "macos")]
 mod probe;
 #[cfg(target_os = "macos")]
@@ -32,6 +35,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve the app: JSON line commands on stdin (`start`, `stop`), reports on stdout. Exits
+    /// when stdin closes.
+    Audio {
+        #[arg(long, value_enum, default_value_t = MicChoice::AvoidBluetooth)]
+        mic: MicChoice,
+    },
     /// Record the stems at native rates and print one status line per second.
     Probe {
         #[arg(long, default_value_t = 60)]
@@ -90,6 +99,15 @@ fn main() -> anyhow::Result<()> {
         .json()
         .init();
     match Cli::parse().command {
+        Command::Audio { mic } => {
+            #[cfg(target_os = "macos")]
+            return audio::serve(mic);
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = mic;
+                anyhow::bail!("audio needs system audio, which only macOS has yet")
+            }
+        }
         Command::Probe { seconds, out, mic } => {
             #[cfg(target_os = "macos")]
             return probe::probe(Duration::from_secs(seconds), &out, mic);

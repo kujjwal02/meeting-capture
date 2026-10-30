@@ -140,6 +140,13 @@ impl AppDirs {
         self.data_dir.join("debug-reports")
     }
 
+    /// One folder per recorded call: its numbered stems and each capture process's manifest.
+    /// Media stays here, never in the vault.
+    #[must_use]
+    pub fn calls_dir(&self) -> PathBuf {
+        self.data_dir.join("calls")
+    }
+
     /// The empty working folder for Claude Code, so it reads no project files.
     #[must_use]
     pub fn claude_code_dir(&self) -> PathBuf {

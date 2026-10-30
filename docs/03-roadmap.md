@@ -116,11 +116,33 @@ Progress is tracked in the [checklist](05-checklist.md).
 - `mc-capture` is a helper binary in `Contents/MacOS/`, shipped as a Tauri sidecar and signed with
   the app's identity. It owns the audio devices and the stem files. The app never links Core Audio
   code, so a crash or hung HAL call in capture never takes the tray down.
-- The app talks to the helper in JSON lines. App to helper: `start` with the call id and folder,
-  and `stop`. Helper to app: `recording`, `gap`, `device_changed`, `permission` and `error`.
-- If the helper exits, the app restarts it after 1, 2 and then 4 s and sends `start` again. After
-  3 failures in 60 s the tray shows "Recording failed". If the app exits, the helper sees stdin
-  close, closes both WAVs within 1 s and exits.
+- The app runs `mc-capture audio` and talks to it in JSON lines. Each line has a `seq` and a
+  `type`, with sorted keys. The `capture-protocol` crate defines every line as a closed enum, and
+  each side validates a line once, when it reads it.
+- App to helper: `start` with the call id, call folder, segment number and platform, and `stop`.
+- Helper to app: `recording` per stream, `gap`, `heartbeat` every 5 s, `rotated`, `stopped` once
+  the segment is closed, and `error` with a closed kind. Step 5 adds `device_changed` and
+  `permission`.
+- A heartbeat carries each stream's device samples read and 16 kHz samples written.
+- Example lines: `{"seq":1,"type":"stop"}` and `{"segment":2,"seq":9,"type":"stopped"}`.
+- The helper holds a "prevent idle system sleep" assertion from segment start to segment close.
+- The app starts the helper from its own executable's folder, in the app's process group. The
+  helper's stderr goes to `mc-capture.log` in the app's log folder.
+- A call start or resume takes one segment number for every capture process: one above any
+  segment in `audio.json`, `video.json` or a `NNN-` file name.
+- If the helper exits, the app restarts it after 1, 2 and then 4 s. A restart takes the next
+  segment number only when the failed run left files. A rotation moves the number on too.
+- After 3 failures in 60 s the tray shows "Recording failed" and one notification. Restarts then
+  wait 30 s, or 5 minutes when a device would not open. The notification comes again only after a
+  recording starts or the failures drop below 3 in 60 s.
+- The app kills a hung helper. A helper is hung when for 15 s no heartbeat counter grows and
+  neither stem file grows.
+- To stop, the app sends `stop`, closes stdin and waits 12 s before it kills the helper. The
+  helper reads `stop` only after its device opens, which take up to 10 s. If the app exits, the
+  helper sees stdin close and closes both WAVs, then exits. Closing stdin stops within 1 s once
+  its devices are open.
+- The helper log moves to `mc-capture.log.1` at a helper start once it reaches 4 MB.
+- One call records at a time. A second open call waits until the first ends.
 - Remote audio: a global mono tap (`with_mono_global_tap_excluding_processes` with an empty list)
   in a private aggregate device whose only member is the tap. Adding the output device doubles
   the audio and blocks Zoom and Slack joins. The app does not exclude itself: that broke Zoom on
@@ -179,8 +201,16 @@ Progress is tracked in the [checklist](05-checklist.md).
   warns after 60 s of an all-zero tap while the mic hears speech. Mic permission comes from
   `AVCaptureDevice`. Warnings follow the huddle permission flow: one notification and a tray row
   that opens System Settings.
-- The tray shows a recording dot and "Recording: `<title>`" while stems are open, and a "Stop
+- The tray shows the recording dot while stems are open. Each call has an audio row and a "Stop
   recording this call" row.
+- "Stop recording this call" closes the segment, and the app logs no caption or chat for that
+  call until "Resume recording". The resume starts the next segment. The mc-meet popup has the
+  same button.
+- The call status board holds each call's stop. The supervisor, the huddle watcher and the tray
+  read it there.
+- A Meet call's log gets `recording_stopped` and `recording_resumed` lines, so a call reopened
+  after a restart stays stopped. A huddle log gets the same lines, and the watcher reads its rows
+  while stopped but logs none.
 - Both plists get `NSMicrophoneUsageDescription` and `NSAudioCaptureUsageDescription`, and the
   bundle requires macOS 14.4. On 14.2 and 14.3 the tap's permission prompt lands in another
   category.

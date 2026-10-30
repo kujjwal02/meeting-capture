@@ -29,6 +29,8 @@ cidre = { version = "0.29", default-features = false, features = [
   "dispatch",
   "blocks",
   "macos_14_4",
+  "io_kit",
+  "io_pm",
 ] }
 cpal = "0.18"
 hound = "3.5"
@@ -66,6 +68,7 @@ sha2 = "0.11"
 tempfile = "3.27"
 toml = "1.1"
 capture = { path = "crates/capture" }
+capture-protocol = { path = "crates/capture-protocol" }
 huddle-captions = { path = "crates/huddle-captions" }
 jobs = { path = "crates/jobs" }
 native-host = { path = "crates/native-host" }

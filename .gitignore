@@ -12,3 +12,6 @@ fixtures/private/
 *.webm
 crates/app/gen/
 .vscode/
+
+# The mc-capture sidecar `just bundle` copies in for the release build.
+/crates/app/binaries/

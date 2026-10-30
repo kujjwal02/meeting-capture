@@ -60,6 +60,8 @@ impl CallLog {
                 | CallEvent::Chat { .. }
                 | CallEvent::Roster { .. }
                 | CallEvent::Health { .. }
+                | CallEvent::RecordingStopped { .. }
+                | CallEvent::RecordingResumed { .. }
                 | CallEvent::CallEnded { .. }
                 | CallEvent::Unknown => None,
             })
@@ -114,6 +116,16 @@ impl CallLog {
     ) -> std::io::Result<()> {
         self.append(None, &ended_event(at, reason), true, received_at)
     }
+}
+
+/// The `recording_stopped` or `recording_resumed` event the app writes itself.
+pub(super) fn recording_event(is_stopped: bool, at: Timestamp) -> serde_json::Value {
+    let kind = if is_stopped {
+        "recording_stopped"
+    } else {
+        "recording_resumed"
+    };
+    serde_json::json!({ "kind": kind, "at": at })
 }
 
 /// The `call_ended` event the app writes itself.

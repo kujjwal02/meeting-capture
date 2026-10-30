@@ -8,21 +8,49 @@ use sources::slack_huddle::{self, LogLine};
 
 pub(crate) struct HuddleLog {
     log: AppendLog,
+    is_recording_stopped: bool,
 }
 
 impl HuddleLog {
     /// Creates the log for a huddle that started at `started_at`, in `log_dir`.
     pub(crate) fn create(log_dir: &Path, started_at: Timestamp) -> std::io::Result<Self> {
         let log = AppendLog::create(log_dir, &slack_huddle::log_file_name(started_at))?;
-        Ok(Self { log })
+        Ok(Self {
+            log,
+            is_recording_stopped: false,
+        })
     }
 
     pub(crate) fn path(&self) -> &Path {
         self.log.path()
     }
 
+    /// Appends `line`, except a caption line while the user has recording stopped.
     pub(crate) fn append(&mut self, line: &LogLine) -> std::io::Result<()> {
+        let is_caption = matches!(line, LogLine::Row { .. } | LogLine::Overlay { .. });
+        if is_caption && self.is_recording_stopped {
+            return Ok(());
+        }
         self.log.append(line, matches!(line, LogLine::Ended { .. }))
+    }
+
+    /// Logs a stop or a resume when the user's choice changes. Returns whether it changed.
+    pub(crate) fn set_recording_stopped(
+        &mut self,
+        is_stopped: bool,
+        seen_at: Timestamp,
+    ) -> std::io::Result<bool> {
+        if self.is_recording_stopped == is_stopped {
+            return Ok(false);
+        }
+        let line = if is_stopped {
+            LogLine::RecordingStopped { seen_at }
+        } else {
+            LogLine::RecordingResumed { seen_at }
+        };
+        self.log.append(&line, false)?;
+        self.is_recording_stopped = is_stopped;
+        Ok(true)
     }
 }
 

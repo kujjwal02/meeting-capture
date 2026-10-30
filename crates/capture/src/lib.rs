@@ -22,6 +22,8 @@ pub use mac::clock::{host_now_ns, utc_anchor};
 #[cfg(target_os = "macos")]
 pub use mac::hal::{HalDevice, hal_devices};
 #[cfg(target_os = "macos")]
+pub use mac::power::IdleSleepBlock;
+#[cfg(target_os = "macos")]
 pub use mac::tap::RemoteSource;
 
 /// About 1.4 s at 48 kHz: room for the writer to stall on a slow disk without dropping samples.
@@ -61,4 +63,6 @@ pub enum CaptureError {
     OpenThreadDied { stem: Stem },
     #[error("could not start a thread to open the {stem} stem: {reason}")]
     OpenThreadSpawn { stem: Stem, reason: String },
+    #[error("IOKit refused the idle sleep assertion with code {code}")]
+    PowerAssertion { code: i32 },
 }
