@@ -20,7 +20,8 @@
   const DOM_ROSTER_EVERY_MS = 10000;
   const KEEPALIVE_MS = 20000;
   const MAX_OUTBOX = 5000;
-  const MEETING_CODE_PATTERN = /^\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:\/|$)/;
+  // Meet serves calls at /<code> and at /meet/<code>.
+  const MEETING_CODE_PATTERN = /^(?:\/meet)?\/([a-z]{3}-[a-z]{4}-[a-z]{3})(?:\/|$)/;
   // Failed frames sent to the app per session. The app keeps the first 20 per call.
   const FAILED_FRAMES_SENT = 20;
   // Only caption frame failures help debug a call that does not record. A chat or roster frame
@@ -244,17 +245,49 @@
   // needs them visible. Never touches the caption language.
   function clickCaptionsOn(nowMs) {
     const button = findIconButton(selectors.captionsOffIcon);
-    if (!button) return;
+    if (button) {
+      captionSource.decide({ kind: "captions_clicked", atMs: nowMs });
+      button.click();
+      return;
+    }
+    if (captionsMenuPressed() !== "false") return;
     captionSource.decide({ kind: "captions_clicked", atMs: nowMs });
-    button.click();
+    pressCaptionsShortcut();
   }
 
   // The caption box covers a shared screen. Meet keeps streaming to channels mc-meet opened.
   function clickCaptionsOff(nowMs) {
     const button = findIconButton(selectors.captionsOnIcon);
-    if (!button) return;
+    if (button) {
+      captionSource.decide({ kind: "captions_hidden", atMs: nowMs });
+      button.click();
+      return;
+    }
+    if (captionsMenuPressed() !== "true") return;
     captionSource.decide({ kind: "captions_hidden", atMs: nowMs });
-    button.click();
+    pressCaptionsShortcut();
+  }
+
+  // The "Captions and translation" button's aria-pressed, or null where Meet has no such button.
+  function captionsMenuPressed() {
+    return findIconButton(selectors.captionsMenuIcon)?.getAttribute("aria-pressed") ?? null;
+  }
+
+  // Behind the "Captions and translation" button the captions toggle sits in a popup, and its
+  // "on" icon is a plain check mark. Meet's C shortcut toggles captions without the popup, so
+  // callers check aria-pressed first.
+  function pressCaptionsShortcut() {
+    for (const type of ["keydown", "keyup"]) {
+      document.body.dispatchEvent(
+        new KeyboardEvent(type, {
+          key: "c",
+          code: "KeyC",
+          keyCode: 67,
+          bubbles: true,
+          cancelable: true,
+        }),
+      );
+    }
   }
 
   // ---- Reader events. Both caption readers deliver spec events here; origin names the reader.

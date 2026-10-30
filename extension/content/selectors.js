@@ -7,6 +7,9 @@ globalThis.mcMeetSelectors = Object.freeze({
   // Icon text of the captions button while captions are off, and while they are on.
   captionsOffIcon: "closed_caption_off",
   captionsOnIcon: "closed_caption",
+  // Icon text of the "Captions and translation" button that replaces the captions button in
+  // some accounts' Meet. It opens a popup; its aria-pressed says whether captions are on.
+  captionsMenuIcon: "translate_cc",
   // Meet's hover tooltips. The captions button's one says when Meet refuses captions.
   tooltip: '[role="tooltip"]',
   // The text Meet shows on a disabled captions button, in English: "Live captions are

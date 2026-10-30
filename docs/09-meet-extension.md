@@ -181,12 +181,15 @@ stored value the content script hides captions.
 - Caption source. The hook opens `captions` and `captions_v2` on the peer connection that carries
   `collections`. Meet sends nothing on them until its captions are on, so the content script
   clicks the captions button when the call starts if captions are off, at most 3 times per caption
-  source. When no caption arrives within 20 s of opening the channels, or 10 caption frames in a
-  row fail to decode with no good caption in the last 20 s, the content script reads the caption
-  region in the DOM. The first channel caption after that switches back to the channel and stops
-  the DOM reader. `extension/content/caption-source.js` holds these rules. It reads no DOM and no
-  clock, so it also runs in Node. `content/main.js` feeds it timestamped facts and runs the reader
-  it picks.
+  source. Some accounts' Meet has a "Captions and translation" button (icon `translate_cc`) in
+  place of the captions button. It opens a popup that holds the captions toggle, and its
+  `aria-pressed` says whether captions are on. There the content script presses Meet's C shortcut
+  instead, and only when `aria-pressed` shows the opposite state, since C toggles. When no caption
+  arrives within 20 s of opening the channels, or 10 caption frames in a row fail to decode with
+  no good caption in the last 20 s, the content script reads the caption region in the DOM.
+  The first channel caption after that switches back to the channel and stops the DOM reader.
+  `extension/content/caption-source.js` holds these rules. It reads no DOM and no clock, so it
+  also runs in Node. `content/main.js` feeds it timestamped facts and runs the reader it picks.
 - Hidden captions. Meet's caption box covers a shared screen. With `hide_captions` on, the
   content script turns Meet's captions off after the first channel caption, so the box shows for
   a few seconds at call start. Turning captions off makes Meet close its own caption channel and

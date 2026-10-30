@@ -170,7 +170,8 @@ globalThis.mcMeetReadCaptionsButton = () => {
     .find(Boolean);
   if (hoverText) mcMeetUnavailableTooltip = hoverText.trim();
   const onButton = findIconButton(selectors.captionsOnIcon);
-  const button = onButton ?? findIconButton(selectors.captionsOffIcon);
+  const menuButton = findIconButton(selectors.captionsMenuIcon);
+  const button = onButton ?? findIconButton(selectors.captionsOffIcon) ?? menuButton;
   if (!button) {
     return { isOn: false, isUnavailable: false, isFound: false, tooltip: mcMeetUnavailableTooltip };
   }
@@ -187,7 +188,10 @@ globalThis.mcMeetReadCaptionsButton = () => {
   const isDisabled = button.disabled === true || button.getAttribute("aria-disabled") === "true";
   const isUnavailable = isDisabled || Boolean(ownText);
   return {
-    isOn: Boolean(onButton) && !isUnavailable,
+    isOn:
+      (Boolean(onButton) ||
+        (button === menuButton && button.getAttribute("aria-pressed") === "true")) &&
+      !isUnavailable,
     isUnavailable,
     isFound: true,
     tooltip: mcMeetUnavailableTooltip,

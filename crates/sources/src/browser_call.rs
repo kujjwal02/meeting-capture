@@ -126,7 +126,7 @@ impl CallEvent {
 /// What a `call_started` event says about its call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallStart {
-    /// Trimmed. `None` when blank.
+    /// Trimmed, without a `meet/` prefix. `None` when blank.
     pub meeting_code: Option<String>,
     /// Meet's title on one line, so it reads the same in a heading, a file name and the tray
     /// menu. `None` when blank or when it holds the meeting code: Meet titles a call with no
@@ -144,7 +144,9 @@ impl CallStart {
                 title,
                 ..
             } => {
-                let meeting_code = Some(meeting_code.trim())
+                // mc-meet 0.7.0 and older read `/meet/<code>` URLs as `meet/<code>`.
+                let meeting_code = meeting_code.trim();
+                let meeting_code = Some(meeting_code.strip_prefix("meet/").unwrap_or(meeting_code))
                     .filter(|code| !code.is_empty())
                     .map(str::to_owned);
                 let title = title
