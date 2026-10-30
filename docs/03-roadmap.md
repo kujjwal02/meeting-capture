@@ -180,6 +180,52 @@ Progress is tracked in the [checklist](05-checklist.md).
 5. Device listeners, the Bluetooth rule, mic swap, tap rebuild on stall, permission checks.
 6. Orphan repair at launch. Then 3 real calls, AirPods mid-call, `kill -9` of each process.
 
+## Phase 4 detail
+
+### Desert Ant models on the Mac
+
+[Desert Ant Labs](https://desertant.com/models/) ships on-device speech models that run on the
+Neural Engine through Core ML. Three of them cover phase 4 and phase 6 work. Each is free up to
+100k monthly active devices.
+
+| Model | Job | Figures from the vendor | Replaces |
+|---|---|---|---|
+| Voz | Parakeet TDT 0.6B v3 compiled for the Neural Engine, 467 MB | 10 min of audio in 2.4 s on an M1 Mac mini; 7.40% average WER, 11.84% on AMI | sherpa-onnx Parakeet int8 on the CPU |
+| Who | Diarization: speaker numbers with start and end times, no names | AMI DER 12.6% against 13.1% for pyannote community-1; 950x real time on an M5 Pro | Remote-stem diarization |
+| Ear | Spoken language ID over 99 languages, from audio | 250 ms per check | whatlang on transcript text, for Soniox routing |
+
+Our own Rust crate, `desert-ant`, runs the published weights on both OSes. The official SDKs are
+Swift, Kotlin and JavaScript only, and Voz has no native Windows build.
+
+- Mac: the `.mlmodelc` builds through Core ML (`objc2-core-ml`), on the Neural Engine.
+- Windows: the `.tflite` builds that Voz, Who and Ear already publish, through LiteRT on the CPU.
+  The vendor measures this at 3 to 7 times slower than the Neural Engine.
+- The crate ports the SDK's mel front end, window cutting and decoding from `desert-ant-core`.
+- Weights download from Hugging Face on first use, with a checksum, like the phase 8 model download.
+  The repo never holds them.
+
+Licence: the models and SDK are under the Desert Ant Labs Source-Available License 1.0.
+
+- It allows use, change and shipping inside an app. Use is free under 100,000 monthly active
+  devices per platform.
+- Changes and derivatives stay under that licence. `desert-ant` is a derivative, so it carries
+  that licence, not MIT, and its README says so, like the vendored Anarlog crates.
+- It forbids distributing the models or the SDK on their own.
+- It asks for credit where users can find it: the README and the settings window.
+
+Limits:
+
+- Who weakens past 4 speakers per 5 minutes: VoxConverse DER is 24.7% with 9 or more speakers.
+- Voz does not detect language and gives confident wrong text on unsupported speech. Its 25
+  languages exclude Hindi, so Hinglish still goes to Soniox.
+
+Plan: start phase 4 with Who for diarization and Voz for STT, through `desert-ant`. First check
+Voz's speed and WER against sherpa-onnx Parakeet on 3 recorded calls, on the Mac and the PC.
+Keep sherpa-onnx as the Windows path if Voz on LiteRT is slower there.
+
+Schemer (typed JSON extraction) does not fit: it copies spans and does not summarise, and it is in
+closed beta.
+
 ## Open questions
 
 - Whether the akaiketech.com Workspace admin allows unverified third-party apps to read calendars.
@@ -188,6 +234,10 @@ Progress is tracked in the [checklist](05-checklist.md).
   exists. Test it in phase 3b.
 - Parakeet int8 speed on the M2 CPU. The only CPU figure is 13.7x real time on a Ryzen 4750U.
 - Meet caption quality on Indian English and Hinglish.
+- Whether Ear tells Hinglish from English reliably. Its page names no Indian language and says
+  nothing about mixed-language speech.
+- Whether a Rust crate for LiteRT on Windows is maintained, or `desert-ant` needs its own bindings
+  to the LiteRT C API.
 - Haiku 5.5, Sonnet through Claude Code and GLM-5.3-Flash on five real transcripts.
 - Codex as a fourth provider, through `codex exec`.
 - Recording consent: a per-client "never record" list.
