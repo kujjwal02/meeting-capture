@@ -243,7 +243,8 @@ Done when:
 - [ ] Built-in mic when the default input is Bluetooth; new mic stream opens before the old closes.
 - [ ] Device listeners; the tap rebuilds only on evidence, at most 4 times per episode.
 - [ ] Sleep closes the segment; wake opens the call's next segment.
-- [ ] Orphan WAVs repaired at launch.
+- [x] Orphan WAVs repaired at launch, and at each segment start under the folder's
+  `audio.lock`. A second run finds nothing. A folder whose helper records is skipped.
 - [ ] System-audio and mic permission checked at each segment start and after a failure, with a
   tray warning.
 - [x] Tray recording dot and "Stop recording this call".
@@ -254,7 +255,11 @@ Done when:
   except a `device_switch` gap of up to 3 s paired with a `device_changed` report, or up to 7 s
   paired with a `tap_stalled` one, one per change.
 - [ ] The app and the helper together stay under 5% CPU in `top -l 0 -s 10`.
-- [ ] A `kill -9` of the app and of the helper mid-call each leave stems that play.
+- [x] A `kill -9` of the app and of the helper mid-call each leave stems that play. Checked on
+  fake mc-meet calls with the built-in mic and the tap. Each segment lost at most 0.33 s of its
+  wall time. Each played in `afinfo`. The call's next segment took the next number.
+- [ ] Still for a person: 3 real calls, one with AirPods connected mid-call. A sleep mid-call.
+  A live `just meet-e2e` run. The CPU check above.
 
 ## Phase 3b: mic detection
 

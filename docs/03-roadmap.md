@@ -241,12 +241,42 @@ Progress is tracked in the [checklist](05-checklist.md).
 - `audio.json` has a schema version. Readers accept any version up to their own.
 - Each segment entry holds its number, call id, platform, state (`open`, `closed` or
   `recovered`), clock readings at start and close, and close time.
+- A recovered segment also holds its `repair`: when, and whether the entry was rebuilt from the
+  files alone.
 - Each stem entry holds its file, first and last host time, UTC start, `sample_rate_hz`, samples
   in the header, devices, input rates, gaps, runs ahead, ring losses and `stopped_by`.
+- A repaired stem also holds its `repair`: `header_samples_before`, `listed_samples_before`,
+  `trailing_bytes_cut`, `positions_dropped`, `fixes` and `skipped_reason`.
 - The writer replaces `audio.json` atomically at each checkpoint. A failed checkpoint is reported
   and retried at the next one. A failed WAV write stops that stem alone.
-- At launch the app repairs every segment not marked closed: it truncates to a whole sample,
-  rewrites the RIFF and data sizes from the file length, and marks the segment `recovered`.
+- At launch the app repairs every segment left `open` in each call folder. Repair truncates
+  each stem to a whole sample. It rewrites the RIFF and data sizes from the file length. It sets
+  `samples_written` from the file and marks the segment `recovered`.
+- Repair writes only the header and the file length. The next recording takes the next number.
+- Each segment start repairs its own folder the same way. A helper restarted after a `kill -9`
+  recovers the segment it lost this way.
+- A file can end before the positions its entry records, as after a power cut. Repair then drops
+  the gaps, runs ahead, devices and rates that start past the new end, and counts them.
+- A gap that runs past the new end is shortened to end there. A run ahead that ends past it
+  ends there, with its lead read off its slope at that point.
+- The first device and the first rate start the file, so they always stay.
+- Files with no entry in `audio.json`, or a folder with no `audio.json`, get a rebuilt entry
+  marked `recovered`. It has no clock reading, and no call id when no other segment has one.
+- Repair checks a stem file fully before its first write. A file it cannot fix, such as one
+  without this writer's header, stays as it was.
+- The entry of a skipped stem lists `skipped` and the reason. The folder's other stems are still
+  repaired.
+- Repair writes the header before it cuts a partial sample. A failure between the two leaves a
+  file that plays to the same end, and the entry lists the fix already made.
+- A segment whose every stem was skipped stays `open`, so the next launch retries it.
+- A segment holds an exclusive OS file lock on the folder's `audio.lock` for its whole life.
+- Repair takes the same lock before it reads anything. So repair skips a folder whose helper is
+  alive.
+- The kernel drops the lock when its holder dies, `kill -9` included. So a dead helper never
+  leaves a folder locked. A pid file would need a liveness check that a reused pid fools.
+- A `kill -9` of the app closes the helper's stdin. The helper then closes its segment and
+  exits: 102 ms in the measured run.
+- A segment start waits up to 3 s for the lock, as headroom.
 - System-audio permission: `TCCAccessPreflight("kTCCServiceAudioCapture")` through dlopen. Mic
   permission comes from `AVCaptureDevice`. The helper checks both at each segment start and
   after a device open fails. It checks the mic again after each run of 10 s of exact zeros, and

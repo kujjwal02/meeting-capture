@@ -542,6 +542,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "call-folder"
+version = "0.7.1"
+dependencies = [
+ "tracing",
+]
+
+[[package]]
 name = "camino"
 version = "1.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2768,6 +2775,7 @@ dependencies = [
 name = "meeting-capture"
 version = "0.7.1"
 dependencies = [
+ "call-folder",
  "capture-protocol",
  "huddle-captions",
  "jiff",
@@ -4905,6 +4913,7 @@ dependencies = [
 name = "stem-writer"
 version = "0.7.1"
 dependencies = [
+ "call-folder",
  "jiff",
  "rubato",
  "serde",

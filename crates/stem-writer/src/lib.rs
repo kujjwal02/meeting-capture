@@ -11,15 +11,19 @@ use sources::Platform;
 use stem_timing::{BufferStamp, Stem, StemLosses, UtcAnchor};
 
 mod manifest;
+mod repair;
 mod track;
 mod wav;
 
 pub use manifest::{
     AheadRecord, AudioManifest, ClockRecord, DeviceRecord, GapCause, GapRecord, MANIFEST_FILE_NAME,
-    MANIFEST_SCHEMA_VERSION, RateRecord, SegmentRecord, SegmentState, StemRecord,
+    MANIFEST_SCHEMA_VERSION, RateRecord, SegmentRecord, SegmentRepair, SegmentState, StemFix,
+    StemRecord, StemRepair,
 };
+pub use repair::{FolderRepair, repair_folder};
 pub use track::StemProgress;
 
+use call_folder::FolderLock;
 use track::StemTrack;
 
 /// The rate of every stem file.
@@ -34,6 +38,15 @@ pub const CHECKPOINT_INTERVAL: Duration = Duration::from_millis(4_500);
 /// A WAV's sizes are u32 byte counts, so a 16 kHz 16-bit file holds at most 37.3 hours. The
 /// writer moves to the next segment at 24 hours, far from that limit and under 2.8 GB a file.
 pub const SEGMENT_SAMPLE_LIMIT: u64 = 24 * 3_600 * OUTPUT_RATE_HZ as u64;
+
+/// The audio process's lock file in a call folder. A segment holds it for its whole life, and
+/// repair takes it before it reads anything.
+pub(crate) const LOCK_FILE_NAME: &str = "audio.lock";
+
+/// How long a segment start waits for the folder's lock. A helper whose app died holds it until
+/// its segment closes: 102 ms after its stdin closed, as measured. A repair holds it for
+/// milliseconds. The rest is headroom for a slow disk.
+const LOCK_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StemWriterError {
@@ -66,6 +79,10 @@ pub enum StemWriterError {
         number: u32,
         highest: u32,
     },
+    #[error("{} is in use by another process", folder.display())]
+    FolderBusy { folder: PathBuf },
+    #[error("{} does not start with this writer's WAV header; repair left it as it is", path.display())]
+    NotOwnWav { path: PathBuf },
     #[error("the {stem} stem reports an input rate of 0 Hz")]
     ZeroRate { stem: Stem },
     #[error("could not set up a resampler from {rate_hz} Hz: {source}")]
@@ -129,6 +146,9 @@ pub struct Segment {
     retired: Vec<Stem>,
     events: Vec<SegmentEvent>,
     last_checkpoint: Instant,
+    /// Held for the segment's life, so repair never touches the files it writes. Last, so it
+    /// drops after the stem files flush their buffers.
+    _lock: FolderLock,
 }
 
 /// What a finished segment holds.
@@ -143,12 +163,13 @@ pub struct SegmentReport {
 impl Segment {
     /// Starts segment `number` of the call folder. The number must be above every segment in
     /// `audio.json` and every `NNN-*.wav` in the folder: a finished segment is never reopened.
-    /// `read_clock` gives each segment its clock readings.
+    /// `read_clock` gives each segment its clock readings. Takes the folder's lock first, then
+    /// repairs any segment an earlier writer left open.
     ///
     /// # Errors
     ///
-    /// Fails when the number is taken, the folder cannot be read or created, or `audio.json` is
-    /// unreadable or from a newer schema.
+    /// Fails when another process holds the folder for longer than 3 s, the number is taken, the
+    /// folder cannot be read or created, or `audio.json` is unreadable or from a newer schema.
     pub fn start(
         folder: &Path,
         number: u32,
@@ -160,6 +181,23 @@ impl Segment {
             path: folder.to_owned(),
             source,
         })?;
+        let lock = FolderLock::take_within(folder, LOCK_FILE_NAME, LOCK_WAIT)
+            .map_err(|source| StemWriterError::Io {
+                path: folder.join(LOCK_FILE_NAME),
+                source,
+            })?
+            .ok_or_else(|| StemWriterError::FolderBusy {
+                folder: folder.to_owned(),
+            })?;
+        // A failed repair leaves the old segment as it was. The number check below still keeps
+        // its files from being written again, so the call records on.
+        if let Err(error) = repair::repair_locked(folder) {
+            tracing::warn!(
+                file.directory = %folder.display(),
+                exception.message = %error,
+                "repair.failed"
+            );
+        }
         let mut manifest = AudioManifest::load_or_new(folder)?;
         let highest = highest_segment_number(folder, &manifest)?;
         if number <= highest {
@@ -173,13 +211,14 @@ impl Segment {
         let clock_utc = utc_timestamp(clock.utc)?;
         manifest.segments.push(SegmentRecord {
             number,
-            call_id: call_id.to_owned(),
+            call_id: Some(call_id.to_owned()),
             platform,
             state: SegmentState::Open,
-            clock: clock_record(clock, clock_utc),
+            clock: Some(clock_record(clock, clock_utc)),
             closing_clock: None,
             closed_at: None,
             stems: Vec::new(),
+            repair: None,
         });
         manifest.store(folder)?;
         tracing::info!(
@@ -200,6 +239,7 @@ impl Segment {
             retired: Vec::new(),
             events: Vec::new(),
             last_checkpoint: Instant::now(),
+            _lock: lock,
         })
     }
 
@@ -430,10 +470,11 @@ impl Segment {
                 call_id: segment.call_id.clone(),
                 platform: segment.platform,
                 state: SegmentState::Open,
-                clock: clock_record(clock, clock_utc),
+                clock: Some(clock_record(clock, clock_utc)),
                 closing_clock: None,
                 closed_at: None,
                 stems: Vec::new(),
+                repair: None,
             });
         }
         self.manifest.segments.extend(next);
@@ -631,13 +672,16 @@ fn highest_segment_number(folder: &Path, manifest: &AudioManifest) -> Result<u32
         let Some(name) = name.to_str() else {
             continue;
         };
-        if let Some((prefix, _)) = name.split_once('-')
-            && prefix.len() >= 3
-            && prefix.bytes().all(|byte| byte.is_ascii_digit())
-            && let Ok(number) = prefix.parse::<u32>()
-        {
+        if let Some(number) = segment_number_of(name) {
             highest = highest.max(number);
         }
     }
     Ok(highest)
+}
+
+/// The segment number of a file named `NNN-...`: three or more digits, then a dash.
+pub(crate) fn segment_number_of(file_name: &str) -> Option<u32> {
+    let (prefix, _) = file_name.split_once('-')?;
+    let is_number = prefix.len() >= 3 && prefix.bytes().all(|byte| byte.is_ascii_digit());
+    is_number.then(|| prefix.parse().ok()).flatten()
 }

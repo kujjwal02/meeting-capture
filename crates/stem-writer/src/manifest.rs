@@ -16,6 +16,9 @@ pub const MANIFEST_FILE_NAME: &str = "audio.json";
 
 /// Raised when the layout changes in a way an older reader would misread. Readers accept every
 /// version up to their own; fields added since carry serde defaults.
+///
+/// A segment repair rebuilt from its files alone writes `call_id` and `clock` as `null`. Readers
+/// from v0.7.1 and before need both, so they reject such a file instead of misreading it.
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,12 +43,16 @@ pub enum SegmentState {
 pub struct SegmentRecord {
     /// The `NNN` in the segment's file names.
     pub number: u32,
-    pub call_id: String,
+    /// The call's id as the app sent it. `None` only in a segment repair rebuilt from its files
+    /// alone, in a folder with no other segment to take it from.
+    #[serde(default)]
+    pub call_id: Option<String>,
     pub platform: Platform,
     pub state: SegmentState,
     /// The host clock read against UTC when the segment started. Every UTC time in the segment
-    /// comes from this reading.
-    pub clock: ClockRecord,
+    /// comes from this reading. `None` only in a segment repair rebuilt from its files alone.
+    #[serde(default)]
+    pub clock: Option<ClockRecord>,
     /// A second reading at close. Its offset from `clock` shows how far the two clocks drifted.
     #[serde(default)]
     pub closing_clock: Option<ClockRecord>,
@@ -53,6 +60,70 @@ pub struct SegmentRecord {
     pub closed_at: Option<Timestamp>,
     #[serde(default)]
     pub stems: Vec<StemRecord>,
+    /// Set when repair recovered the segment.
+    #[serde(default)]
+    pub repair: Option<SegmentRepair>,
+}
+
+/// What repair did to a segment whose writer died before closing it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct SegmentRepair {
+    pub repaired_at: Timestamp,
+    /// `audio.json` did not list the segment, so repair rebuilt its entry from the files alone:
+    /// it has no clock reading, no host times and no gaps.
+    pub is_rebuilt_from_files: bool,
+}
+
+/// What repair did to one stem file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StemRepair {
+    /// Samples the header counted before repair. `None` when the file was shorter than a header.
+    pub header_samples_before: Option<u64>,
+    /// `samples_written` before repair. `None` when the manifest did not list the stem.
+    pub listed_samples_before: Option<u64>,
+    /// Bytes of a partial trailing sample cut from the end of the file.
+    pub trailing_bytes_cut: u64,
+    /// Gaps, runs ahead, devices and input rates that started past the repaired end and were
+    /// dropped. Ones that started before it now end there.
+    #[serde(default)]
+    pub positions_dropped: u64,
+    pub fixes: Vec<StemFix>,
+    /// Why repair left the file as it was, when it did. The stem's other fields are unchanged.
+    #[serde(default)]
+    pub skipped_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StemFix {
+    /// The RIFF and data sizes now count every whole sample in the file.
+    HeaderSizesRewritten,
+    /// The file ended inside a sample, so its last byte was cut.
+    PartialSampleCut,
+    /// The file was shorter than a header, so it now holds an empty one.
+    HeaderWritten,
+    /// The file was on disk but not in the segment's entry.
+    AddedToManifest,
+    /// The segment's entry listed the file, but it was gone. The entry now counts no samples.
+    FileMissing,
+    /// The file ended before positions the entry recorded, so those were capped at its end.
+    PositionsCapped,
+    /// The file could not be repaired, so it was left as it was: `skipped_reason` says why.
+    Skipped,
+}
+
+impl std::fmt::Display for StemFix {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::HeaderSizesRewritten => "header_sizes_rewritten",
+            Self::PartialSampleCut => "partial_sample_cut",
+            Self::HeaderWritten => "header_written",
+            Self::AddedToManifest => "added_to_manifest",
+            Self::FileMissing => "file_missing",
+            Self::PositionsCapped => "positions_capped",
+            Self::Skipped => "skipped",
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -96,6 +167,9 @@ pub struct StemRecord {
     /// Why the writer stopped this stem early, when it did. The file holds the audio before.
     #[serde(default)]
     pub stopped_by: Option<String>,
+    /// Set when repair rebuilt the file's header.
+    #[serde(default)]
+    pub repair: Option<StemRepair>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

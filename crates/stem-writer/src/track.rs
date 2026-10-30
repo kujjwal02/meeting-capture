@@ -512,6 +512,7 @@ impl StemTrack {
             runs_ahead: self.runs_ahead.clone(),
             ring_losses: self.ring_losses,
             stopped_by: self.stopped_by.clone(),
+            repair: None,
         }
     }
 

@@ -2,7 +2,8 @@
 //! tray down. `audio` is the process the app supervises: commands on stdin, reports on stdout.
 //! `probe` records the stems at their native rates and reports what the devices did; `record`
 //! writes one segment of a call folder through the stem writer; `devices` lists the Core Audio
-//! devices; `await-device-change` exits on the first device change.
+//! devices; `await-device-change` exits on the first device change; `repair` recovers the
+//! segments a dead writer left open in a call folder, as the app does at launch.
 
 #[cfg(target_os = "macos")]
 mod audio;
@@ -92,6 +93,14 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         seconds: u64,
     },
+    /// Rebuild the headers of the segments a dead writer left open in a call folder and mark
+    /// them recovered. Leaves a folder alone while a helper records there. Prints the outcome
+    /// as one JSON object.
+    Repair {
+        /// The call folder.
+        #[arg(long)]
+        folder: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -164,6 +173,11 @@ fn main() -> anyhow::Result<()> {
                 let _ = seconds;
                 anyhow::bail!("await-device-change watches Core Audio on macOS only")
             }
+        }
+        Command::Repair { folder } => {
+            let outcome = stem_writer::repair_folder(&folder)?;
+            println!("{}", serde_json::to_string(&outcome)?);
+            Ok(())
         }
         Command::Devices { mic } => {
             #[cfg(target_os = "macos")]

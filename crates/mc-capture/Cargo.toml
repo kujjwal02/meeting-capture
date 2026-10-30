@@ -10,17 +10,17 @@ license.workspace = true
 anyhow.workspace = true
 capture.workspace = true
 clap.workspace = true
+serde_json.workspace = true
+stem-writer.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
-# Only the macOS commands record or print JSON.
+# Only the macOS commands record.
 [target.'cfg(target_os = "macos")'.dependencies]
 capture-protocol.workspace = true
 hound.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 sources.workspace = true
-stem-writer.workspace = true
 thiserror.workspace = true
 
 [lints]
