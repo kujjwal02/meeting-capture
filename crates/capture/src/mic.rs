@@ -1,9 +1,12 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use cpal::Device;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::Serialize;
 
 use crate::ring::stem_ring;
-use crate::{CaptureError, StemFormat, StemReader};
+use crate::{CaptureError, MicMoment, StemFormat, StemReader};
 
 /// Which input device records the mic stem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -17,6 +20,27 @@ pub enum MicRule {
     AvoidBluetooth,
 }
 
+/// What the mic rule picks from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MicRequest {
+    pub rule: MicRule,
+    pub moment: MicMoment,
+    /// An input to leave out, such as the built-in mic while the lid is closed: macOS then
+    /// mutes it to exact zeros.
+    pub skipped_uid: Option<String>,
+}
+
+impl MicRequest {
+    #[must_use]
+    pub fn call_start(rule: MicRule) -> Self {
+        Self {
+            rule,
+            moment: MicMoment::CallStart,
+            skipped_uid: None,
+        }
+    }
+}
+
 /// How an input device connects, as far as the mic rule cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +50,9 @@ pub enum MicTransport {
     Bluetooth,
     /// An aggregate device, such as our own private tap aggregate.
     Aggregate,
+    /// A software device such as `ZoomAudioDevice` or `BlackHole`. It carries another app's audio,
+    /// not a voice, so `AvoidBluetooth` never records from it.
+    Virtual,
     Other,
     /// The transport could not be read. `AvoidBluetooth` treats it as Bluetooth.
     Unknown,
@@ -43,11 +70,16 @@ pub enum MicPickReason {
     DefaultIsBluetooth,
     /// The default input's transport is unreadable, so the built-in mic records instead.
     DefaultTransportUnknown,
-    /// The default input is Bluetooth or unreadable and no built-in mic exists, so the first
-    /// wired input records instead.
+    /// The default input is a virtual device, so the built-in mic records instead.
+    DefaultIsVirtual,
+    /// The default input is the skipped one, so another input records instead.
+    DefaultIsSkipped,
+    /// The default input is Bluetooth, virtual or unreadable and no built-in mic exists, so the
+    /// first wired input records instead.
     NoBuiltInMic,
-    /// The default input is Bluetooth or unreadable and no other input qualifies, as on a
-    /// closed-lid Mac mini with only a headset.
+    /// At a call start, the default input is Bluetooth or unreadable and no other input
+    /// qualifies, as on a Mac mini with only a headset. Recording the headset is better than
+    /// no mic when the call has not started on another profile yet.
     NoAlternativeInput,
 }
 
@@ -68,6 +100,7 @@ impl MicTransport {
             Self::BuiltIn => "built_in",
             Self::Bluetooth => "bluetooth",
             Self::Aggregate => "aggregate",
+            Self::Virtual => "virtual",
             Self::Other => "other",
             Self::Unknown => "unknown",
         }
@@ -78,7 +111,7 @@ impl MicTransport {
     fn is_wired_alternative(self) -> bool {
         match self {
             Self::BuiltIn | Self::Other => true,
-            Self::Bluetooth | Self::Aggregate | Self::Unknown => false,
+            Self::Bluetooth | Self::Aggregate | Self::Virtual | Self::Unknown => false,
         }
     }
 }
@@ -91,6 +124,8 @@ impl MicPickReason {
             Self::DefaultIsSafe => "default_is_safe",
             Self::DefaultIsBluetooth => "default_is_bluetooth",
             Self::DefaultTransportUnknown => "default_transport_unknown",
+            Self::DefaultIsVirtual => "default_is_virtual",
+            Self::DefaultIsSkipped => "default_is_skipped",
             Self::NoBuiltInMic => "no_built_in_mic",
             Self::NoAlternativeInput => "no_alternative_input",
         }
@@ -120,9 +155,17 @@ pub struct MicPick {
     pub default_input_transport: MicTransport,
 }
 
-/// Keeps the input stream open. Dropping it stops the stream.
-pub(crate) struct MicSource {
+/// Virtual inputs that report a hardware-like transport, by name. Zoom's device is the one
+/// several recorders had to block by name.
+const VIRTUAL_INPUT_NAMES: [&str; 2] = ["ZoomAudioDevice", "Microsoft Teams Audio"];
+
+/// One open mic stream. Dropping it stops the stream.
+pub struct MicStream {
     stream: Option<cpal::Stream>,
+    pick: MicPick,
+    /// Set by cpal when the device went away or changed its rate under the stream. Either way
+    /// the stream delivers nothing more that the stamps describe correctly.
+    is_lost: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -140,10 +183,10 @@ pub fn default_devices() -> InputDevices {
     }
 }
 
-impl MicSource {
+impl MicStream {
     /// Opens the mic as mono f32 at the device's default rate.
-    pub(crate) fn start(rule: MicRule) -> Result<(Self, StemReader), CaptureError> {
-        let (device, pick) = pick_device(rule)?;
+    pub(crate) fn start(request: &MicRequest) -> Result<(Self, StemReader), CaptureError> {
+        let (device, pick) = pick_device(request)?;
         tracing::info!(
             device.name = pick.device_name.as_deref(),
             mic.transport = %pick.transport,
@@ -166,6 +209,8 @@ impl MicSource {
         };
         let sample_rate_hz = config.sample_rate();
         let (mut pusher, reader) = stem_ring(format);
+        let is_lost = Arc::new(AtomicBool::new(false));
+        let lost_flag = Arc::clone(&is_lost);
         let stream = device
             .build_input_stream::<f32, _, _>(
                 stream_config,
@@ -176,7 +221,7 @@ impl MicSource {
                             .filter(|&nanos| nanos != 0);
                     pusher.push_buffer(samples, host_time_ns, sample_rate_hz);
                 },
-                |error| tracing::warn!(exception.message = %error, "mic.stream_error"),
+                move |error| note_stream_error(&lost_flag, &error),
                 None,
             )
             .map_err(|e| microphone_error("build_input_stream", &e))?;
@@ -184,9 +229,29 @@ impl MicSource {
         Ok((
             Self {
                 stream: Some(stream),
+                pick,
+                is_lost,
             },
             reader,
         ))
+    }
+
+    /// What the mic rule chose when this stream opened.
+    #[must_use]
+    pub fn pick(&self) -> &MicPick {
+        &self.pick
+    }
+
+    /// Whether the device went away or changed its rate under the stream.
+    #[must_use]
+    pub fn is_lost(&self) -> bool {
+        self.is_lost.load(Ordering::Relaxed)
+    }
+
+    /// Marks the stream lost, as a vanished device would. The record loop also calls it when a
+    /// closed lid mutes the built-in mic to exact zeros.
+    pub fn mark_lost(&self) {
+        self.is_lost.store(true, Ordering::Relaxed);
     }
 
     /// Stops the callbacks. The reader still holds what they pushed.
@@ -195,32 +260,62 @@ impl MicSource {
     }
 }
 
+fn note_stream_error(is_lost: &AtomicBool, error: &cpal::Error) {
+    #[allow(
+        clippy::match_same_arms,
+        reason = "cpal's error kind is non-exhaustive, so the wildcard needs its own arm"
+    )]
+    let is_fatal = match error.kind() {
+        cpal::ErrorKind::DeviceNotAvailable | cpal::ErrorKind::StreamInvalidated => true,
+        cpal::ErrorKind::Xrun => false,
+        _ => false,
+    };
+    if is_fatal {
+        is_lost.store(true, Ordering::Relaxed);
+    }
+    tracing::warn!(
+        exception.message = %error,
+        mic.is_lost = is_fatal,
+        "mic.stream_error"
+    );
+}
+
 /// Decides which input device the mic rule picks, without opening it.
 ///
 /// # Errors
 ///
-/// Fails when no input device exists or the device list cannot be read.
-pub fn mic_pick(rule: MicRule) -> Result<MicPick, CaptureError> {
-    pick_device(rule).map(|(_, pick)| pick)
+/// Fails when no input device exists, the device list cannot be read, or the rule allows no
+/// input: see `CaptureError::NoSafeMicrophone` and `CaptureError::OnlyVirtualMicrophone`.
+pub fn mic_pick(request: &MicRequest) -> Result<MicPick, CaptureError> {
+    pick_device(request).map(|(_, pick)| pick)
 }
 
-fn pick_device(rule: MicRule) -> Result<(Device, MicPick), CaptureError> {
+fn pick_device(request: &MicRequest) -> Result<(Device, MicPick), CaptureError> {
+    let rule = request.rule;
     let host = cpal::default_host();
     let default = host
         .default_input_device()
         .ok_or(CaptureError::NoMicrophone)?;
     let default_transport = transport(&default);
+    let is_default_skipped =
+        request.skipped_uid.is_some() && device_uid(&default) == request.skipped_uid;
     let (device, reason) = match (rule, default_transport) {
+        _ if is_default_skipped => {
+            pick_alternative(&host, &default, request, AlternativeCause::Skipped)?
+        }
         (MicRule::FollowDefault, _) => (default.clone(), MicPickReason::RuleFollowsDefault),
         (
             MicRule::AvoidBluetooth,
             MicTransport::BuiltIn | MicTransport::Aggregate | MicTransport::Other,
         ) => (default.clone(), MicPickReason::DefaultIsSafe),
         (MicRule::AvoidBluetooth, MicTransport::Bluetooth) => {
-            pick_alternative(&host, &default, MicPickReason::DefaultIsBluetooth)?
+            pick_alternative(&host, &default, request, AlternativeCause::Bluetooth)?
+        }
+        (MicRule::AvoidBluetooth, MicTransport::Virtual) => {
+            pick_alternative(&host, &default, request, AlternativeCause::Virtual)?
         }
         (MicRule::AvoidBluetooth, MicTransport::Unknown) => {
-            pick_alternative(&host, &default, MicPickReason::DefaultTransportUnknown)?
+            pick_alternative(&host, &default, request, AlternativeCause::UnknownTransport)?
         }
     };
     let pick = MicPick {
@@ -235,15 +330,39 @@ fn pick_device(rule: MicRule) -> Result<(Device, MicPick), CaptureError> {
     Ok((device, pick))
 }
 
-/// The built-in mic, else the first wired input, else the default when nothing else qualifies.
+/// Why the default input does not record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AlternativeCause {
+    Bluetooth,
+    Virtual,
+    UnknownTransport,
+    Skipped,
+}
+
+impl AlternativeCause {
+    /// The reason a pick names when the built-in mic records instead.
+    fn reason(self) -> MicPickReason {
+        match self {
+            Self::Bluetooth => MicPickReason::DefaultIsBluetooth,
+            Self::Virtual => MicPickReason::DefaultIsVirtual,
+            Self::UnknownTransport => MicPickReason::DefaultTransportUnknown,
+            Self::Skipped => MicPickReason::DefaultIsSkipped,
+        }
+    }
+}
+
+/// The built-in mic, else the first wired input. With neither, only a call start falls back
+/// to a Bluetooth or unreadable default; a virtual or skipped default never records.
 fn pick_alternative(
     host: &cpal::Host,
     default: &Device,
-    built_in_reason: MicPickReason,
+    request: &MicRequest,
+    cause: AlternativeCause,
 ) -> Result<(Device, MicPickReason), CaptureError> {
     let inputs: Vec<(Device, MicTransport)> = host
         .input_devices()
         .map_err(|e| microphone_error("input_devices", &e))?
+        .filter(|device| request.skipped_uid.is_none() || device_uid(device) != request.skipped_uid)
         .map(|device| {
             let transport = transport(&device);
             (device, transport)
@@ -255,11 +374,35 @@ fn pick_alternative(
     let wired = inputs
         .iter()
         .find(|(_, transport)| transport.is_wired_alternative());
-    Ok(match (built_in, wired) {
-        (Some((built_in, _)), _) => (built_in.clone(), built_in_reason),
-        (None, Some((wired, _))) => (wired.clone(), MicPickReason::NoBuiltInMic),
-        (None, None) => (default.clone(), MicPickReason::NoAlternativeInput),
-    })
+    match (built_in, wired) {
+        (Some((built_in, _)), _) => return Ok((built_in.clone(), cause.reason())),
+        (None, Some((wired, _))) => return Ok((wired.clone(), MicPickReason::NoBuiltInMic)),
+        (None, None) => {}
+    }
+    let default_name = device_name(default).unwrap_or_default();
+    match (cause, request.moment) {
+        (AlternativeCause::Virtual, MicMoment::CallStart | MicMoment::MidCall) => {
+            Err(CaptureError::OnlyVirtualMicrophone { default_name })
+        }
+        (
+            AlternativeCause::Bluetooth | AlternativeCause::UnknownTransport,
+            MicMoment::CallStart,
+        ) => {
+            tracing::warn!(
+                device.name = default_name,
+                mic.reason = %cause.reason(),
+                "mic.unsafe_fallback"
+            );
+            Ok((default.clone(), MicPickReason::NoAlternativeInput))
+        }
+        (AlternativeCause::Bluetooth | AlternativeCause::UnknownTransport, MicMoment::MidCall)
+        | (AlternativeCause::Skipped, MicMoment::CallStart | MicMoment::MidCall) => {
+            Err(CaptureError::NoSafeMicrophone {
+                default_name,
+                moment: request.moment,
+            })
+        }
+    }
 }
 
 fn device_uid(device: &Device) -> Option<String> {
@@ -269,19 +412,37 @@ fn device_uid(device: &Device) -> Option<String> {
 /// On macOS cpal reports no Bluetooth interface type, so the transport comes from the HAL. cpal
 /// 0.18.2's device ID there is the Core Audio device UID, which the HAL resolves to the same
 /// device.
-#[cfg(target_os = "macos")]
 fn transport(device: &Device) -> MicTransport {
+    let is_virtual_by_name = device_name(device)
+        .is_some_and(|name| VIRTUAL_INPUT_NAMES.iter().any(|known| name.contains(known)));
+    if is_virtual_by_name {
+        return MicTransport::Virtual;
+    }
+    platform_transport(device)
+}
+
+#[cfg(target_os = "macos")]
+fn platform_transport(device: &Device) -> MicTransport {
     use cidre::core_audio::DeviceTransportType;
 
     let Some(uid) = device_uid(device) else {
         return MicTransport::Unknown;
     };
     match crate::mac::hal::transport_type(&uid) {
-        Some(DeviceTransportType::BUILT_IN) => MicTransport::BuiltIn,
-        Some(DeviceTransportType::BLUETOOTH | DeviceTransportType::BLUETOOTH_LE) => {
+        Some(transport) if crate::mac::hal::is_bluetooth_transport(transport) => {
             MicTransport::Bluetooth
         }
-        Some(DeviceTransportType::AGGREGATE) => MicTransport::Aggregate,
+        Some(DeviceTransportType::BUILT_IN) => MicTransport::BuiltIn,
+        // An aggregate that holds a Bluetooth mic opens it like the headset itself would. One
+        // whose members cannot be read counts as unknown.
+        Some(DeviceTransportType::AGGREGATE) => {
+            match crate::mac::hal::aggregate_has_bluetooth(&uid) {
+                Some(false) => MicTransport::Aggregate,
+                Some(true) => MicTransport::Bluetooth,
+                None => MicTransport::Unknown,
+            }
+        }
+        Some(DeviceTransportType::VIRTUAL) => MicTransport::Virtual,
         Some(DeviceTransportType::UNKNOWN) | None => MicTransport::Unknown,
         // Core Audio's transport type is an open set of four-char codes.
         Some(_) => MicTransport::Other,
@@ -293,13 +454,14 @@ fn transport(device: &Device) -> MicTransport {
     clippy::match_same_arms,
     reason = "Unknown is named on its own so a reader sees it; the wildcard covers variants cpal adds later"
 )]
-fn transport(device: &Device) -> MicTransport {
+fn platform_transport(device: &Device) -> MicTransport {
     use cpal::InterfaceType;
 
     match device.description().ok().map(|d| d.interface_type()) {
         Some(InterfaceType::BuiltIn) => MicTransport::BuiltIn,
         Some(InterfaceType::Bluetooth) => MicTransport::Bluetooth,
         Some(InterfaceType::Aggregate) => MicTransport::Aggregate,
+        Some(InterfaceType::Virtual) => MicTransport::Virtual,
         Some(
             InterfaceType::Usb
             | InterfaceType::Pci
@@ -309,7 +471,6 @@ fn transport(device: &Device) -> MicTransport {
             | InterfaceType::Line
             | InterfaceType::Spdif
             | InterfaceType::Network
-            | InterfaceType::Virtual
             | InterfaceType::DisplayPort,
         ) => MicTransport::Other,
         Some(InterfaceType::Unknown) | None => MicTransport::Unknown,

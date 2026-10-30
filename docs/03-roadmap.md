@@ -119,10 +119,13 @@ Progress is tracked in the [checklist](05-checklist.md).
 - The app runs `mc-capture audio` and talks to it in JSON lines. Each line has a `seq` and a
   `type`, with sorted keys. The `capture-protocol` crate defines every line as a closed enum, and
   each side validates a line once, when it reads it.
-- App to helper: `start` with the call id, call folder, segment number and platform, and `stop`.
+- App to helper: `start` with the call id, call folder, segment number, platform and mic moment,
+  and `stop`. The mic moment is `call_start` for segment 1 and `mid_call` for every later
+  segment: a wake, a rotation, a resume or a helper restart.
 - Helper to app: `recording` per stream, `gap`, `heartbeat` every 5 s, `rotated`, `stopped` once
-  the segment is closed, and `error` with a closed kind. Step 5 adds `device_changed` and
-  `permission`.
+  the segment is closed, `device_changed` when a stream moves to another device mid-segment,
+  `mic_unavailable` when the mic is lost and no safe input is left, `permission` with a
+  permission's state, `system_sleep` and `system_wake`, and `error` with a closed kind.
 - A heartbeat carries each stream's device samples read and 16 kHz samples written.
 - Example lines: `{"seq":1,"type":"stop"}` and `{"segment":2,"seq":9,"type":"stopped"}`.
 - The helper holds a "prevent idle system sleep" assertion from segment start to segment close.
@@ -148,8 +151,56 @@ Progress is tracked in the [checklist](05-checklist.md).
   the audio and blocks Zoom and Slack joins. The app does not exclude itself: that broke Zoom on
   macOS 26.
 - Mic: `cpal` on the system default input. If the default input is Bluetooth, the built-in mic is
-  recorded instead, so the app never forces AirPods into HFP. On a device change (debounced 1 s)
-  the new stream opens before the old one closes.
+  recorded instead, so the app never forces AirPods into HFP. A virtual input such as
+  `ZoomAudioDevice` is skipped the same way.
+- With no built-in or wired input, a call start records the Bluetooth or unknown default and
+  logs it. A virtual default with no alternative fails the open with a named error. A mid-call
+  pick never returns a Bluetooth, virtual or unknown-transport input. An aggregate input counts
+  as Bluetooth when one of its active sub-devices is Bluetooth, and as unknown when the HAL
+  cannot list them.
+- A mid-call segment start with no safe input records the remote stem alone and reports
+  `mic_unavailable`. The pick then retries as for a lost mic.
+- The helper registers Core Audio listeners for the default input, the default output and the
+  device list. A listener only sets a flag; the record loop reads the flags every 50 ms and
+  never polls the HAL. A change waits 1 s to settle, or 1.5 s when Bluetooth joined or left
+  the route.
+- Mic swap: after a settled change the mic rule picks again. A second stream opens beside the
+  recording one when the pick names another device, or when the open stream reports its device
+  gone.
+- The new stream takes over at its first non-zero buffer. After a pick change it also takes
+  over after 2 s of zeros, counted from its first buffer. After a lost device it takes over at
+  its first buffer.
+- A new stream with no buffer within 5 s is dropped, and the swap retries after 15 s. A failed
+  open retries after 15 s too. When the old mic was already lost, the dropped stream leaves the
+  stem with no device and the helper reports `mic_unavailable`.
+- At takeover the old stream stops and its last buffers are written. The stem continues from
+  the new stream's first buffer after the old one's end.
+- With no safe input left, a changed pick keeps the old stream. A lost mic leaves the mic stem
+  with no device: the helper reports `mic_unavailable`, the stem records a gap, and the pick
+  runs again every 15 s and at each device change. The tray turns amber with a "without your
+  mic" row.
+- After 10 s of exact zeros on the built-in mic with the lid closed (`AppleClamshellState`),
+  the mic counts as lost, and picks leave it out until the lid opens. The helper carries this
+  into the call's next segments.
+- Tap rebuild only on evidence: the aggregate device died, the tap's format changed rate, the
+  delivered buffers ran 2% off the format's rate for two 2 s windows, the tap delivered nothing
+  for 1 s within 10 s of a default output change, or it delivered nothing for 5 s since its
+  last buffer or its open. A buffer without a valid host time counts as delivered. Each
+  device-list change also reads whether the aggregate is alive. At most 4 rebuilds per episode,
+  15 s apart; an episode ends after 60 s without one. A fifth closes the segment with
+  `tap_rebuild_limit`, and the app restarts the helper. Silence alone never rebuilds.
+- Sleep: the helper registers for IOKit power notifications and holds the sleep until the
+  segment is closed, at most 20 s. It reports `stopped` and `system_sleep`, and stays running.
+  On full wake it reports `system_wake`, and the app sends `start` with the call's next segment
+  number. A dark wake, with no graphics, reports nothing until it becomes a full wake. Host time
+  stops during sleep, so the sleep is the span between two segments. A `start` that arrives
+  while the Mac sleeps waits for the wake.
+- While a failing helper waits 5 minutes for a device that would not open, the app runs
+  `mc-capture await-device-change`. A device change ends the wait, and the helper restarts 1.5 s
+  later.
+- Debug builds of the helper read `MC_CAPTURE_INJECT`, a timetable such as
+  `5:mic-lost,12:tap-stall,30:sleep,32:wake`, so the device and sleep paths run without touching
+  real devices. Release builds leave the timetable and its test hooks out.
 - Every native open runs on its own thread with a 5 s timeout. On timeout the helper exits and the
   app restarts it. Teardown stops the device and waits for running callbacks before it frees
   anything.
@@ -181,8 +232,8 @@ Progress is tracked in the [checklist](05-checklist.md).
 - A rotation reads a fresh clock: it closes the old segment and opens the new one. A stopped stem
   stays listed in the closed segment and leaves the new one. Silence past 24 hours opens the next
   file.
-- Each call gets a folder in the app data folder, named after the call id. A start, resume or
-  helper restart begins a new numbered pair: `001-mic.wav`, `001-remote.wav`, then `002-...`.
+- Each call gets a folder in the app data folder, named after the call id. A start, resume,
+  helper restart or wake begins a new numbered pair: `001-mic.wav`, `001-remote.wav`, then `002-...`.
 - The app picks the segment number. The writer refuses a number at or below any segment in the
   folder, so a finished segment is never opened for writing again.
 - Each process keeps its own manifest in the call folder. The audio process writes `audio.json`,
@@ -196,11 +247,14 @@ Progress is tracked in the [checklist](05-checklist.md).
   and retried at the next one. A failed WAV write stops that stem alone.
 - At launch the app repairs every segment not marked closed: it truncates to a whole sample,
   rewrites the RIFF and data sizes from the file length, and marks the segment `recovered`.
-- System-audio permission: `TCCAccessPreflight("kTCCServiceAudioCapture")` through dlopen, at
-  launch and before each call. If the private call is missing, the status is unknown, and the tray
-  warns after 60 s of an all-zero tap while the mic hears speech. Mic permission comes from
-  `AVCaptureDevice`. Warnings follow the huddle permission flow: one notification and a tray row
-  that opens System Settings.
+- System-audio permission: `TCCAccessPreflight("kTCCServiceAudioCapture")` through dlopen. Mic
+  permission comes from `AVCaptureDevice`. The helper checks both at each segment start and
+  after a device open fails. It checks the mic again after each run of 10 s of exact zeros, and
+  the tap after each run of 60 s of exact zeros during which the mic heard a voice. Nothing
+  polls. If
+  the private call is missing or answers neither yes nor no, the state is unknown. A denied or
+  restricted permission turns the tray amber, adds a tray row that opens its System Settings
+  pane, and shows one notification.
 - The tray shows the recording dot while stems are open. Each call has an audio row and a "Stop
   recording this call" row.
 - "Stop recording this call" closes the segment, and the app logs no caption or chat for that

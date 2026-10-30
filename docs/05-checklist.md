@@ -241,13 +241,18 @@ Done when:
 - [x] `stem-writer` writes numbered `NNN-mic.wav` and `NNN-remote.wav` segments and `audio.json`.
 - [x] `mc-capture` helper, supervised by the app with 1, 2 and 4 s restarts.
 - [ ] Built-in mic when the default input is Bluetooth; new mic stream opens before the old closes.
+- [ ] Device listeners; the tap rebuilds only on evidence, at most 4 times per episode.
+- [ ] Sleep closes the segment; wake opens the call's next segment.
 - [ ] Orphan WAVs repaired at launch.
-- [ ] System-audio and mic permission checked at launch, with a tray warning.
+- [ ] System-audio and mic permission checked at each segment start and after a failure, with a
+  tray warning.
 - [x] Tray recording dot and "Stop recording this call".
 
 Done when:
 
-- [ ] 3 calls recorded, one with AirPods connected mid-call, no gap over 1 s in `audio.json`.
+- [ ] 3 calls recorded, one with AirPods connected mid-call. In `audio.json`, no gap is over 1 s,
+  except a `device_switch` gap of up to 3 s paired with a `device_changed` report, or up to 7 s
+  paired with a `tap_stalled` one, one per change.
 - [ ] The app and the helper together stay under 5% CPU in `top -l 0 -s 10`.
 - [ ] A `kill -9` of the app and of the helper mid-call each leave stems that play.
 

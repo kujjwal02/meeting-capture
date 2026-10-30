@@ -11,7 +11,12 @@
 //! Each process restarts after 1, 2 and then 4 s. After 3 failures in a minute it is failing
 //! until it records again, and restarts every 30 s, or every 5 minutes when a device would not
 //! open. A start or resume takes the call's next segment number; a restart takes the next one
-//! only when the last left files behind.
+//! only when the last left files behind. While a failing process waits 5 minutes for a device,
+//! `mc-capture await-device-change` watches the HAL, so a new device restarts it 1.5 s later.
+//!
+//! A sleep closes the segment inside the helper, which stays running. On wake the helper says
+//! so and the supervisor starts the call's next segment in it. The helper's permission reports
+//! feed the tray: a refused microphone or system audio permission shows as a problem.
 
 mod restart_backoff;
 
@@ -21,7 +26,10 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use capture_protocol::{AudioCommand, AudioErrorKind, AudioReport, Platform, Stem};
+use capture_protocol::{
+    AudioCommand, AudioErrorKind, AudioReport, DeviceChangeCause, MicMoment, PermissionService,
+    PermissionState, Platform, Stem,
+};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tauri::{AppHandle, Manager as _};
@@ -49,6 +57,9 @@ const SIDECAR_LOG_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 const SIDECAR_FILE_NAME: &str = "mc-capture.exe";
 #[cfg(not(windows))]
 const SIDECAR_FILE_NAME: &str = "mc-capture";
+/// After a device change ends a backoff early, the wait before the restart: Bluetooth routes
+/// take this long to settle.
+const DEVICE_CHANGE_SETTLE: Duration = Duration::from_millis(1_500);
 /// The video process's manifest, which phase 3c writes beside `audio.json`.
 const VIDEO_MANIFEST_FILE_NAME: &str = "video.json";
 
@@ -65,11 +76,18 @@ pub(crate) enum AudioState {
     Recording {
         segment: u32,
     },
+    /// Stems are open, but the mic went away and no safe input is left. The helper keeps
+    /// looking for one.
+    RecordingWithoutMic {
+        segment: u32,
+    },
     /// The helper exited or hung; it restarts after the backoff.
     Restarting,
     /// The helper failed 3 times within 60 s and has not recorded since. It restarts every 30 s,
     /// or every 5 minutes when a device would not open.
     Failing,
+    /// The Mac sleeps or just woke. The helper closed the segment and opens the next on wake.
+    Sleeping,
     StoppedByUser,
 }
 
@@ -79,8 +97,12 @@ impl AudioState {
             Self::Queued => "Audio: waiting, another call is recording".to_owned(),
             Self::Starting { segment } => format!("Audio: starting segment {segment:03}"),
             Self::Recording { segment } => format!("Audio: recording segment {segment:03}"),
+            Self::RecordingWithoutMic { segment } => {
+                format!("Audio: recording segment {segment:03} without your mic")
+            }
             Self::Restarting => "Audio: the helper stopped, restarting".to_owned(),
             Self::Failing => "Audio: recording failed, retrying".to_owned(),
+            Self::Sleeping => "Audio: paused while the Mac sleeps".to_owned(),
             Self::StoppedByUser => "Audio: stopped by you".to_owned(),
         }
     }
@@ -93,6 +115,8 @@ pub(crate) struct AudioCapture {
     /// Taken once, by `start`.
     stop_change_receiver: Mutex<Option<mpsc::UnboundedReceiver<PathBuf>>>,
     states: Mutex<HashMap<PathBuf, AudioState>>,
+    /// The last state the helper read for each permission.
+    permissions: Mutex<HashMap<PermissionService, PermissionState>>,
 }
 
 impl AudioCapture {
@@ -102,7 +126,53 @@ impl AudioCapture {
             stop_changes,
             stop_change_receiver: Mutex::new(Some(stop_change_receiver)),
             states: Mutex::new(HashMap::new()),
+            permissions: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The permissions recording needs that macOS refuses.
+    pub fn refused_permissions(&self) -> Vec<PermissionService> {
+        let permissions = self
+            .permissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut refused: Vec<PermissionService> = permissions
+            .iter()
+            .filter(|(_, state)| is_refused(**state))
+            .map(|(service, _)| *service)
+            .collect();
+        refused.sort_by_key(|service| permission_name(*service));
+        refused
+    }
+
+    /// Records a permission state. Notifies once when a permission becomes refused, and
+    /// refreshes the tray on any change.
+    fn set_permission(&self, app: &AppHandle, service: PermissionService, state: PermissionState) {
+        let previous = self
+            .permissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(service, state);
+        if previous == Some(state) {
+            return;
+        }
+        tracing::info!(
+            permission.service = %service,
+            permission.state = %state,
+            "permission state changed"
+        );
+        if is_refused(state) && !previous.is_some_and(is_refused) {
+            crate::notify(
+                app,
+                "Recording needs a permission",
+                &format!(
+                    "macOS refuses Meeting Capture {}. Allow it in System Settings, Privacy & \
+                     Security.",
+                    permission_name(service)
+                ),
+            );
+        }
+        crate::tray::show_call_status(app);
     }
 
     /// The audio state of each open call that has one.
@@ -112,15 +182,22 @@ impl AudioCapture {
 
     /// Whether any call has its stems open.
     pub fn is_recording(&self) -> bool {
-        self.lock()
-            .values()
-            .any(|state| matches!(state, AudioState::Recording { .. }))
+        self.lock().values().any(|state| {
+            matches!(
+                state,
+                AudioState::Recording { .. } | AudioState::RecordingWithoutMic { .. }
+            )
+        })
     }
 
-    pub fn is_failing(&self) -> bool {
-        self.lock()
-            .values()
-            .any(|state| matches!(state, AudioState::Failing))
+    /// Whether any call fails to record, or records without the user's mic.
+    pub fn has_problem(&self) -> bool {
+        self.lock().values().any(|state| {
+            matches!(
+                state,
+                AudioState::Failing | AudioState::RecordingWithoutMic { .. }
+            )
+        })
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, AudioState>> {
@@ -137,8 +214,32 @@ impl AudioCapture {
             previous != state
         };
         if is_changed {
+            tracing::info!(
+                call.id = %call_id.display(),
+                audio.state = state.map(AudioState::label),
+                "audio state changed"
+            );
             crate::tray::show_call_status(app);
         }
+    }
+}
+
+/// Denied, or blocked by a profile. Not yet asked and unreadable are no problem to show: the
+/// first open asks, and an unreadable state may well be granted.
+fn is_refused(state: PermissionState) -> bool {
+    match state {
+        PermissionState::Denied | PermissionState::Restricted => true,
+        PermissionState::Granted | PermissionState::NotDetermined | PermissionState::Unknown => {
+            false
+        }
+    }
+}
+
+/// The permission as System Settings names it.
+pub(crate) fn permission_name(service: PermissionService) -> &'static str {
+    match service {
+        PermissionService::Microphone => "the microphone",
+        PermissionService::AudioCapture => "system audio recording",
     }
 }
 
@@ -477,6 +578,22 @@ enum ReportSign {
     Closed,
     /// A device did not open. Restarts back off further.
     DeviceOpenFailed,
+    Permission {
+        service: PermissionService,
+        state: PermissionState,
+    },
+    /// The mic is gone and no safe input is left; the mic stem records a gap.
+    MicUnavailable {
+        segment: u32,
+    },
+    /// The mic moved to another device, which ends a time without one.
+    MicChanged {
+        segment: u32,
+    },
+    /// The Mac is about to sleep. Any open segment is already closed.
+    Asleep,
+    /// The Mac woke. The process waits for the next `start`.
+    Woke,
     /// Nothing the supervisor acts on.
     Logged,
 }
@@ -517,6 +634,13 @@ impl CaptureProcess for AudioProcess {
             platform: match call.platform {
                 CallPlatform::Meet => Platform::Meet,
                 CallPlatform::SlackHuddle => Platform::Slack,
+            },
+            // Segment 1 is the call's start. A later one follows a wake, a rotation, a resume
+            // or a helper restart, when a Bluetooth headset may be in the call already.
+            mic_moment: if segment == 1 {
+                MicMoment::CallStart
+            } else {
+                MicMoment::MidCall
             },
         }
     }
@@ -561,7 +685,26 @@ impl CaptureProcess for AudioProcess {
                 kind: AudioErrorKind::DeviceOpenFailed,
                 ..
             } => ReportSign::DeviceOpenFailed,
-            AudioReport::Gap { .. } | AudioReport::Error { .. } => ReportSign::Logged,
+            AudioReport::Permission { service, state } => ReportSign::Permission {
+                service: *service,
+                state: *state,
+            },
+            AudioReport::SystemSleep { .. } => ReportSign::Asleep,
+            AudioReport::SystemWake => ReportSign::Woke,
+            AudioReport::MicUnavailable { segment, .. } => {
+                ReportSign::MicUnavailable { segment: *segment }
+            }
+            AudioReport::DeviceChanged {
+                segment,
+                stream: Stem::Mic,
+                ..
+            } => ReportSign::MicChanged { segment: *segment },
+            AudioReport::Gap { .. }
+            | AudioReport::DeviceChanged {
+                stream: Stem::Remote,
+                ..
+            }
+            | AudioReport::Error { .. } => ReportSign::Logged,
         }
     }
 
@@ -570,6 +713,23 @@ impl CaptureProcess for AudioProcess {
             .audio_capture
             .set_state(app, call_id, state);
     }
+}
+
+fn log_mic_unavailable(
+    call_id: &str,
+    segment: u32,
+    old_device: Option<&str>,
+    cause: Option<DeviceChangeCause>,
+    message: &str,
+) {
+    tracing::warn!(
+        call.id = call_id,
+        segment.number = segment,
+        audio.previous_device = old_device,
+        audio.change_cause = cause.map(|cause| cause.to_string()),
+        exception.message = message,
+        "audio mic unavailable"
+    );
 }
 
 fn log_audio_report(call_id: &Path, report: &AudioReport) {
@@ -625,6 +785,41 @@ fn log_audio_report(call_id: &Path, report: &AudioReport) {
             segment.number = segment,
             "audio segment closed"
         ),
+        AudioReport::DeviceChanged {
+            segment,
+            stream,
+            old_device,
+            new_device,
+            rate_hz,
+            cause,
+        } => tracing::info!(
+            call.id = call_id,
+            segment.number = segment,
+            audio.stream = %stream,
+            audio.previous_device = old_device.as_deref(),
+            audio.device = new_device,
+            audio.rate_hz = rate_hz,
+            audio.change_cause = %cause,
+            "audio device changed"
+        ),
+        AudioReport::MicUnavailable {
+            segment,
+            old_device,
+            cause,
+            message,
+        } => log_mic_unavailable(&call_id, *segment, old_device.as_deref(), *cause, message),
+        AudioReport::Permission { service, state } => tracing::info!(
+            call.id = call_id,
+            permission.service = %service,
+            permission.state = %state,
+            "permission checked"
+        ),
+        AudioReport::SystemSleep { segment } => tracing::info!(
+            call.id = call_id,
+            segment.number = segment,
+            "the Mac is going to sleep"
+        ),
+        AudioReport::SystemWake => tracing::info!(call.id = call_id, "the Mac woke"),
         AudioReport::Error { kind, message } => tracing::error!(
             call.id = call_id,
             error.type = %kind,
@@ -700,9 +895,26 @@ impl<P: CaptureProcess> Recording<P> {
                 AudioState::Restarting
             };
             P::show_state(&self.app, &self.call.id, Some(state));
+            // A device that would not open may come back, as a headset that reconnects: a
+            // device change ends the long wait early.
+            let is_device_watched =
+                cfg!(target_os = "macos") && is_device_open_failed && restart.is_failing;
+            let device_changed = async {
+                if is_device_watched && await_device_change(restart.delay).await {
+                    tokio::time::sleep(DEVICE_CHANGE_SETTLE).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            };
             // Stopping and resuming the call starts a new recording at once.
             tokio::select! {
                 () = tokio::time::sleep(restart.delay) => {}
+                () = device_changed => {
+                    tracing::info!(
+                        call.id = %self.call.id.display(),
+                        "a device changed; restarting early"
+                    );
+                }
                 _ = &mut stop => return,
             }
             // A run that left no files gives its number to the next.
@@ -722,14 +934,18 @@ impl<P: CaptureProcess> Recording<P> {
             Err(reason) => return failed(reason),
         };
         let pid = child.id().unwrap_or_default();
-        let mut stdin = Some(stdin);
         let mut reports = BufReader::new(stdout).lines();
-        let mut liveness = Liveness::new(self.segment);
+        let mut run = ProcessRun {
+            stdin: Some(stdin),
+            liveness: Liveness::new(self.segment),
+            open_segment: Some(self.segment),
+            has_closed_segment: false,
+            is_device_open_failed: false,
+            next_command_seq: 2,
+        };
         let mut check = tokio::time::interval(LIVENESS_CHECK_INTERVAL);
         check.tick().await;
         let mut stop_deadline: Option<tokio::time::Instant> = None;
-        let mut has_closed_segment = false;
-        let mut is_device_open_failed = false;
         loop {
             // A future that never ends until a stop sets the deadline.
             let stop_limit = async {
@@ -740,28 +956,28 @@ impl<P: CaptureProcess> Recording<P> {
             };
             tokio::select! {
                 line = reports.next_line() => match line {
-                    Ok(Some(line)) => match self.take_report(&line, &mut liveness) {
-                        Some(ReportSign::Closed) => has_closed_segment = true,
-                        Some(ReportSign::DeviceOpenFailed) => is_device_open_failed = true,
-                        Some(
-                            ReportSign::Recording { .. }
-                            | ReportSign::Progress { .. }
-                            | ReportSign::Rotated { .. }
-                            | ReportSign::Logged,
-                        )
-                        | None => {}
-                    },
+                    Ok(Some(line)) => {
+                        if let Err(error) = self.follow_report(&line, &mut run).await {
+                            kill(&mut child).await;
+                            return failed(format!("could not send start after a wake: {error}"));
+                        }
+                    }
                     Ok(None) => {
                         let Some(deadline) = stop_deadline else {
                             let status = child.wait().await;
                             log_exit(pid, status.as_ref());
                             return ProcessEnd::Failed {
                                 reason: exit_reason(status.as_ref()),
-                                is_device_open_failed,
+                                is_device_open_failed: run.is_device_open_failed,
                             };
                         };
-                        Self::wait_stopped(self.segment, &mut child, deadline, has_closed_segment)
-                            .await;
+                        Self::wait_stopped(
+                            self.segment,
+                            &mut child,
+                            deadline,
+                            run.has_closed_segment,
+                        )
+                        .await;
                         return ProcessEnd::Stopped;
                     }
                     Err(error) => {
@@ -773,17 +989,7 @@ impl<P: CaptureProcess> Recording<P> {
                     }
                 },
                 _ = &mut *stop, if stop_deadline.is_none() => {
-                    if let Some(mut open_stdin) = stdin.take() {
-                        let sent = send_command(&mut open_stdin, 2, &P::stop_command()).await;
-                        if let Err(error) = sent {
-                            tracing::warn!(
-                                exception.message = %error,
-                                "could not send stop; closing stdin"
-                            );
-                        }
-                        // Dropping stdin closes it: after the segment closes, the process exits.
-                        drop(open_stdin);
-                    }
+                    run.send_stop::<P>().await;
                     stop_deadline = Some(tokio::time::Instant::now() + STOP_LIMIT);
                 }
                 () = stop_limit => {
@@ -794,9 +1000,10 @@ impl<P: CaptureProcess> Recording<P> {
                     kill(&mut child).await;
                     return ProcessEnd::Stopped;
                 }
-                _ = check.tick(), if stop_deadline.is_none() => {
-                    let files = P::segment_files(&self.folder, liveness.segment);
-                    if liveness.is_hung(&files) {
+                // Nothing grows while the process waits for a wake.
+                _ = check.tick(), if stop_deadline.is_none() && run.open_segment.is_some() => {
+                    let files = P::segment_files(&self.folder, run.liveness.segment);
+                    if run.liveness.is_hung(&files) {
                         kill(&mut child).await;
                         return failed(format!(
                             "hung: no counter moved and no file grew for {} s",
@@ -902,7 +1109,7 @@ impl<P: CaptureProcess> Recording<P> {
                 P::show_state(
                     &self.app,
                     &self.call.id,
-                    Some(AudioState::Recording { segment }),
+                    Some(self.recording_state(segment, false)),
                 );
             }
             ReportSign::Progress {
@@ -915,14 +1122,151 @@ impl<P: CaptureProcess> Recording<P> {
                 P::show_state(
                     &self.app,
                     &self.call.id,
-                    Some(AudioState::Recording {
-                        segment: to_segment,
-                    }),
+                    Some(self.recording_state(to_segment, true)),
                 );
             }
-            ReportSign::Closed | ReportSign::DeviceOpenFailed | ReportSign::Logged => {}
+            ReportSign::Permission { service, state } => self
+                .app
+                .state::<AppState>()
+                .audio_capture
+                .set_permission(&self.app, service, state),
+            ReportSign::Asleep => {
+                P::show_state(&self.app, &self.call.id, Some(AudioState::Sleeping));
+            }
+            ReportSign::MicUnavailable { segment } => P::show_state(
+                &self.app,
+                &self.call.id,
+                Some(AudioState::RecordingWithoutMic { segment }),
+            ),
+            ReportSign::MicChanged { segment } => P::show_state(
+                &self.app,
+                &self.call.id,
+                Some(AudioState::Recording { segment }),
+            ),
+            ReportSign::Closed
+            | ReportSign::DeviceOpenFailed
+            | ReportSign::Woke
+            | ReportSign::Logged => {}
         }
         Some(sign)
+    }
+
+    /// The state for stems open in `segment`. A segment that recorded without the user's mic
+    /// stays so when its remote stem starts, and across a rotation, until the mic returns.
+    fn recording_state(&self, segment: u32, is_rotation: bool) -> AudioState {
+        let shown = self
+            .app
+            .state::<AppState>()
+            .audio_capture
+            .states()
+            .get(&self.call.id)
+            .copied();
+        let is_without_mic = matches!(
+            shown,
+            Some(AudioState::RecordingWithoutMic { segment: shown_segment })
+                if is_rotation || shown_segment == segment
+        );
+        if is_without_mic {
+            AudioState::RecordingWithoutMic { segment }
+        } else {
+            AudioState::Recording { segment }
+        }
+    }
+
+    /// Takes one report line into the run. Fails only when a wake's `start` cannot be sent.
+    async fn follow_report(&mut self, line: &str, run: &mut ProcessRun) -> std::io::Result<()> {
+        match self.take_report(line, &mut run.liveness) {
+            Some(ReportSign::Closed) => {
+                run.has_closed_segment = true;
+                run.open_segment = None;
+            }
+            Some(ReportSign::DeviceOpenFailed) => run.is_device_open_failed = true,
+            Some(
+                ReportSign::Recording { segment }
+                | ReportSign::Rotated {
+                    to_segment: segment,
+                },
+            ) => run.open_segment = Some(segment),
+            // stdin is gone once a stop went out: then the wake starts nothing.
+            Some(ReportSign::Woke) if run.open_segment.is_none() => {
+                if let Some(stdin) = run.stdin.as_mut() {
+                    let segment = self.next_segment_after_sleep();
+                    let start = P::start_command(&self.call, &self.folder, segment);
+                    send_command(stdin, run.next_command_seq, &start).await?;
+                    tracing::info!(
+                        segment.number = segment,
+                        "started the next segment after a wake"
+                    );
+                    run.next_command_seq += 1;
+                    run.open_segment = Some(segment);
+                    run.has_closed_segment = false;
+                    run.liveness = Liveness::new(segment);
+                    self.segment = segment;
+                    P::show_state(
+                        &self.app,
+                        &self.call.id,
+                        Some(AudioState::Starting { segment }),
+                    );
+                }
+            }
+            Some(
+                ReportSign::Progress { .. }
+                | ReportSign::Permission { .. }
+                | ReportSign::MicUnavailable { .. }
+                | ReportSign::MicChanged { .. }
+                | ReportSign::Asleep
+                | ReportSign::Woke
+                | ReportSign::Logged,
+            )
+            | None => {}
+        }
+        Ok(())
+    }
+
+    /// The call's next segment number after a sleep closed this one. Every capture process of
+    /// the call shares the number, so it comes from all their files.
+    fn next_segment_after_sleep(&self) -> u32 {
+        let after_this = self.segment + 1;
+        match next_call_segment(&self.folder) {
+            Ok(free) => after_this.max(free),
+            Err(reason) => {
+                tracing::warn!(
+                    exception.message = reason,
+                    "took the segment after this one"
+                );
+                after_this
+            }
+        }
+    }
+}
+
+/// What one run of the process has done so far.
+struct ProcessRun {
+    /// `None` once a stop went out.
+    stdin: Option<ChildStdin>,
+    liveness: Liveness,
+    /// `None` between a sleep's close and the next start: the process waits for the wake.
+    open_segment: Option<u32>,
+    has_closed_segment: bool,
+    is_device_open_failed: bool,
+    /// `start` went out as 1.
+    next_command_seq: u64,
+}
+
+impl ProcessRun {
+    /// Sends `stop` to an open segment, then closes stdin: after the segment closes, the
+    /// process exits. With no segment open, closing stdin alone ends it.
+    async fn send_stop<P: CaptureProcess>(&mut self) {
+        let Some(mut stdin) = self.stdin.take() else {
+            return;
+        };
+        if self.open_segment.is_some()
+            && let Err(error) =
+                send_command(&mut stdin, self.next_command_seq, &P::stop_command()).await
+        {
+            tracing::warn!(exception.message = %error, "could not send stop; closing stdin");
+        }
+        drop(stdin);
     }
 }
 
@@ -1013,6 +1357,52 @@ fn sidecar_path() -> Result<PathBuf, String> {
             "{} is missing; build it with `cargo build -p mc-capture`",
             helper.display()
         ))
+    }
+}
+
+/// Waits up to `limit` for the default devices or the device list to change, through the
+/// helper's `await-device-change`, so the app links no Core Audio. False when the time ran
+/// out or the helper could not watch.
+async fn await_device_change(limit: Duration) -> bool {
+    #[derive(serde::Deserialize)]
+    struct AwaitedChange {
+        changed: bool,
+    }
+    let helper = match sidecar_path() {
+        Ok(helper) => helper,
+        Err(reason) => {
+            tracing::warn!(
+                exception.message = reason,
+                "could not watch for device changes"
+            );
+            return false;
+        }
+    };
+    let output = Command::new(&helper)
+        .arg("await-device-change")
+        .arg("--seconds")
+        .arg(limit.as_secs().to_string())
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => {
+            serde_json::from_slice::<AwaitedChange>(&output.stdout)
+                .is_ok_and(|awaited| awaited.changed)
+        }
+        Ok(output) => {
+            tracing::warn!(
+                process.exit.code = output.status.code(),
+                "the device watch ended with an error"
+            );
+            false
+        }
+        Err(error) => {
+            tracing::warn!(exception.message = %error, "could not start the device watch");
+            false
+        }
     }
 }
 

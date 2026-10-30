@@ -1,6 +1,8 @@
 pub mod clock;
 pub mod hal;
+pub mod permission;
 pub mod power;
+pub mod sleep;
 pub mod tap;
 
 use crate::CaptureError;

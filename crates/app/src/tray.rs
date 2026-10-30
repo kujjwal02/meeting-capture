@@ -23,6 +23,7 @@ use crate::audio_capture::AudioState;
 use crate::call_status::{BoardView, CallState, CallView, Moment, TrayLook, display_time_zone};
 use crate::launch::{LaunchTarget, launch};
 use crate::{AppState, meetings, updates};
+use capture_protocol::PermissionService;
 
 const TRAY_ID: &str = "main";
 const TOOLTIP_HEADING: &str = "Meeting Capture";
@@ -52,6 +53,7 @@ enum MenuAction {
     ResumeRecording(PathBuf),
     RetryFailed,
     OpenAccessibilitySettings,
+    OpenPrivacySettings(PermissionService),
     InstallUpdate,
     CheckForUpdates,
     InstallMeetExtension,
@@ -75,6 +77,7 @@ impl MenuAction {
             }
             MenuAction::RetryFailed => "retry-failed".to_owned(),
             MenuAction::OpenAccessibilitySettings => "open-accessibility-settings".to_owned(),
+            MenuAction::OpenPrivacySettings(service) => format!("open-privacy-settings:{service}"),
             MenuAction::InstallUpdate => "install-update".to_owned(),
             MenuAction::CheckForUpdates => "check-for-updates".to_owned(),
             MenuAction::InstallMeetExtension => "install-meet-extension".to_owned(),
@@ -107,6 +110,8 @@ impl MenuAction {
         [
             MenuAction::RetryFailed,
             MenuAction::OpenAccessibilitySettings,
+            MenuAction::OpenPrivacySettings(PermissionService::Microphone),
+            MenuAction::OpenPrivacySettings(PermissionService::AudioCapture),
             MenuAction::InstallUpdate,
             MenuAction::CheckForUpdates,
             MenuAction::InstallMeetExtension,
@@ -298,7 +303,7 @@ pub(crate) fn refresh(app: &AppHandle) {
 // The icon follows the worst call state, and the tooltip carries each call's status line.
 fn show_look(app: &AppHandle, tray: &TrayIcon, view: &BoardView) -> tauri::Result<()> {
     let audio = &app.state::<AppState>().audio_capture;
-    let look = if audio.is_failing() {
+    let look = if audio.has_problem() || !audio.refused_permissions().is_empty() {
         TrayLook::Problem
     } else {
         match view.tray_look() {
@@ -315,6 +320,9 @@ fn show_look(app: &AppHandle, tray: &TrayIcon, view: &BoardView) -> tauri::Resul
     let mut tooltip = vec![TOOLTIP_HEADING.to_owned()];
     if view.is_huddle_permission_missing {
         tooltip.push(HUDDLE_PERMISSION_LINE.to_owned());
+    }
+    for service in audio.refused_permissions() {
+        tooltip.push(recording_permission_line(service));
     }
     let audio_states = audio.states();
     for call in &view.calls {
@@ -390,6 +398,14 @@ fn compose_menu(app: &AppHandle, view: &BoardView) -> tauri::Result<Menu<Wry>> {
             true,
         )?)?;
     }
+    for service in state.audio_capture.refused_permissions() {
+        menu.append(&action_entry(
+            app,
+            &MenuAction::OpenPrivacySettings(service),
+            &recording_permission_line(service),
+            true,
+        )?)?;
+    }
     append_browser_call_status(app, &menu, &state)?;
     append_calls(app, &menu, &state, view)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -450,6 +466,13 @@ fn compose_menu(app: &AppHandle, view: &BoardView) -> tauri::Result<Menu<Wry>> {
 }
 
 const HUDDLE_PERMISSION_LINE: &str = "Slack huddles: allow Accessibility to read captions";
+
+fn recording_permission_line(service: PermissionService) -> String {
+    format!(
+        "Recording: allow {}",
+        crate::audio_capture::permission_name(service)
+    )
+}
 
 // One line for the extension.
 fn append_browser_call_status(
@@ -699,6 +722,24 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
             if let Err(error) = app.opener().open_url(ACCESSIBILITY_PANE, None::<&str>) {
                 tracing::error!(exception.message = %error, "could not open the Accessibility settings");
+            }
+        }
+        MenuAction::OpenPrivacySettings(service) => {
+            let pane = match service {
+                PermissionService::Microphone => {
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+                }
+                // "Screen & System Audio Recording" holds "System Audio Recording Only".
+                PermissionService::AudioCapture => {
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+                }
+            };
+            if let Err(error) = app.opener().open_url(pane, None::<&str>) {
+                tracing::error!(
+                    exception.message = %error,
+                    permission.service = %service,
+                    "could not open the privacy settings"
+                );
             }
         }
         MenuAction::InstallUpdate => {
