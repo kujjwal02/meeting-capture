@@ -2,10 +2,14 @@
 //! tray down. `audio` is the process the app supervises: commands on stdin, reports on stdout.
 //! `probe` records the stems at their native rates and reports what the devices did; `record`
 //! writes one segment of a call folder through the stem writer; `devices` lists the Core Audio
-//! devices.
+//! devices; `await-device-change` exits on the first device change.
 
 #[cfg(target_os = "macos")]
 mod audio;
+#[cfg(target_os = "macos")]
+mod devices;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod inject;
 #[cfg(target_os = "macos")]
 mod probe;
 #[cfg(target_os = "macos")]
@@ -24,6 +28,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 enum LineKind {
     Status,
     Summary,
+    DeviceChanged,
+    MicUnavailable,
+    Permission,
+    SystemSleep,
+    SystemWake,
 }
 
 #[derive(Parser)]
@@ -75,6 +84,13 @@ enum Command {
     Devices {
         #[arg(long, value_enum, default_value_t = MicChoice::AvoidBluetooth)]
         mic: MicChoice,
+    },
+    /// Wait until the default input, the default output or the device list changes, or the
+    /// time runs out. Prints `{"changed":true}` or `{"changed":false}`. The app runs it while
+    /// it backs off after a device failed to open, so a new device ends the wait early.
+    AwaitDeviceChange {
+        #[arg(long, default_value_t = 300)]
+        seconds: u64,
     },
 }
 
@@ -140,6 +156,15 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("record needs system audio, which only macOS has yet")
             }
         }
+        Command::AwaitDeviceChange { seconds } => {
+            #[cfg(target_os = "macos")]
+            return await_device_change(Duration::from_secs(seconds));
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = seconds;
+                anyhow::bail!("await-device-change watches Core Audio on macOS only")
+            }
+        }
         Command::Devices { mic } => {
             #[cfg(target_os = "macos")]
             return print_devices(mic.rule());
@@ -184,8 +209,34 @@ fn print_devices(rule: capture::MicRule) -> anyhow::Result<()> {
     }
     let report = DeviceReport {
         devices: capture::hal_devices()?,
-        mic_pick: capture::mic_pick(rule)?,
+        mic_pick: capture::mic_pick(&capture::MicRequest::call_start(rule))?,
     };
     println!("{}", serde_json::to_string(&report)?);
+    Ok(())
+}
+
+/// Reads the listeners' flag, which only a HAL callback sets, so the HAL is not polled.
+#[cfg(target_os = "macos")]
+fn await_device_change(limit: Duration) -> anyhow::Result<()> {
+    const CHECK_INTERVAL: Duration = Duration::from_millis(100);
+    capture::watch_hal_changes()?;
+    let started = std::time::Instant::now();
+    let is_changed = loop {
+        let changes = capture::take_hal_changes();
+        if changes.any() {
+            tracing::info!(
+                hal.default_input_changed = changes.default_input,
+                hal.default_output_changed = changes.default_output,
+                hal.device_list_changed = changes.device_list,
+                "device.changed"
+            );
+            break true;
+        }
+        if started.elapsed() >= limit {
+            break false;
+        }
+        std::thread::sleep(CHECK_INTERVAL);
+    };
+    println!("{}", serde_json::json!({ "changed": is_changed }));
     Ok(())
 }

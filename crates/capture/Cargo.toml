@@ -18,8 +18,9 @@ tracing.workspace = true
 cidre.workspace = true
 
 # The workspace forbids unsafe code, and `forbid` cannot be lowered per module. The tap reads Core
-# Audio buffers through raw pointers, so this crate denies unsafe code and allows it in
-# `mac::tap` alone.
+# Audio buffers through raw pointers, the permission check calls a dlopen-ed function and the
+# sleep watcher calls IOKit, so this crate denies unsafe code and allows it in `mac::tap`,
+# `mac::permission` and `mac::sleep` alone.
 [lints.rust]
 unsafe_code = "deny"
 

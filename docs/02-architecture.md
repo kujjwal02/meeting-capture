@@ -139,8 +139,9 @@ The app tracks each open Meet call and huddle in one status board
   its caption channels as the source: mc-meet hides Meet's captions only after a caption arrived
   on them, and they keep streaming.
 - The tray icon is a grey dot when idle, red while recording and amber at a problem or a missing
-  huddle permission. Audio that records turns an idle dot red. Audio that keeps failing turns it
-  amber.
+  huddle permission. Audio that records turns an idle dot red. Audio that keeps failing, a call
+  recording without the user's mic, or a refused microphone or system audio permission, turns
+  it amber.
 - On macOS only, each open call has an audio row. Each open call has "Stop recording this call".
   A stopped call shows "Resume recording" instead. The tooltip and the menu hold one status line
   per call, with times in the settings time zone. "Recent calls" lists the last 5 calls that

@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use crate::mac::tap::RemoteSource;
-use crate::mic::MicSource;
-use crate::{CaptureError, MicRule, Stem, StemReader};
+use crate::mic::MicStream;
+use crate::{CaptureError, MicRequest, Stem, StemReader};
 
 /// The longest any one device open may take. A hung HAL call must not hang the helper.
 const OPEN_LIMIT: Duration = Duration::from_secs(5);
@@ -22,7 +22,8 @@ static REMOTE_OPEN_PENDING: AtomicBool = AtomicBool::new(false);
 ///
 /// Teardown: `stop_callbacks`, then drain both readers, then drop.
 pub struct CallAudioSource {
-    mic: MicSource,
+    /// `None` while no safe input exists: the call records its remote audio alone.
+    mic: Option<MicStream>,
     #[cfg(target_os = "macos")]
     remote: Option<RemoteSource>,
 }
@@ -34,7 +35,9 @@ pub struct OpenedStem {
 }
 
 pub struct CallReaders {
-    pub mic: OpenedStem,
+    /// `Err` with `CaptureError::NoSafeMicrophone` when the rule allows no input mid-call. The
+    /// tap still opens.
+    pub mic: Result<OpenedStem, CaptureError>,
     /// `None` where no system audio source exists yet: on Windows until phase 5.
     pub remote: Option<OpenedStem>,
 }
@@ -49,7 +52,7 @@ impl CallAudioSource {
     /// Fails when a device does not open, an open takes longer than 5 s, or an earlier open of
     /// the same stem has not returned.
     pub fn open(
-        rule: MicRule,
+        request: MicRequest,
         mut while_waiting: impl FnMut(&mut StemReader),
     ) -> Result<(Self, CallReaders), CaptureError> {
         let opening = Instant::now();
@@ -57,14 +60,21 @@ impl CallAudioSource {
             not(target_os = "macos"),
             allow(unused_mut, reason = "only the tap open drains the mic reader")
         )]
-        let (mic, mut mic_reader) = open_timed(Stem::Mic, move || MicSource::start(rule), || {})?;
+        let (mic, mut mic_reader) =
+            match open_timed(Stem::Mic, move || MicStream::start(&request), || {}) {
+                Ok((mic, reader)) => (Some(mic), Ok(reader)),
+                Err(error @ CaptureError::NoSafeMicrophone { .. }) => (None, Err(error)),
+                Err(error) => return Err(error),
+            };
         let mic_open_duration = opening.elapsed();
 
         #[cfg(target_os = "macos")]
         let (source, remote) = {
             let opening = Instant::now();
             let (remote, remote_reader) = open_timed(Stem::Remote, RemoteSource::start, || {
-                while_waiting(&mut mic_reader);
+                if let Ok(mic_reader) = mic_reader.as_mut() {
+                    while_waiting(mic_reader);
+                }
             })?;
             let source = Self {
                 mic,
@@ -83,10 +93,10 @@ impl CallAudioSource {
         };
 
         let readers = CallReaders {
-            mic: OpenedStem {
-                reader: mic_reader,
+            mic: mic_reader.map(|reader| OpenedStem {
+                reader,
                 open_duration: mic_open_duration,
-            },
+            }),
             remote,
         };
         Ok((source, readers))
@@ -98,10 +108,100 @@ impl CallAudioSource {
         self.remote.as_ref()
     }
 
+    #[cfg(target_os = "macos")]
+    pub fn remote_mut(&mut self) -> Option<&mut RemoteSource> {
+        self.remote.as_mut()
+    }
+
+    /// The mic stream that records now, if any.
+    #[must_use]
+    pub fn mic(&self) -> Option<&MicStream> {
+        self.mic.as_ref()
+    }
+
+    /// Opens a second mic stream beside the one recording, with the same 5 s limit. The caller
+    /// drains both until the new one delivers sound, then hands it to `replace_mic`: the swap
+    /// is make-before-break. `while_waiting` runs about every 20 ms during the open, so the
+    /// running stems can be drained.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the device does not open, the open takes longer than 5 s, or an earlier mic
+    /// open has not returned.
+    pub fn open_mic(
+        request: MicRequest,
+        while_waiting: impl FnMut(),
+    ) -> Result<(MicStream, OpenedStem), CaptureError> {
+        let opening = Instant::now();
+        let (mic, reader) =
+            open_timed(Stem::Mic, move || MicStream::start(&request), while_waiting)?;
+        Ok((
+            mic,
+            OpenedStem {
+                reader,
+                open_duration: opening.elapsed(),
+            },
+        ))
+    }
+
+    /// Stops the recording mic stream's callbacks. Its reader keeps what they delivered, so a
+    /// swap can drain the old stream to its end before `replace_mic`.
+    pub fn stop_mic(&mut self) {
+        if let Some(mic) = self.mic.as_mut() {
+            mic.stop();
+        }
+    }
+
+    /// Records from `next` instead. Call `stop_mic` and drain the old stream's reader first;
+    /// dropping the old stream here releases its device.
+    pub fn replace_mic(&mut self, next: MicStream) {
+        self.mic = Some(next);
+    }
+
+    /// Releases the mic, so the call records its remote audio alone. Call `stop_mic` and drain
+    /// its reader first.
+    pub fn close_mic(&mut self) {
+        self.mic = None;
+    }
+
+    /// Stops the tap and releases its aggregate device and the tap, in teardown order. Its
+    /// reader keeps every sample the tap delivered.
+    #[cfg(target_os = "macos")]
+    pub fn close_remote(&mut self) {
+        if let Some(mut remote) = self.remote.take() {
+            remote.stop_callbacks();
+            drop(remote);
+        }
+    }
+
+    /// Opens a new tap after `close_remote`, with the same 5 s limit. `while_waiting` runs about
+    /// every 20 ms during the open.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the tap does not open, the open takes longer than 5 s, or an earlier tap
+    /// open has not returned.
+    #[cfg(target_os = "macos")]
+    pub fn reopen_remote(
+        &mut self,
+        while_waiting: impl FnMut(),
+    ) -> Result<OpenedStem, CaptureError> {
+        if self.remote.is_some() {
+            return Err(CaptureError::AlreadyOpen { stem: Stem::Remote });
+        }
+        let opening = Instant::now();
+        let (remote, reader) = open_timed(Stem::Remote, RemoteSource::start, while_waiting)?;
+        self.remote = Some(remote);
+        Ok(OpenedStem {
+            reader,
+            open_duration: opening.elapsed(),
+        })
+    }
+
     /// Stops every callback. The readers then hold all the audio the devices delivered; drain
     /// them before dropping this, which releases the aggregate device and the tap.
     pub fn stop_callbacks(&mut self) {
-        self.mic.stop();
+        self.stop_mic();
         #[cfg(target_os = "macos")]
         if let Some(remote) = self.remote.as_mut() {
             remote.stop_callbacks();

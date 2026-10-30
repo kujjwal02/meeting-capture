@@ -1,22 +1,35 @@
 //! `mc-capture audio`: the process the app supervises. It reads commands from stdin and writes
 //! reports to stdout, one JSON line each, in the `capture-protocol` shapes. stdout carries
 //! nothing else; logs go to stderr. Closing stdin stops the segment, then the process exits.
-//! Closing stdin stops within 1 s once its devices are open.
+//! Closing stdin stops within 1 s once its devices are open. A sleep closes the segment and
+//! reports `system_sleep`; on wake the process reports `system_wake` and waits for the app's
+//! next `start`, since the app owns the call's segment numbers.
 
+use std::collections::HashMap;
 use std::io::{BufRead as _, Write as _};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::Context as _;
-use capture::{CaptureError, Stem};
-use capture_protocol::{AudioCommand, AudioErrorKind, AudioReport};
+use capture::{CaptureError, PermissionService, PermissionState, PowerEvent, Stem};
+use capture_protocol::{AudioCommand, AudioErrorKind, AudioReport, DeviceChangeCause};
 use stem_writer::SegmentEvent;
 
 use crate::MicChoice;
-use crate::record::{LiveSegment, SegmentError, SegmentObserver, SegmentRequest, StemStart};
+use crate::record::{
+    DeviceChange, LiveSegment, LoopControl, SegmentEnd, SegmentError, SegmentObserver,
+    SegmentRequest, StemStart,
+};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// What reaches the serving loop: commands from stdin, its close, and power events.
+enum HelperInput {
+    Command(AudioCommand),
+    StdinClosed,
+    Power(PowerEvent),
+}
 
 /// Numbers and writes report lines. The stdin thread and the recording loop share it.
 #[derive(Clone)]
@@ -48,23 +61,58 @@ impl ReportWriter {
     }
 }
 
+/// Permission states this process reported, so a check that finds nothing new stays quiet.
+#[derive(Default)]
+struct ReportedPermissions {
+    states: HashMap<PermissionService, PermissionState>,
+}
+
+impl ReportedPermissions {
+    fn report(
+        &mut self,
+        writer: &ReportWriter,
+        service: PermissionService,
+        state: PermissionState,
+    ) -> anyhow::Result<()> {
+        if self.states.insert(service, state) == Some(state) {
+            return Ok(());
+        }
+        writer.send(&AudioReport::Permission { service, state })
+    }
+}
+
 /// Serves commands until stdin closes. Returns an error, and so exits non-zero, when a segment
 /// fails: the app then restarts the process with the next segment number.
 pub(crate) fn serve(mic: MicChoice) -> anyhow::Result<()> {
     let writer = ReportWriter::new();
-    let (sender, commands) = mpsc::channel();
+    let (sender, inputs) = mpsc::channel();
+    let power_sender = sender.clone();
+    let on_power = move |event| {
+        // The receiver is gone only when the process is ending.
+        let _unheard = power_sender.send(HelperInput::Power(event));
+    };
+    if let Err(error) = crate::record::watch_devices_and_power(on_power) {
+        writer.error(AudioErrorKind::WatchFailed, error.to_string())?;
+    }
     let reader_writer = writer.clone();
     std::thread::Builder::new()
         .name("stdin".to_owned())
         .spawn(move || read_commands(&sender, &reader_writer))
         .context("start the stdin thread")?;
     tracing::info!(process.pid = std::process::id(), "audio.ready");
+    let mut permissions = ReportedPermissions::default();
+    let mut idle = IdleInputs::default();
+    // The built-in mic a closed lid muted, carried to the call's next segment.
+    let mut lid_muted_uid = None;
     loop {
-        // A closed stdin with no segment open: the app is done with this process.
-        let Ok(command) = commands.recv() else {
+        let Some(command) = idle.next_command(&inputs, &writer)? else {
             return Ok(());
         };
         match command {
+            // A stop cancels a start that waits for the wake.
+            AudioCommand::Stop if idle.deferred_start.take().is_some() => {
+                tracing::info!("start.cancelled");
+            }
             AudioCommand::Stop => writer.error(
                 AudioErrorKind::BadCommand,
                 "stop arrived with no segment open".to_owned(),
@@ -74,10 +122,12 @@ pub(crate) fn serve(mic: MicChoice) -> anyhow::Result<()> {
                 folder,
                 segment,
                 platform,
+                mic_moment,
             } => {
                 let mut observer = AudioObserver {
                     writer: &writer,
-                    commands: &commands,
+                    inputs: &inputs,
+                    permissions: &mut permissions,
                     next_heartbeat: HEARTBEAT_INTERVAL,
                     is_stdin_closed: false,
                 };
@@ -87,14 +137,20 @@ pub(crate) fn serve(mic: MicChoice) -> anyhow::Result<()> {
                     call_id: &call_id,
                     platform,
                     mic,
+                    mic_moment,
+                    lid_muted_uid: lid_muted_uid.take(),
                 };
                 match crate::record::record_segment(&request, &mut observer) {
                     Ok(finished) => {
                         let number = finished.report.number;
+                        lid_muted_uid.clone_from(&finished.lid_muted_uid);
+                        idle.is_asleep = matches!(finished.end, SegmentEnd::Sleep(_));
+                        let is_stdin_closed = observer.is_stdin_closed;
                         let reported = observer
                             .segment_events(number, finished.report.events)
-                            .and_then(|()| writer.send(&AudioReport::Stopped { segment: number }));
-                        if observer.is_stdin_closed {
+                            .and_then(|()| writer.send(&AudioReport::Stopped { segment: number }))
+                            .and_then(|()| report_segment_end(&writer, number, finished.end));
+                        if is_stdin_closed {
                             // An app that quit closed stdin and stdout together.
                             if let Err(error) = reported {
                                 tracing::info!(exception.message = %error, "stop.unreported");
@@ -109,6 +165,7 @@ pub(crate) fn serve(mic: MicChoice) -> anyhow::Result<()> {
                             SegmentError::Open(_) => AudioErrorKind::DeviceOpenFailed,
                             SegmentError::Write(_) => AudioErrorKind::WriteFailed,
                             SegmentError::Close(_) => AudioErrorKind::SegmentCloseFailed,
+                            SegmentError::RebuildLimit { .. } => AudioErrorKind::TapRebuildLimit,
                             // No one reads stdout any more.
                             SegmentError::Report(_) => return Err(error.into()),
                         };
@@ -122,9 +179,75 @@ pub(crate) fn serve(mic: MicChoice) -> anyhow::Result<()> {
     }
 }
 
-/// Parses each stdin line once. A bad line is reported and skipped. The sender drops at EOF,
-/// which is how the recording loop hears that stdin closed.
-fn read_commands(sender: &mpsc::Sender<AudioCommand>, writer: &ReportWriter) {
+/// The serving loop's state between segments. Between a sleep and its wake the devices may be
+/// gone, so a start waits for the wake.
+#[derive(Default)]
+struct IdleInputs {
+    is_asleep: bool,
+    deferred_start: Option<AudioCommand>,
+}
+
+impl IdleInputs {
+    /// The next command to run, after handling power events. `None` once stdin closed.
+    fn next_command(
+        &mut self,
+        inputs: &Receiver<HelperInput>,
+        writer: &ReportWriter,
+    ) -> anyhow::Result<Option<AudioCommand>> {
+        loop {
+            if !self.is_asleep
+                && let Some(start) = self.deferred_start.take()
+            {
+                return Ok(Some(start));
+            }
+            // The power senders live as long as the process, so this never disconnects.
+            let Ok(input) = inputs.recv() else {
+                return Ok(None);
+            };
+            match input {
+                HelperInput::Command(start @ AudioCommand::Start { .. }) if self.is_asleep => {
+                    tracing::info!("start.deferred_until_wake");
+                    self.deferred_start = Some(start);
+                }
+                HelperInput::Command(command) => return Ok(Some(command)),
+                // A closed stdin with no segment open: the app is done with this process.
+                HelperInput::StdinClosed => return Ok(None),
+                HelperInput::Power(PowerEvent::WillSleep(ack)) => {
+                    tracing::info!("power.will_sleep");
+                    self.is_asleep = true;
+                    let reported = writer.send(&AudioReport::SystemSleep { segment: None });
+                    ack.allow();
+                    reported?;
+                }
+                HelperInput::Power(PowerEvent::Woke) => {
+                    tracing::info!("power.woke");
+                    self.is_asleep = false;
+                    writer.send(&AudioReport::SystemWake)?;
+                }
+            }
+        }
+    }
+}
+
+/// Reports why a closed segment ended, after its `stopped`. A sleep is allowed only once the
+/// app has heard that the segment closed.
+fn report_segment_end(writer: &ReportWriter, number: u32, end: SegmentEnd) -> anyhow::Result<()> {
+    match end {
+        SegmentEnd::Stopped => Ok(()),
+        SegmentEnd::Sleep(ack) => {
+            let reported = writer.send(&AudioReport::SystemSleep {
+                segment: Some(number),
+            });
+            ack.allow();
+            reported
+        }
+        SegmentEnd::Woke => writer.send(&AudioReport::SystemWake),
+    }
+}
+
+/// Parses each stdin line once. A bad line is reported and skipped. At EOF it sends
+/// `StdinClosed`, which is how the recording loop hears that stdin closed.
+fn read_commands(sender: &mpsc::Sender<HelperInput>, writer: &ReportWriter) {
     for line in std::io::stdin().lock().lines() {
         let line = match line {
             Ok(line) => line,
@@ -139,8 +262,8 @@ fn read_commands(sender: &mpsc::Sender<AudioCommand>, writer: &ReportWriter) {
         match capture_protocol::decode::<AudioCommand>(&line) {
             Ok(command) => {
                 tracing::info!(message.id = command.seq, "audio.command");
-                if sender.send(command.message).is_err() {
-                    break;
+                if sender.send(HelperInput::Command(command.message)).is_err() {
+                    return;
                 }
             }
             Err(error) => {
@@ -152,11 +275,13 @@ fn read_commands(sender: &mpsc::Sender<AudioCommand>, writer: &ReportWriter) {
         }
     }
     tracing::info!("stdin.closed");
+    let _unheard = sender.send(HelperInput::StdinClosed);
 }
 
 struct AudioObserver<'a> {
     writer: &'a ReportWriter,
-    commands: &'a Receiver<AudioCommand>,
+    inputs: &'a Receiver<HelperInput>,
+    permissions: &'a mut ReportedPermissions,
     next_heartbeat: Duration,
     is_stdin_closed: bool,
 }
@@ -201,7 +326,41 @@ impl SegmentObserver for AudioObserver<'_> {
         Ok(())
     }
 
-    fn after_drain(&mut self, live: &mut LiveSegment<'_>) -> anyhow::Result<bool> {
+    fn device_changed(&mut self, segment: u32, change: &DeviceChange) -> anyhow::Result<()> {
+        self.writer.send(&AudioReport::DeviceChanged {
+            segment,
+            stream: change.stem,
+            old_device: change.old_device.clone(),
+            new_device: change.new_device.clone(),
+            rate_hz: change.rate_hz,
+            cause: change.cause,
+        })
+    }
+
+    fn mic_unavailable(
+        &mut self,
+        segment: u32,
+        old_device: Option<&str>,
+        cause: Option<DeviceChangeCause>,
+        message: &str,
+    ) -> anyhow::Result<()> {
+        self.writer.send(&AudioReport::MicUnavailable {
+            segment,
+            old_device: old_device.map(str::to_owned),
+            cause,
+            message: message.to_owned(),
+        })
+    }
+
+    fn permission_checked(
+        &mut self,
+        service: PermissionService,
+        state: PermissionState,
+    ) -> anyhow::Result<()> {
+        self.permissions.report(self.writer, service, state)
+    }
+
+    fn after_drain(&mut self, live: &mut LiveSegment<'_>) -> anyhow::Result<LoopControl> {
         if live.elapsed() >= self.next_heartbeat {
             self.next_heartbeat += HEARTBEAT_INTERVAL;
             self.writer.send(&AudioReport::Heartbeat {
@@ -210,9 +369,9 @@ impl SegmentObserver for AudioObserver<'_> {
                 remote: live.counters(Stem::Remote),
             })?;
         }
-        match self.commands.try_recv() {
-            Ok(AudioCommand::Stop) => Ok(true),
-            Ok(AudioCommand::Start { segment, .. }) => {
+        match self.inputs.try_recv() {
+            Ok(HelperInput::Command(AudioCommand::Stop)) => Ok(LoopControl::Stop),
+            Ok(HelperInput::Command(AudioCommand::Start { segment, .. })) => {
                 self.writer.error(
                     AudioErrorKind::BadCommand,
                     format!(
@@ -220,12 +379,20 @@ impl SegmentObserver for AudioObserver<'_> {
                         live.number()
                     ),
                 )?;
-                Ok(false)
+                Ok(LoopControl::Continue)
             }
-            Err(TryRecvError::Empty) => Ok(false),
-            Err(TryRecvError::Disconnected) => {
+            Ok(HelperInput::Power(PowerEvent::WillSleep(ack))) => {
+                tracing::info!(segment = live.number(), "power.will_sleep");
+                Ok(LoopControl::Sleep(ack))
+            }
+            Ok(HelperInput::Power(PowerEvent::Woke)) => {
+                tracing::warn!(segment = live.number(), "power.woke_unannounced");
+                Ok(LoopControl::Woke)
+            }
+            Err(TryRecvError::Empty) => Ok(LoopControl::Continue),
+            Ok(HelperInput::StdinClosed) | Err(TryRecvError::Disconnected) => {
                 self.is_stdin_closed = true;
-                Ok(true)
+                Ok(LoopControl::Stop)
             }
         }
     }

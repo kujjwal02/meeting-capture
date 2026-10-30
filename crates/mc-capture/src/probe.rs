@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use capture::{BufferStamp, CallAudioSource, OpenedStem, StemReader};
+use capture::{BufferStamp, CallAudioSource, MicRequest, OpenedStem, StemReader};
 use serde::Serialize;
 
 use crate::{LineKind, MicChoice};
@@ -243,13 +243,14 @@ pub(crate) fn probe(length: Duration, out: &Path, mic: MicChoice) -> anyhow::Res
 
     let mut mic_file = StemFile::new(out.join("mic-native.wav"));
     let mut drain_outcome = Ok(());
-    let (mut source, readers) = CallAudioSource::open(rule, |mic_reader| {
-        if drain_outcome.is_ok() {
-            drain_outcome = mic_file.drain(mic_reader);
-        }
-    })?;
+    let (mut source, readers) =
+        CallAudioSource::open(MicRequest::call_start(rule), |mic_reader| {
+            if drain_outcome.is_ok() {
+                drain_outcome = mic_file.drain(mic_reader);
+            }
+        })?;
     drain_outcome?;
-    let mut mic_stem = ProbeStem::new(readers.mic, mic_file);
+    let mut mic_stem = ProbeStem::new(readers.mic?, mic_file);
     tracing::info!(open_ms = mic_stem.open_ms, "mic.opened");
     let mut remote_stem = readers
         .remote
