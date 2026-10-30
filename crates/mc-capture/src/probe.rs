@@ -8,16 +8,9 @@ use anyhow::Context;
 use capture::{BufferStamp, CallAudioSource, OpenedStem, StemReader};
 use serde::Serialize;
 
-use crate::MicChoice;
+use crate::{LineKind, MicChoice};
 
 type WavFile = hound::WavWriter<std::io::BufWriter<std::fs::File>>;
-
-#[derive(Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum LineKind {
-    Status,
-    Summary,
-}
 
 #[derive(Serialize)]
 struct StemStatus {

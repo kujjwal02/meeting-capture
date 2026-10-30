@@ -1,37 +1,10 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{RING_CAPACITY_SAMPLES, StemFormat};
+use crate::{BufferStamp, RING_CAPACITY_SAMPLES, StemFormat, StemLosses};
 
 /// Room for every buffer that fits in the sample ring, down to 64-frame buffers.
 const STAMP_CAPACITY: usize = 1_024;
-
-/// When one device buffer started, and where its samples sit in the reader's sample stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferStamp {
-    /// Host clock time of the buffer's first sample, as the OS hands it to the callback, with no
-    /// latency correction. Both stems use the same clock. On macOS it is mach host time in
-    /// nanoseconds since boot, sleep excluded. On Windows it will be QPC time in nanoseconds.
-    pub host_time_ns: u64,
-    /// Samples the reader received before this buffer's first sample. A ring overflow drops the
-    /// tail of a buffer, so the next stamp's index grows by less than `frame_count`.
-    pub sample_index: u64,
-    /// Frames the device delivered in this buffer, dropped ones included.
-    pub frame_count: u32,
-    /// The rate the device delivered this buffer at.
-    pub sample_rate_hz: u32,
-}
-
-/// Losses a stem ring counts while it runs.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StemLosses {
-    /// Samples the callback could not push because the sample ring was full.
-    pub dropped_samples: u64,
-    /// Stamps the callback could not push because the stamp ring was full.
-    pub dropped_stamps: u64,
-    /// Buffers that arrived without a valid host time, so they have no stamp.
-    pub untimed_buffers: u64,
-}
 
 #[derive(Default)]
 struct LossCounters {
@@ -113,6 +86,7 @@ impl MonoPusher {
             host_time_ns,
             sample_index,
             frame_count: u32::try_from(frame_count).unwrap_or(u32::MAX),
+            accepted_count: u32::try_from(accepted).unwrap_or(u32::MAX),
             sample_rate_hz,
         };
         if self.stamps.push(stamp).is_err() {

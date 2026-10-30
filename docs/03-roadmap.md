@@ -132,17 +132,46 @@ Progress is tracked in the [checklist](05-checklist.md).
   app restarts it. Teardown stops the device and waits for running callbacks before it frees
   anything.
 - Real-time callbacks only take channel 0 and push it into an SPSC ring of 65,536 samples. Each
-  callback also pushes the buffer's host time, sample index and rate into a second ring. A writer
-  thread resamples to 16 kHz. Each stem has one rubato cubic resampler for the whole stream.
-- Alignment: the writer places each buffer by its own host time. A stem whose host time runs more
-  than 100 ms ahead of its samples gets silence, logged as a gap. The host-time anchor is never
+  callback also pushes the buffer's host time, sample index and rate into a second ring. The
+  helper drains both rings from the first callback and hands them to the stem writer, which
+  resamples to 16 kHz with a rubato sinc resampler. The rate comes from each buffer's stamp. A
+  new rate rebuilds the resampler.
+- Alignment: the writer places each buffer by its own host time. The host-time anchor is never
   reset, not even on a device change.
-- Stems are 16 kHz mono 16-bit WAV through `hound`, 115 MB per hour each. The header is rewritten
-  every 5 s, so a crash loses at most 5 s.
+- Samples the ring dropped become silence of the same length.
+- The writer compares each stamp with the one before. A host-time step more than 4 ms beyond
+  what the sample count explains marks a stall. Noisy stamps raise the 4 ms limit to 4 times
+  their mean step. The writer fills the stall with silence and reports it as a gap.
+- The drift is host time minus file position. It goes through a 2 s low-pass into a PI loop. The
+  loop stretches or squeezes the audio by at most 1,000 ppm, so a device clock 300 ppm off never
+  adds a gap.
+- Drift beyond 70 ms with no stall step is filled with silence. This happens on the first buffer
+  after a device switch. Cap and OBS smooth within the same 70 ms.
+- Audio more than 70 ms ahead of host time is kept, since dropping it would lose speech. The
+  manifest lists it under `runs_ahead`. Steering then pulls the file back to host time.
+- A gap inside a run ahead also takes up the lead. A rotation carries the lead into the next file.
+- A device switch starts the new stream's sample index at 0. The time between the two devices
+  becomes a `device_switch` gap.
+- Stems are 16 kHz mono 16-bit WAV, 115 MB per hour each. Every 4.5 s the writer fsyncs the
+  samples, then rewrites the header and fsyncs again. A power cut then loses at most 5 s.
+- A WAV holds at most 37.3 hours, since its sizes are 32-bit. At 24 hours the writer moves both
+  stems to the next segment.
+- A rotation reads a fresh clock: it closes the old segment and opens the new one. A stopped stem
+  stays listed in the closed segment and leaves the new one. Silence past 24 hours opens the next
+  file.
 - Each call gets a folder in the app data folder, named after the call id. A start, resume or
   helper restart begins a new numbered pair: `001-mic.wav`, `001-remote.wav`, then `002-...`.
-  `stems.json` holds the call id, the platform, each segment's UTC start and end, its state
-  (`open`, `closed` or `recovered`), the mic device, dropped samples and the gap list.
+- The app picks the segment number. The writer refuses a number at or below any segment in the
+  folder, so a finished segment is never opened for writing again.
+- Each process keeps its own manifest in the call folder. The audio process writes `audio.json`,
+  and the video process writes `video.json`. Finalize reads both.
+- `audio.json` has a schema version. Readers accept any version up to their own.
+- Each segment entry holds its number, call id, platform, state (`open`, `closed` or
+  `recovered`), clock readings at start and close, and close time.
+- Each stem entry holds its file, first and last host time, UTC start, `sample_rate_hz`, samples
+  in the header, devices, input rates, gaps, runs ahead, ring losses and `stopped_by`.
+- The writer replaces `audio.json` atomically at each checkpoint. A failed checkpoint is reported
+  and retried at the next one. A failed WAV write stops that stem alone.
 - At launch the app repairs every segment not marked closed: it truncates to a whole sample,
   rewrites the RIFF and data sizes from the file length, and marks the segment `recovered`.
 - System-audio permission: `TCCAccessPreflight("kTCCServiceAudioCapture")` through dlopen, at
@@ -176,7 +205,7 @@ Progress is tracked in the [checklist](05-checklist.md).
    switch to AirPods, the AirPods HFP rate, and CPU with only the tap open.
 2. `capture` crate: `CallAudioSource`, tap and mic sources, ring with host-time stamps, timed opens,
    teardown.
-3. `stem-writer`: resampling, gap fill, WAV with 5 s flush, `stems.json`.
+3. `stem-writer`: resampling, gap fill, clock steering, WAV fsynced every 4.5 s, `audio.json`.
 4. Helper protocol, app supervision, tray rows. The app subscribes to the call stream early in
    `setup()`, so it sees the calls ended at launch.
 5. Device listeners, the Bluetooth rule, mic swap, tap rebuild on stall, permission checks.
