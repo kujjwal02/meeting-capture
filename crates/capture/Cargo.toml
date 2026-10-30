@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 cpal.workspace = true
 rtrb.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

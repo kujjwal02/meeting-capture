@@ -1,5 +1,6 @@
 //! The capture helper. The app spawns it, so a crash or a hung Core Audio call never takes the
-//! tray down. `probe` records the stems at their native rates and reports what the devices did.
+//! tray down. `probe` records the stems at their native rates and reports what the devices did;
+//! `devices` lists the Core Audio devices.
 
 #[cfg(target_os = "macos")]
 mod probe;
@@ -26,18 +27,15 @@ enum Command {
         /// Folder for `mic-native.wav` and `remote-native.wav`.
         #[arg(long)]
         out: PathBuf,
-        #[arg(long, value_enum, default_value_t = Sources::Both)]
-        sources: Sources,
         #[arg(long, value_enum, default_value_t = MicChoice::AvoidBluetooth)]
         mic: MicChoice,
     },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Sources {
-    Both,
-    Mic,
-    Remote,
+    /// Print every Core Audio device this process can see, and the mic the rule would record,
+    /// as one JSON object. Opens no device. Private aggregates of other processes are not listed.
+    Devices {
+        #[arg(long, value_enum, default_value_t = MicChoice::AvoidBluetooth)]
+        mic: MicChoice,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -52,19 +50,48 @@ fn main() -> anyhow::Result<()> {
         .json()
         .init();
     match Cli::parse().command {
-        Command::Probe {
-            seconds,
-            out,
-            sources,
-            mic,
-        } => {
+        Command::Probe { seconds, out, mic } => {
             #[cfg(target_os = "macos")]
-            return probe::probe(Duration::from_secs(seconds), &out, sources, mic);
+            return probe::probe(Duration::from_secs(seconds), &out, mic);
             #[cfg(not(target_os = "macos"))]
             {
-                let _ = (seconds, out, sources, mic);
+                let _ = (seconds, out, mic);
                 anyhow::bail!("probe records system audio on macOS only")
             }
         }
+        Command::Devices { mic } => {
+            #[cfg(target_os = "macos")]
+            return print_devices(mic.rule());
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = mic;
+                anyhow::bail!("devices lists Core Audio devices on macOS only")
+            }
+        }
     }
+}
+
+#[cfg(target_os = "macos")]
+impl MicChoice {
+    fn rule(self) -> capture::MicRule {
+        match self {
+            Self::FollowDefault => capture::MicRule::FollowDefault,
+            Self::AvoidBluetooth => capture::MicRule::AvoidBluetooth,
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn print_devices(rule: capture::MicRule) -> anyhow::Result<()> {
+    #[derive(serde::Serialize)]
+    struct DeviceReport {
+        devices: Vec<capture::HalDevice>,
+        mic_pick: capture::MicPick,
+    }
+    let report = DeviceReport {
+        devices: capture::hal_devices()?,
+        mic_pick: capture::mic_pick(rule)?,
+    };
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
 }

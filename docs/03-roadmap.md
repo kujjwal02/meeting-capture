@@ -131,11 +131,12 @@ Progress is tracked in the [checklist](05-checklist.md).
 - Every native open runs on its own thread with a 5 s timeout. On timeout the helper exits and the
   app restarts it. Teardown stops the device and waits for running callbacks before it frees
   anything.
-- Real-time callbacks only downmix to mono and push into an SPSC ring of 65,536 samples. A writer
-  thread resamples to 16 kHz with one rubato cubic resampler per stem, kept for the whole stream.
-- Alignment: the writer compares samples written with the monotonic clock. A stem more than
-  100 ms behind gets silence, logged as a gap. This also absorbs clock drift between the mic and
-  the tap.
+- Real-time callbacks only take channel 0 and push it into an SPSC ring of 65,536 samples. Each
+  callback also pushes the buffer's host time, sample index and rate into a second ring. A writer
+  thread resamples to 16 kHz. Each stem has one rubato cubic resampler for the whole stream.
+- Alignment: the writer places each buffer by its own host time. A stem whose host time runs more
+  than 100 ms ahead of its samples gets silence, logged as a gap. The host-time anchor is never
+  reset, not even on a device change.
 - Stems are 16 kHz mono 16-bit WAV through `hound`, 115 MB per hour each. The header is rewritten
   every 5 s, so a crash loses at most 5 s.
 - Each call gets a folder in the app data folder, named after the call id. A start, resume or
@@ -173,7 +174,8 @@ Progress is tracked in the [checklist](05-checklist.md).
 1. Spike: plist strings, minimum version, a bare `mc-capture` that records 60 s. Check that macOS
    attributes its prompts to Meeting Capture. Measure the tap's format, whether it survives a
    switch to AirPods, the AirPods HFP rate, and CPU with only the tap open.
-2. `capture` crate: `Frame`, `CallAudioSource`, tap and mic sources, ring, timed opens, teardown.
+2. `capture` crate: `CallAudioSource`, tap and mic sources, ring with host-time stamps, timed opens,
+   teardown.
 3. `stem-writer`: resampling, gap fill, WAV with 5 s flush, `stems.json`.
 4. Helper protocol, app supervision, tray rows. The app subscribes to the call stream early in
    `setup()`, so it sees the calls ended at launch.
