@@ -1,21 +1,12 @@
 use std::time::SystemTime;
 
 use cidre::core_audio as ca;
+use stem_timing::UtcAnchor;
 
 /// The host clock now, on the same scale as `BufferStamp::host_time_ns`.
 #[must_use]
 pub fn host_now_ns() -> u64 {
     ca::host_time_to_nanos(ca::current_host_time())
-}
-
-/// One reading of the host clock against UTC, to turn host times into wall-clock times.
-#[derive(Debug, Clone, Copy)]
-pub struct UtcAnchor {
-    /// Midpoint of the two host clock reads around the UTC read.
-    pub host_time_ns: u64,
-    pub utc: SystemTime,
-    /// Host time between the two reads: the anchor's error bound.
-    pub read_gap_ns: u64,
 }
 
 #[must_use]

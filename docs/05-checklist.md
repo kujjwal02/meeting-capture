@@ -238,7 +238,7 @@ Done when:
 - [x] Spike: tap across a switch to AirPods, AirPods HFP rate.
 - [x] Usage strings in both plists; minimum macOS 14.4; the audio-input entitlement.
 - [ ] `capture` with one `CallAudioSource` trait; global tap for remote audio, `cpal` for the mic.
-- [ ] `stem-writer` writes numbered `mic.wav` and `remote.wav` segments and `stems.json`.
+- [ ] `stem-writer` writes numbered `NNN-mic.wav` and `NNN-remote.wav` segments and `audio.json`.
 - [ ] `mc-capture` helper, supervised by the app with 1, 2 and 4 s restarts.
 - [ ] Built-in mic when the default input is Bluetooth; new mic stream opens before the old closes.
 - [ ] Orphan WAVs repaired at launch.
@@ -247,7 +247,7 @@ Done when:
 
 Done when:
 
-- [ ] 3 calls recorded, one with AirPods connected mid-call, no gap over 1 s in `stems.json`.
+- [ ] 3 calls recorded, one with AirPods connected mid-call, no gap over 1 s in `audio.json`.
 - [ ] The app and the helper together stay under 5% CPU in `top -l 0 -s 10`.
 - [ ] A `kill -9` of the app and of the helper mid-call each leave stems that play.
 

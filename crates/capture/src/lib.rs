@@ -2,7 +2,6 @@
 //! takes channel 0 in its real-time callback and pushes it, with the buffer's host time, into a
 //! lock-free ring. The caller drains the ring through a `StemReader` on an ordinary thread.
 
-use std::fmt;
 use std::time::Duration;
 
 mod call;
@@ -15,10 +14,11 @@ pub use call::{CallAudioSource, CallReaders, OpenedStem};
 pub use mic::{
     InputDevices, MicPick, MicPickReason, MicRule, MicTransport, default_devices, mic_pick,
 };
-pub use ring::{BufferStamp, StemLosses, StemReader};
+pub use ring::StemReader;
+pub use stem_timing::{BufferStamp, Stem, StemLosses, UtcAnchor};
 
 #[cfg(target_os = "macos")]
-pub use mac::clock::{UtcAnchor, host_now_ns, utc_anchor};
+pub use mac::clock::{host_now_ns, utc_anchor};
 #[cfg(target_os = "macos")]
 pub use mac::hal::{HalDevice, hal_devices};
 #[cfg(target_os = "macos")]
@@ -26,28 +26,6 @@ pub use mac::tap::RemoteSource;
 
 /// About 1.4 s at 48 kHz: room for the writer to stall on a slow disk without dropping samples.
 pub const RING_CAPACITY_SAMPLES: usize = 65_536;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stem {
-    Mic,
-    Remote,
-}
-
-impl Stem {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Mic => "mic",
-            Self::Remote => "remote",
-        }
-    }
-}
-
-impl fmt::Display for Stem {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
 
 /// The format a source delivers into its ring: always mono f32, at the device's own rate.
 #[derive(Debug, Clone)]

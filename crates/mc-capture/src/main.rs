@@ -1,15 +1,27 @@
 //! The capture helper. The app spawns it, so a crash or a hung Core Audio call never takes the
 //! tray down. `probe` records the stems at their native rates and reports what the devices did;
-//! `devices` lists the Core Audio devices.
+//! `record` writes one segment of a call folder through the stem writer; `devices` lists the Core
+//! Audio devices.
 
 #[cfg(target_os = "macos")]
 mod probe;
+#[cfg(target_os = "macos")]
+mod record;
 
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
+
+/// What a JSON line on stdout reports.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LineKind {
+    Status,
+    Summary,
+}
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -30,12 +42,40 @@ enum Command {
         #[arg(long, value_enum, default_value_t = MicChoice::AvoidBluetooth)]
         mic: MicChoice,
     },
+    /// Record the folder's next segment as 16 kHz stems placed by host time, with
+    /// `audio.json`. Prints one status line per second and a summary.
+    Record {
+        /// The call folder.
+        #[arg(long)]
+        folder: PathBuf,
+        /// The segment number. Default: one past the folder's highest.
+        #[arg(long)]
+        segment: Option<u32>,
+        /// Default: the folder's name.
+        #[arg(long)]
+        call_id: Option<String>,
+        #[arg(long, value_enum, default_value_t = PlatformChoice::Other)]
+        platform: PlatformChoice,
+        #[arg(long, default_value_t = 60)]
+        seconds: u64,
+        #[arg(long, value_enum, default_value_t = MicChoice::AvoidBluetooth)]
+        mic: MicChoice,
+    },
     /// Print every Core Audio device this process can see, and the mic the rule would record,
     /// as one JSON object. Opens no device. Private aggregates of other processes are not listed.
     Devices {
         #[arg(long, value_enum, default_value_t = MicChoice::AvoidBluetooth)]
         mic: MicChoice,
     },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum PlatformChoice {
+    Meet,
+    Teams,
+    Zoom,
+    Slack,
+    Other,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -59,6 +99,29 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("probe records system audio on macOS only")
             }
         }
+        Command::Record {
+            folder,
+            segment,
+            call_id,
+            platform,
+            seconds,
+            mic,
+        } => {
+            #[cfg(target_os = "macos")]
+            return record::record(&record::RecordRequest {
+                folder,
+                segment,
+                call_id,
+                platform: platform.platform(),
+                length: Duration::from_secs(seconds),
+                mic,
+            });
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = (folder, segment, call_id, platform, seconds, mic);
+                anyhow::bail!("record needs system audio, which only macOS has yet")
+            }
+        }
         Command::Devices { mic } => {
             #[cfg(target_os = "macos")]
             return print_devices(mic.rule());
@@ -67,6 +130,19 @@ fn main() -> anyhow::Result<()> {
                 let _ = mic;
                 anyhow::bail!("devices lists Core Audio devices on macOS only")
             }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl PlatformChoice {
+    fn platform(self) -> sources::Platform {
+        match self {
+            Self::Meet => sources::Platform::Meet,
+            Self::Teams => sources::Platform::Teams,
+            Self::Zoom => sources::Platform::Zoom,
+            Self::Slack => sources::Platform::Slack,
+            Self::Other => sources::Platform::Other,
         }
     }
 }

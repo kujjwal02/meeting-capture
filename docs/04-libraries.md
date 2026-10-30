@@ -52,7 +52,7 @@ crates.io on 2026-10-17.
 | Phase | Job | Libraries |
 |---|---|---|
 | 2 | Call detection | `tokio` broadcast channel |
-| 3 | Mac capture | cidre 0.29, cpal 0.18, hound 3.5 |
+| 3 | Mac capture | cidre 0.29, cpal 0.18, hound 3.5, rubato 5.0 |
 | 3b | Mic detection | Vendored Anarlog detect (MIT) |
 | 4 | Local STT | sherpa-onnx 1.13 with Parakeet TDT 0.6B v3 |
 | 5 | Windows capture | wasapi 0.26, cpal |
