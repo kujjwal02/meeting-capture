@@ -49,3 +49,7 @@ mc-meet in your own browsers starts the dev binary without the dev home.
 
 On a failure it prints the Meet tab's errors and mc-meet's stored sessions, and saves
 `host-failure.png` and `guest-failure.png` in the work folder. Step times print in IST.
+
+## Known traps
+
+[driving-meet.md](driving-meet.md) lists the failures seen while driving Meet from scripts, with fixes.

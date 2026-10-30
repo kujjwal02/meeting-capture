@@ -9,6 +9,7 @@ speech-to-text, and a pipeline that writes meeting notes into `~/knowledge`. Rea
 | --- | --- |
 | `docs/` | Overview, architecture, roadmap. The current plan. |
 | `~/knowledge/areas/infrastructure/meeting-recording/local-capture/` | Research behind the plan: tool comparisons, costs, sources. `10-desktop-app-plan.md` is the detailed plan. |
+| `tools/meet-e2e/driving-meet.md` | Traps and fixes for driving real Meet calls from scripts. Read before any Meet driver or spike. |
 | `.scratch/` | Working scripts and dumps, one `YYYY-MM-DD-what/` per job. Gitignored. |
 
 ## Conventions
