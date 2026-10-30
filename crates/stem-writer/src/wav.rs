@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{OUTPUT_RATE_HZ, StemWriterError};
 
-const HEADER_BYTES: u32 = 44;
-const BYTES_PER_SAMPLE: u32 = 2;
+pub(crate) const HEADER_BYTES: u32 = 44;
+pub(crate) const BYTES_PER_SAMPLE: u32 = 2;
 
 pub(crate) struct StemWav {
     path: PathBuf,
@@ -98,13 +98,13 @@ impl StemWav {
 }
 
 /// The data chunk's size in bytes, when the header's u32 fields can hold it.
-fn data_bytes(samples: u64) -> Option<u32> {
+pub(crate) fn data_bytes(samples: u64) -> Option<u32> {
     u32::try_from(samples * u64::from(BYTES_PER_SAMPLE))
         .ok()
         .filter(|bytes| bytes.checked_add(HEADER_BYTES).is_some())
 }
 
-fn wav_header(data_bytes: u32) -> [u8; HEADER_BYTES as usize] {
+pub(crate) fn wav_header(data_bytes: u32) -> [u8; HEADER_BYTES as usize] {
     let byte_rate = OUTPUT_RATE_HZ * BYTES_PER_SAMPLE;
     let mut header = [0_u8; HEADER_BYTES as usize];
     let fields: [&[u8]; 13] = [

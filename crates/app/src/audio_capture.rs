@@ -281,9 +281,11 @@ fn set_recording_stopped(app: &AppHandle, call_id: &Path, is_stopped: bool) {
     crate::tray::show_call_status(app);
 }
 
-/// Starts the supervisor. Call before any call source starts, so it hears every call.
+/// Starts the supervisor. Call before any call source starts, so it hears every call. Also
+/// repairs, in the background, the segments a dead helper left open in any call folder.
 pub(crate) fn start(app: &AppHandle) {
     let state = app.state::<AppState>();
+    repair_call_folders(state.settings.app_dirs().calls_dir());
     let stop_changes = state
         .audio_capture
         .stop_change_receiver
@@ -310,6 +312,50 @@ pub(crate) fn start(app: &AppHandle) {
         active: None,
     };
     tauri::async_runtime::spawn(supervisor.run(events, stop_changes));
+}
+
+/// Recovers what a `kill -9`, a crash or a power cut left open. The supervisor's state starts
+/// empty, so the folder locks decide: a folder whose helper is still recording, as one that
+/// outlived a killed app, is skipped, and that helper closes its own segment. Each segment start
+/// repairs its folder again under the lock, so a call that starts at once loses nothing to the
+/// race. stem-writer logs each repaired stem. Phase 3c adds the video repair to each folder.
+fn repair_call_folders(calls_dir: PathBuf) {
+    tauri::async_runtime::spawn_blocking(move || {
+        let folders = match call_folder::call_folders(&calls_dir) {
+            Ok(folders) => folders,
+            Err(error) => {
+                tracing::error!(
+                    file.directory = %calls_dir.display(),
+                    exception.message = %error,
+                    "repair.calls_unreadable"
+                );
+                return;
+            }
+        };
+        let mut repaired_count = 0_usize;
+        let mut failed_count = 0_usize;
+        for folder in &folders {
+            match stem_writer::repair_folder(folder) {
+                Ok(stem_writer::FolderRepair::Repaired { .. }) => repaired_count += 1,
+                Ok(stem_writer::FolderRepair::Busy | stem_writer::FolderRepair::Clean) => {}
+                Err(error) => {
+                    failed_count += 1;
+                    tracing::error!(
+                        file.directory = %folder.display(),
+                        exception.message = %error,
+                        "repair.failed"
+                    );
+                }
+            }
+        }
+        tracing::info!(
+            file.directory = %calls_dir.display(),
+            repair.folder_count = folders.len(),
+            repair.repaired_folder_count = repaired_count,
+            repair.failed_folder_count = failed_count,
+            "repair.finished"
+        );
+    });
 }
 
 /// One capture process of the active recording.

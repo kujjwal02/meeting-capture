@@ -193,6 +193,11 @@ flowchart LR
 - `obs-control` starts and stops OBS video recording with the call.
 - Each capture process keeps its own manifest in the call folder: `audio.json` from the audio
   process, `video.json` from the video process. Finalize reads both.
+- Repair lives in `stem-writer`, beside the WAV and manifest code it must match. The app runs it
+  over `calls/` at launch. Each segment start runs it on its own folder. `mc-capture repair
+  --folder` runs it by hand.
+- `call-folder` holds what every capture process shares about a call folder: the OS file lock
+  that marks a live writer (`audio.lock`, later `video.lock`) and the walk over `calls/`.
 
 ## 2. Transcribe (phases 4, 6)
 
@@ -271,6 +276,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 | detect | 3b | Emit "call started" and "call ended" when an app takes or releases the mic | Vendored from Anarlog `crates/detect` (MIT) |
 | capture | 3, 5 | One `CallAudioSource` trait; per-OS adapters emit timestamped PCM frames | Mac: Core Audio tap via `cidre`. Windows: WASAPI process loopback via `wasapi`. Mic: `cpal`. Adapted from Anarlog `crates/audio-actual` |
 | stem-timing | 3 | The types `capture` and `stem-writer` share: stem, buffer stamp, ring losses, clock reading. Portable, no audio API | `serde` |
+| call-folder | 3 | The per-process lock on a call folder and the walk over `calls/`, shared by every capture process and repair | std file locks |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV placed by host time, fsynced every 4.5 s, and `audio.json` | `rubato` |
 | stt | 4 | VAD, Parakeet TDT 0.6B v3 int8, diarization of the remote stem | `sherpa-onnx` |
 | obs-control | 7 | Start and stop OBS video recording with the call | `obws` |
