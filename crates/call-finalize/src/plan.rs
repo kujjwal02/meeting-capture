@@ -5,7 +5,9 @@
 //! and stems is a host time difference: a window capture part starts at its first frame's host
 //! time, read through the paired audio segment's clock reading, the same reading that places the
 //! stems. Segments that do not pair, and separate pairs, sit apart by their own clock readings,
-//! since host time stands still while the Mac sleeps.
+//! since host time stands still while the Mac sleeps. A Meet tab part starts at the UTC Chrome
+//! stamped on its first frame, and its paired remote stem moves earlier by the tab audio's
+//! playback latency.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -14,7 +16,9 @@ pub use capture_protocol::finalize::{InputTrack, SkipReason, SkippedInput};
 use jiff::Timestamp;
 use stem_timing::Stem;
 use stem_writer::{AudioManifest, SegmentState, StemRecord};
-use video_capture::{ClockRecord, VideoManifest, VideoSegmentRecord, VideoSegmentState};
+use video_capture::{
+    ClockRecord, PartRecord, VideoManifest, VideoSegmentRecord, VideoSegmentState, VideoSource,
+};
 
 use crate::FinalizeError;
 
@@ -52,8 +56,8 @@ pub enum PartStart {
         own_clock: Option<ClockRecord>,
     },
     /// Meet tab capture: Chrome stamps each frame with UTC as it arrives. The remote stem hears
-    /// the tab `remote_trail_ms` later, the playback latency mc-meet logs at capture, so the
-    /// paired remote stem moves that much earlier.
+    /// the tab `remote_trail_ms` later: the playback latency mc-meet logs at capture plus a fixed
+    /// calibration. The paired remote stem moves that much earlier over the part's span.
     BrowserUtc {
         first_frame_at: Timestamp,
         remote_trail_ms: f64,
@@ -138,8 +142,20 @@ pub fn plan_folder(folder: &Path) -> Result<CallTimeline, FinalizeError> {
                 reason: SkipReason::NoPartRecord,
             });
         }
-        match window_capture_parts(folder, segment) {
-            Ok(segment_parts) => parts.extend(segment_parts),
+        match segment_parts(folder, segment) {
+            Ok(SegmentParts {
+                parts: segment_parts,
+                is_any_without_clock,
+            }) => {
+                parts.extend(segment_parts);
+                if is_any_without_clock {
+                    skipped.push(SkippedInput {
+                        segment: segment.number,
+                        track: InputTrack::Video,
+                        reason: SkipReason::NoClock,
+                    });
+                }
+            }
             Err(reason) => skipped.push(SkippedInput {
                 segment: segment.number,
                 track: InputTrack::Video,
@@ -164,11 +180,16 @@ fn has_fragment_without_part(segment: &VideoSegmentRecord) -> bool {
         })
 }
 
-/// The parts of one segment `mc-capture video` wrote.
-fn window_capture_parts(
-    folder: &Path,
-    segment: &VideoSegmentRecord,
-) -> Result<Vec<VideoPartInput>, SkipReason> {
+/// The placeable parts of one segment.
+struct SegmentParts {
+    parts: Vec<VideoPartInput>,
+    /// A part with fragments has no start on its source's clock. It stays out, and the skip
+    /// entry keeps its segment folder from the purge.
+    is_any_without_clock: bool,
+}
+
+/// The parts of one segment, from `mc-capture video` or the app's tab video writer.
+fn segment_parts(folder: &Path, segment: &VideoSegmentRecord) -> Result<SegmentParts, SkipReason> {
     match segment.state {
         VideoSegmentState::Open => return Err(SkipReason::StillOpen),
         VideoSegmentState::Closed | VideoSegmentState::Recovered => {}
@@ -182,36 +203,65 @@ fn window_capture_parts(
         });
     }
     let segment_dir = folder.join(&segment.folder);
-    let parts: Vec<VideoPartInput> = segment
-        .parts
-        .iter()
-        .filter_map(|part| {
-            let fragments: Vec<_> = segment
-                .fragments
+    let mut parts = Vec::new();
+    let mut is_any_without_clock = false;
+    for part in &segment.parts {
+        let fragments: Vec<_> = segment
+            .fragments
+            .iter()
+            .filter(|fragment| fragment.part == part.number)
+            .collect();
+        if fragments.is_empty() {
+            continue;
+        }
+        let Some(start) = part_start(segment, part) else {
+            is_any_without_clock = true;
+            continue;
+        };
+        parts.push(VideoPartInput {
+            segment: segment.number,
+            part: part.number,
+            audio_segment: segment.audio_segment,
+            start,
+            init: segment_dir.join(&part.init),
+            fragments: fragments
                 .iter()
-                .filter(|fragment| fragment.part == part.number)
-                .collect();
-            (!fragments.is_empty()).then(|| VideoPartInput {
-                segment: segment.number,
-                part: part.number,
-                audio_segment: segment.audio_segment,
-                start: PartStart::HostTime {
-                    first_host_time_ns: part.first_host_time_ns,
-                    own_clock: segment.clock,
-                },
-                init: segment_dir.join(&part.init),
-                fragments: fragments
-                    .iter()
-                    .map(|fragment| segment_dir.join(&fragment.file))
-                    .collect(),
-                length_ms: fragments.iter().map(|fragment| fragment.duration_ms).sum(),
-            })
-        })
-        .collect();
-    if parts.is_empty() {
+                .map(|fragment| segment_dir.join(&fragment.file))
+                .collect(),
+            length_ms: fragments.iter().map(|fragment| fragment.duration_ms).sum(),
+        });
+    }
+    if parts.is_empty() && !is_any_without_clock {
         Err(SkipReason::Empty)
     } else {
-        Ok(parts)
+        Ok(SegmentParts {
+            parts,
+            is_any_without_clock,
+        })
+    }
+}
+
+/// How much longer than the logged playback latency the remote stem trails a Meet tab frame.
+/// The tab capture spike measured the stem 99 and 113 ms (medians of two runs) behind the frame
+/// it arrived with, against an `AudioContext` output latency of 41 to 45 ms; with Chrome's own tab
+/// audio the same offset was 53 and 72 ms. The rest is capture and Meet's own audio and video
+/// sync. Not yet measured on a real call.
+const MEET_TAB_CALIBRATION_MS: f64 = 60.0;
+
+/// A part's first frame on the clock its segment's source stamps.
+fn part_start(segment: &VideoSegmentRecord, part: &PartRecord) -> Option<PartStart> {
+    match segment.source {
+        VideoSource::Window => Some(PartStart::HostTime {
+            first_host_time_ns: part.first_host_time_ns?,
+            own_clock: segment.clock,
+        }),
+        // A tab with no audio track logs no latency: nothing plays it back, so nothing trails.
+        VideoSource::MeetTab => Some(PartStart::BrowserUtc {
+            first_frame_at: part.first_frame_at?,
+            remote_trail_ms: segment
+                .playback_latency_ms
+                .map_or(0.0, |latency_ms| latency_ms + MEET_TAB_CALIBRATION_MS),
+        }),
     }
 }
 
@@ -371,17 +421,33 @@ pub fn plan(folder: &Path, audio: &AudioManifest, parts: &[VideoPartInput]) -> C
     }
 }
 
-/// Each part's first frame in UTC nanoseconds, and each audio segment's remote trail from its
-/// browser parts.
+/// A span of tab time, in UTC nanoseconds, whose remote stem audio trails the frames by
+/// `trail_ns`.
+#[derive(Debug, Clone, Copy)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "each field is in nanoseconds, and the unit belongs in its name"
+)]
+struct TrailSpan {
+    start_ns: i128,
+    end_ns: i128,
+    trail_ns: i128,
+}
+
+/// Each audio segment's remote trail spans, by segment number.
+type RemoteTrails = BTreeMap<u32, Vec<TrailSpan>>;
+
+/// Each part's first frame in UTC nanoseconds, and each audio segment's remote trail spans from
+/// its browser parts.
 fn start_parts<'a>(
     parts: &'a [VideoPartInput],
     audio_clocks: &BTreeMap<u32, ClockReading>,
     clock_runs: &mut ClockRuns,
     skipped: &mut Vec<SkippedInput>,
-) -> (Vec<(&'a VideoPartInput, i128)>, BTreeMap<u32, i128>) {
-    // Several browser parts may pair with one audio segment; the latest logged trail wins, as
-    // the playback path only grows its buffer.
-    let mut remote_trails_ns: BTreeMap<u32, i128> = BTreeMap::new();
+) -> (Vec<(&'a VideoPartInput, i128)>, RemoteTrails) {
+    // Audio outside every browser part's span played through nothing mc-meet controls, so it
+    // keeps its place.
+    let mut remote_trails_ns = RemoteTrails::new();
     let mut part_starts: Vec<(&VideoPartInput, i128)> = Vec::new();
     for part in parts {
         let start_utc_ns = match part.start {
@@ -407,10 +473,15 @@ fn start_parts<'a>(
                 first_frame_at,
                 remote_trail_ms,
             } => {
+                let start_ns = first_frame_at.as_nanosecond();
                 if let Some(number) = part.audio_segment {
-                    remote_trails_ns.insert(number, ms_to_ns(remote_trail_ms));
+                    remote_trails_ns.entry(number).or_default().push(TrailSpan {
+                        start_ns,
+                        end_ns: start_ns + ms_to_ns(part.length_ms),
+                        trail_ns: ms_to_ns(remote_trail_ms),
+                    });
                 }
-                first_frame_at.as_nanosecond()
+                start_ns
             }
         };
         part_starts.push((part, start_utc_ns));
@@ -423,7 +494,7 @@ fn start_parts<'a>(
 fn place_stems_in_utc<'a>(
     audio: &'a AudioManifest,
     audio_clocks: &BTreeMap<u32, ClockReading>,
-    remote_trails_ns: &BTreeMap<u32, i128>,
+    remote_trails_ns: &RemoteTrails,
     skipped: &mut Vec<SkippedInput>,
 ) -> Vec<(u32, &'a StemRecord, Vec<UtcChunk>)> {
     let mut utc_stems: Vec<(u32, &StemRecord, Vec<UtcChunk>)> = Vec::new();
@@ -451,11 +522,13 @@ fn place_stems_in_utc<'a>(
                 skip(SkipReason::Empty);
                 continue;
             }
-            let shift_ns = match stem.stem {
-                Stem::Remote => remote_trails_ns.get(&segment.number).copied().unwrap_or(0),
-                Stem::Mic => 0,
+            let trail_spans: &[TrailSpan] = match stem.stem {
+                Stem::Remote => remote_trails_ns
+                    .get(&segment.number)
+                    .map_or(&[], Vec::as_slice),
+                Stem::Mic => &[],
             };
-            let chunks = utc_chunks(stem, clock, shift_ns);
+            let chunks = utc_chunks(stem, clock, trail_spans);
             utc_stems.push((segment.number, stem, chunks));
         }
     }
@@ -499,8 +572,9 @@ fn mix_chunks(chunks: &[UtcChunk], origin_ns: i128) -> Vec<StemChunk> {
 
 /// Cuts the stem into chunks, each at the UTC of its own first sample: 1 s chunks where file
 /// and host time move together, 10 ms ones inside a run ahead. Cuts fall on each run's start
-/// and end, where the file jumps against host time.
-fn utc_chunks(stem: &StemRecord, clock: ClockReading, shift_ns: i128) -> Vec<UtcChunk> {
+/// and end, where the file jumps against host time. A chunk heard inside a trail span moves
+/// earlier by that span's trail; a 1 s chunk across a span's edge moves whole or not at all.
+fn utc_chunks(stem: &StemRecord, clock: ClockReading, trail_spans: &[TrailSpan]) -> Vec<UtcChunk> {
     let to_sample = |ms: f64| -> u64 {
         #[expect(
             clippy::cast_possible_truncation,
@@ -549,9 +623,14 @@ fn utc_chunks(stem: &StemRecord, clock: ClockReading, shift_ns: i128) -> Vec<Utc
         )]
         let file_ms = file_sample as f64 * 1e3 / f64::from(MIX_RATE_HZ);
         if let Some(host_time_ns) = stem.host_time_at(file_ms) {
+            let heard_ns = clock.utc_ns_at(host_time_ns);
+            let trail_ns = trail_spans
+                .iter()
+                .find(|span| (span.start_ns..span.end_ns).contains(&(heard_ns - span.trail_ns)))
+                .map_or(0, |span| span.trail_ns);
             chunks.push(UtcChunk {
                 file_sample,
-                utc_ns: clock.utc_ns_at(host_time_ns) - shift_ns,
+                utc_ns: heard_ns - trail_ns,
                 sample_count,
             });
         }

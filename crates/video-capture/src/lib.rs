@@ -1,10 +1,12 @@
 //! A call's video: one window recorded through ScreenCaptureKit, encoded in hardware by
 //! VideoToolbox, and cut by AVAssetWriter into 2 s HLS fragments in numbered segments of the call
 //! folder, with `video.json`. Every frame carries mach host time, as the audio stems do, so
-//! finalize lines the two up.
+//! finalize lines the two up. A Meet call's video comes from mc-meet's tab capture instead:
+//! Chrome muxes the fragments and stamps them with UTC, and `tab_video` writes them into the same
+//! layout.
 //!
-//! The manifest, the segment writer and repair are portable, so the app repairs video folders on
-//! every OS. Capture is macOS only, in `mac`. Unsafe code lives only in `mac::stream`,
+//! The manifest, the segment writer, the tab video writer and repair are portable, so the app
+//! repairs video folders on every OS. Capture is macOS only, in `mac`. Unsafe code lives only in `mac::stream`,
 //! `mac::encoder` and `mac::muxer`, which define the Objective-C classes the frameworks call back.
 
 use std::path::{Path, PathBuf};
@@ -13,6 +15,7 @@ use std::time::Duration;
 mod manifest;
 mod playlist;
 mod repair;
+mod tab_video;
 mod window_pick;
 mod writer;
 
@@ -22,12 +25,14 @@ pub mod mac;
 pub use manifest::{
     ClockRecord, FragmentRecord, FrameCounts, MANIFEST_FILE_NAME, MANIFEST_SCHEMA_VERSION,
     PartRecord, VideoCodec, VideoGapCause, VideoGapRecord, VideoManifest, VideoRepair,
-    VideoSegmentRecord, VideoSegmentState, WindowChangeCause, WindowChangeRecord, WindowRecord,
+    VideoSegmentRecord, VideoSegmentState, VideoSource, WindowChangeCause, WindowChangeRecord,
+    WindowRecord,
 };
 pub use playlist::PLAYLIST_FILE_NAME;
 pub use repair::{VideoFolderRepair, repair_folder};
+pub use tab_video::{AudioPairing, TabFragment, TabFragmentOutcome, TabSegmentEnd, TabVideoWriter};
 pub use window_pick::{ListedWindow, WindowHint, pick_window};
-pub use writer::{FragmentWritten, SegmentStart, VideoSegmentWriter};
+pub use writer::{FragmentWritten, FrameTime, SegmentSource, SegmentStart, VideoSegmentWriter};
 
 /// The video process's lock file in a call folder. A segment holds it for its whole life, and
 /// repair takes it before it reads anything.

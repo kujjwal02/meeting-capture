@@ -32,8 +32,8 @@ use video_capture::mac::stream::{
 };
 use video_capture::mac::window::{LOOKUP_LIMIT, WindowLookup, look_up_window};
 use video_capture::{
-    FrameCounts, ListedWindow, SEGMENT_CLOSE_LIMIT, SegmentStart, VideoCodec, VideoGapRecord,
-    VideoSegmentWriter, VideoWriterError, WindowChangeRecord,
+    FrameCounts, FrameTime, ListedWindow, SEGMENT_CLOSE_LIMIT, SegmentSource, SegmentStart,
+    VideoCodec, VideoGapRecord, VideoSegmentWriter, VideoWriterError, WindowChangeRecord,
 };
 
 const TICK: Duration = Duration::from_millis(20);
@@ -817,8 +817,10 @@ impl Segment<'_> {
             call_id: &self.request.call_id,
             platform: self.request.platform,
             codec,
-            window: self.window_record(),
-            clock: capture::utc_anchor(),
+            source: SegmentSource::Window {
+                window: self.window_record(),
+                clock: capture::utc_anchor(),
+            },
         })
         .map_err(SegmentError::Start)?;
         self.writer = Some(writer);
@@ -931,7 +933,7 @@ impl Segment<'_> {
                             start.codec,
                             start.size.width_px,
                             start.size.height_px,
-                            start.first_host_time_ns,
+                            FrameTime::HostTime(start.first_host_time_ns),
                         )
                         .map_err(SegmentError::Write)?;
                 }
@@ -942,7 +944,11 @@ impl Segment<'_> {
                 } => {
                     writer.set_frame_counts(self.counts);
                     let written = writer
-                        .write_fragment(&bytes, first_host_time_ns, duration_ms)
+                        .write_fragment(
+                            &bytes,
+                            first_host_time_ns.map(FrameTime::HostTime),
+                            duration_ms,
+                        )
                         .map_err(SegmentError::Write)?;
                     self.fragments_written += 1;
                     tracing::debug!(
@@ -1449,7 +1455,7 @@ impl Segment<'_> {
         writer.set_frame_counts(self.counts);
         let stopped_by = cause.map_or("error", StopCause::as_str).to_owned();
         let record = writer
-            .close(Some(stopped_by), capture::utc_anchor())
+            .close(Some(stopped_by), Some(capture::utc_anchor()))
             .map_err(SegmentError::Close)?;
         tracing::info!(
             segment.number = record.number,

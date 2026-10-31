@@ -4,8 +4,25 @@ use std::io;
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-/// The largest frame either side accepts. Chrome takes at most 1 MB from a host.
-pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+/// Which way a frame travels, which sets its size limit.
+#[derive(Debug, Clone, Copy)]
+pub enum FrameFlow {
+    /// From the extension to the app: video fragments ride here.
+    FromExtension,
+    /// From the app to the extension. Chrome takes at most 1 MB from a host.
+    ToExtension,
+}
+
+impl FrameFlow {
+    /// The largest frame accepted this way.
+    #[must_use]
+    pub const fn max_bytes(self) -> usize {
+        match self {
+            Self::FromExtension => 8 * 1024 * 1024,
+            Self::ToExtension => 1024 * 1024,
+        }
+    }
+}
 
 /// The byte order of a frame's length.
 #[derive(Debug, Clone, Copy)]
@@ -21,10 +38,11 @@ pub enum LengthOrder {
 /// # Errors
 ///
 /// Returns the read error, `UnexpectedEof` for a stream that ends inside a frame, and
-/// `InvalidData` for a frame over `MAX_FRAME_BYTES`.
+/// `InvalidData` for a frame over `flow`'s limit.
 pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     order: LengthOrder,
+    flow: FrameFlow,
 ) -> io::Result<Option<Vec<u8>>> {
     let mut length_bytes = [0u8; 4];
     match reader.read_exact(&mut length_bytes).await {
@@ -37,10 +55,11 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
         LengthOrder::Little => u32::from_le_bytes(length_bytes),
     };
     let length = usize::try_from(length).map_err(io::Error::other)?;
-    if length > MAX_FRAME_BYTES {
+    let max_bytes = flow.max_bytes();
+    if length > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("frame of {length} bytes is over the {MAX_FRAME_BYTES} byte limit"),
+            format!("frame of {length} bytes is over the {max_bytes} byte limit"),
         ));
     }
     let mut frame = vec![0u8; length];
@@ -52,17 +71,19 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
 ///
 /// # Errors
 ///
-/// Returns the write error, and `InvalidData` for a frame over `MAX_FRAME_BYTES`.
+/// Returns the write error, and `InvalidData` for a frame over `flow`'s limit.
 pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     order: LengthOrder,
+    flow: FrameFlow,
     frame: &[u8],
 ) -> io::Result<()> {
-    if frame.len() > MAX_FRAME_BYTES {
+    let max_bytes = flow.max_bytes();
+    if frame.len() > max_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "frame of {} bytes is over the {MAX_FRAME_BYTES} byte limit",
+                "frame of {} bytes is over the {max_bytes} byte limit",
                 frame.len()
             ),
         ));

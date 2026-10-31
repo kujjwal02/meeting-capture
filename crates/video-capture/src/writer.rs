@@ -19,7 +19,8 @@ use stem_timing::UtcAnchor;
 
 use crate::manifest::{
     ClockRecord, FragmentRecord, FrameCounts, PartRecord, VideoCodec, VideoGapRecord,
-    VideoManifest, VideoSegmentRecord, VideoSegmentState, WindowChangeRecord, WindowRecord,
+    VideoManifest, VideoSegmentRecord, VideoSegmentState, VideoSource, WindowChangeRecord,
+    WindowRecord,
 };
 use crate::playlist::{self, ENDLIST_LINE, PLAYLIST_FILE_NAME, PlaylistEntry};
 use crate::{
@@ -42,8 +43,25 @@ pub struct SegmentStart<'a> {
     pub call_id: &'a str,
     pub platform: Platform,
     pub codec: VideoCodec,
-    pub window: WindowRecord,
-    pub clock: UtcAnchor,
+    pub source: SegmentSource,
+}
+
+/// What records the segment.
+pub enum SegmentSource {
+    /// A window through ScreenCaptureKit, with the host clock read against UTC now.
+    Window {
+        window: WindowRecord,
+        clock: UtcAnchor,
+    },
+    /// mc-meet's tab capture. Chrome stamps frames with UTC, so the segment needs no clock.
+    MeetTab,
+}
+
+/// When a part's or a fragment's first frame was captured, on the clock its source stamps.
+#[derive(Debug, Clone, Copy)]
+pub enum FrameTime {
+    HostTime(u64),
+    Utc(Timestamp),
 }
 
 /// One fragment as it landed on disk.
@@ -59,8 +77,8 @@ pub struct VideoSegmentWriter {
     folder: PathBuf,
     segment_dir: PathBuf,
     manifest: VideoManifest,
-    clock: UtcAnchor,
-    clock_utc: Timestamp,
+    /// The host clock reading and its UTC. `None` for a Meet tab segment.
+    clock: Option<(UtcAnchor, Timestamp)>,
     playlist: File,
     next_fragment: u32,
     fragments_since_checkpoint: u32,
@@ -117,20 +135,27 @@ impl VideoSegmentWriter {
             .and_then(|()| playlist.sync_data())
             .map_err(io_error(&playlist_path))?;
         crate::sync_folder(&segment_dir)?;
-        let clock_utc = utc_timestamp(start.clock.utc)?;
+        let (source, window, clock) = match start.source {
+            SegmentSource::Window { window, clock } => {
+                let clock_utc = utc_timestamp(clock.utc)?;
+                (VideoSource::Window, Some(window), Some((clock, clock_utc)))
+            }
+            SegmentSource::MeetTab => (VideoSource::MeetTab, None, None),
+        };
         manifest.segments.push(VideoSegmentRecord {
             number: start.number,
             audio_segment: Some(start.audio_segment),
             call_id: Some(start.call_id.to_owned()),
             platform: start.platform,
+            source,
             state: VideoSegmentState::Open,
             folder: folder_name,
             playlist: PLAYLIST_FILE_NAME.to_owned(),
             codec: start.codec,
-            clock: Some(clock_record(start.clock, clock_utc)),
+            clock: clock.map(|(anchor, utc)| clock_record(anchor, utc)),
             closing_clock: None,
             closed_at: None,
-            window: Some(start.window),
+            window,
             first_host_time_ns: None,
             started_at: None,
             last_host_time_ns: None,
@@ -141,6 +166,7 @@ impl VideoSegmentWriter {
             frames: FrameCounts::default(),
             stream_rebuilds: 0,
             stopped_by: None,
+            playback_latency_ms: None,
             repair: None,
         });
         manifest.store(folder)?;
@@ -148,14 +174,14 @@ impl VideoSegmentWriter {
             file.directory = %folder.display(),
             segment.number = start.number,
             call.id = start.call_id,
+            video.source = source.as_str(),
             "video.segment_started"
         );
         Ok(Self {
             folder: folder.to_owned(),
             segment_dir,
             manifest,
-            clock: start.clock,
-            clock_utc,
+            clock,
             playlist,
             next_fragment: 1,
             fragments_since_checkpoint: 0,
@@ -204,15 +230,20 @@ impl VideoSegmentWriter {
         codec: VideoCodec,
         width_px: u32,
         height_px: u32,
-        first_host_time_ns: u64,
+        first_frame: FrameTime,
     ) -> Result<u32, VideoWriterError> {
         let number = u32::try_from(self.record().parts.len()).unwrap_or(u32::MAX - 1) + 1;
         let file = format!("init-{number}.mp4");
         write_durably(&self.segment_dir, &file, init_segment)?;
-        let started_at = self.utc_at(first_host_time_ns);
+        let (first_host_time_ns, started_at, first_frame_at) = match first_frame {
+            FrameTime::HostTime(host_time_ns) => {
+                (Some(host_time_ns), self.utc_at(host_time_ns), None)
+            }
+            FrameTime::Utc(at) => (None, Some(at), Some(at)),
+        };
         let record = self.record_mut();
-        if record.first_host_time_ns.is_none() {
-            record.first_host_time_ns = Some(first_host_time_ns);
+        if record.parts.is_empty() {
+            record.first_host_time_ns = first_host_time_ns;
             record.started_at = started_at;
         }
         record.parts.push(PartRecord {
@@ -222,6 +253,7 @@ impl VideoSegmentWriter {
             width_px,
             height_px,
             first_host_time_ns,
+            first_frame_at,
         });
         // Listed in `video.json` before the playlist, so a part the playlist names always has
         // its size on record.
@@ -249,7 +281,7 @@ impl VideoSegmentWriter {
     pub fn write_fragment(
         &mut self,
         fragment: &[u8],
-        first_host_time_ns: Option<u64>,
+        first_frame: Option<FrameTime>,
         duration_ms: f64,
     ) -> Result<FragmentWritten, VideoWriterError> {
         let part = u32::try_from(self.record().parts.len()).unwrap_or(u32::MAX);
@@ -276,11 +308,17 @@ impl VideoSegmentWriter {
         })?;
         crate::sync_folder(&self.segment_dir)?;
         let bytes = u64::try_from(fragment.len()).unwrap_or(u64::MAX);
+        let (first_host_time_ns, first_frame_at) = match first_frame {
+            Some(FrameTime::HostTime(host_time_ns)) => (Some(host_time_ns), None),
+            Some(FrameTime::Utc(at)) => (None, Some(at)),
+            None => (None, None),
+        };
         let record = self.record_mut();
         record.fragments.push(FragmentRecord {
             file: file.clone(),
             part,
             first_host_time_ns,
+            first_frame_at,
             duration_ms,
             bytes,
         });
@@ -341,6 +379,12 @@ impl VideoSegmentWriter {
         self.record_mut().frames = counts;
     }
 
+    /// The tab audio playback latency the next store writes. The latest wins: the playback
+    /// path only grows its buffer.
+    pub fn set_playback_latency_ms(&mut self, latency_ms: f64) {
+        self.record_mut().playback_latency_ms = Some(latency_ms);
+    }
+
     /// Stores `video.json`.
     ///
     /// # Errors
@@ -351,7 +395,8 @@ impl VideoSegmentWriter {
         self.manifest.store(&self.folder)
     }
 
-    /// Ends the playlist and marks the segment closed.
+    /// Ends the playlist and marks the segment closed. `closing` is a second host clock
+    /// reading, `None` for a Meet tab segment.
     ///
     /// # Errors
     ///
@@ -360,14 +405,17 @@ impl VideoSegmentWriter {
     pub fn close(
         mut self,
         stopped_by: Option<String>,
-        closing: UtcAnchor,
+        closing: Option<UtcAnchor>,
     ) -> Result<VideoSegmentRecord, VideoWriterError> {
         self.append_playlist(&format!("{ENDLIST_LINE}\n"))?;
-        let closing_utc = utc_timestamp(closing.utc)?;
+        let closing_clock = match closing {
+            Some(anchor) => Some(clock_record(anchor, utc_timestamp(anchor.utc)?)),
+            None => None,
+        };
         let record = self.record_mut();
         record.state = VideoSegmentState::Closed;
-        record.closed_at = Some(closing_utc);
-        record.closing_clock = Some(clock_record(closing, closing_utc));
+        record.closed_at = Some(closing_clock.map_or_else(Timestamp::now, |clock| clock.utc));
+        record.closing_clock = closing_clock;
         record.stopped_by = stopped_by;
         self.checkpoint()?;
         let record = self.record().clone();
@@ -392,12 +440,13 @@ impl VideoSegmentWriter {
             })
     }
 
-    /// A host time in UTC, through the segment's clock reading.
+    /// A host time in UTC, through the segment's clock reading. `None` in a Meet tab segment.
     #[must_use]
     pub fn utc_at(&self, host_time_ns: u64) -> Option<Timestamp> {
-        let offset_ns = i128::from(host_time_ns) - i128::from(self.clock.host_time_ns);
+        let (anchor, anchor_utc) = self.clock?;
+        let offset_ns = i128::from(host_time_ns) - i128::from(anchor.host_time_ns);
         let offset = SignedDuration::from_nanos(i64::try_from(offset_ns).ok()?);
-        self.clock_utc.checked_add(offset).ok()
+        anchor_utc.checked_add(offset).ok()
     }
 }
 

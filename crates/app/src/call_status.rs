@@ -159,6 +159,8 @@ pub(crate) enum Observation {
     HuddleHealth(HuddleHealth),
     /// The user stopped recording the call (`true`) or resumed it (`false`).
     RecordingStopped(bool),
+    /// The call's Meet tab video wrote a fragment.
+    TabVideoRecorded,
 }
 
 /// What the user hears about a call.
@@ -253,6 +255,8 @@ pub(crate) struct EndedCallView {
     pub ended_at: Timestamp,
     pub caption_count: u64,
     pub outcome: CallOutcome,
+    /// The call's Meet tab video wrote at least one fragment.
+    pub is_tab_video_recorded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -330,6 +334,8 @@ struct TrackedCall {
     /// "Stop recording this call" was chosen and "Resume recording" was not. A rejoin
     /// (`call.resumed`) keeps it.
     is_stopped_by_user: bool,
+    /// The Meet tab video wrote a fragment. A rejoin keeps it.
+    is_tab_video_recorded: bool,
 }
 
 /// What the call announced, so each notification goes out once, even when a state flips back
@@ -551,6 +557,7 @@ impl TrackedCall {
             problems: VecDeque::new(),
             notices: CallNotices::default(),
             is_stopped_by_user: false,
+            is_tab_video_recorded: false,
         }
     }
 
@@ -633,13 +640,17 @@ impl TrackedCall {
             (Observation::HuddleHealth(health), Signals::Huddle(huddle)) => {
                 huddle.health = Some(health);
             }
+            (Observation::TabVideoRecorded, Signals::Meet(_)) => {
+                self.is_tab_video_recorded = true;
+            }
             // A source reports only on its own calls.
             (
                 Observation::MeetCaption { .. }
                 | Observation::MeetHealth { .. }
                 | Observation::MeetPortHeld(_)
                 | Observation::MeetPagesAway(_)
-                | Observation::MeetLoggedCaptions(_),
+                | Observation::MeetLoggedCaptions(_)
+                | Observation::TabVideoRecorded,
                 Signals::Huddle(_),
             )
             | (
@@ -889,6 +900,7 @@ impl EndedCall {
             ended_at: self.ended_at,
             caption_count: call.caption_count,
             outcome,
+            is_tab_video_recorded: call.is_tab_video_recorded,
         }
     }
 }
@@ -947,8 +959,14 @@ impl EndedCallView {
             CallOutcome::RecordedWithProblems => "recorded with problems",
             CallOutcome::NoTranscript => "no transcript",
         };
+        // Only the Mac records video, and only of Meet tabs.
+        let is_video_missing = match self.platform {
+            CallPlatform::Meet => cfg!(target_os = "macos") && !self.is_tab_video_recorded,
+            CallPlatform::SlackHuddle => false,
+        };
+        let video_note = if is_video_missing { ", no video" } else { "" };
         format!(
-            "{start} to {end}  {name}: {} caption{} in {minutes} min, {outcome}",
+            "{start} to {end}  {name}: {} caption{} in {minutes} min, {outcome}{video_note}",
             self.caption_count,
             plural(self.caption_count)
         )

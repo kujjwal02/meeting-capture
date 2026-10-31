@@ -10,6 +10,7 @@ license.workspace = true
 tauri-build.workspace = true
 
 [dependencies]
+base64.workspace = true
 call-folder.workspace = true
 capture-protocol.workspace = true
 huddle-captions.workspace = true

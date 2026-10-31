@@ -12,8 +12,10 @@
 // chrome.storage.session keys, which the popup reads:
 //   call_status   the app's last call_status message
 //   app           { is_reachable, app_version, checked_at_ms }
+// tab-video.js owns the Meet tab video capture and its own chrome.storage.session keys.
 
 import { decide, hasOpenSessions, restoreState, STATE_KEYS } from "./session-rules.js";
+import { createTabVideo, NEEDS_CLICK_KEY } from "./tab-video.js";
 
 const HOST_NAME = "com.meetingcapture.app";
 const PROTOCOL = 1;
@@ -92,6 +94,9 @@ async function apply(input, port) {
   }
   for (const effect of decision.effects) await runEffect(effect, port);
   if (decision.state !== state) sendPagesAway(decision.state);
+  if (JSON.stringify(decision.state.tabSessions) !== JSON.stringify(state.tabSessions)) {
+    tabVideo.reconcile();
+  }
 }
 
 // Tells the app which sessions wait for their tab to come back, so it does not take a closed or
@@ -216,11 +221,19 @@ async function noteAppReachable(isReachable, appVersion) {
 }
 
 // The look of one tab: { icon, badge, title }.
-function lookOf(callStatus, isAppReachable) {
+function lookOf(callStatus, isAppReachable, isVideoClickNeeded) {
   if (!isAppReachable) {
     return { icon: "off", badge: "OFF", title: "Meeting Capture is not running" };
   }
   if (!callStatus) return { icon: "idle", badge: "", title: "mc-meet: connected" };
+  const isCallLive = ["waiting", "recording", "problem"].includes(callStatus.state);
+  if (isVideoClickNeeded && isCallLive) {
+    return {
+      icon: "problem",
+      badge: "REC?",
+      title: "Click to record this tab's video",
+    };
+  }
   switch (callStatus.state) {
     case "recording":
       return {
@@ -245,6 +258,7 @@ async function showStatusOnTabs() {
   const { tabSessions } = restoreState(await store.readState(), Date.now());
   const callStatus = (await chrome.storage.session.get(CALL_STATUS_KEY))[CALL_STATUS_KEY];
   const { is_reachable: isAppReachable } = await readAppReachability();
+  const needsClick = (await chrome.storage.session.get(NEEDS_CLICK_KEY))[NEEDS_CLICK_KEY] ?? {};
   const tabs = await chrome.tabs.query({ url: MEET_TABS });
   for (const tab of tabs) {
     const sessionId = tabSessions[tab.id];
@@ -260,7 +274,7 @@ async function showStatusOnTabs() {
         is_stopped: status.state === "stopped",
       });
     }
-    const look = lookOf(status, isAppReachable);
+    const look = lookOf(status, isAppReachable, tab.id in needsClick);
     const tabId = tab.id;
     await chrome.action
       .setIcon({
@@ -280,6 +294,11 @@ function connectPopup(port) {
   popupPorts.add(port);
   ensureNative();
   port.onMessage.addListener((message) => {
+    if (message?.type === "popup_opened") {
+      // Opening the popup invokes mc-meet on the tab, which lets it capture the tab.
+      tabVideo.onInvoked(message.tab_id);
+      return;
+    }
     if (message?.type === "stop_recording" || message?.type === "resume_recording") {
       serially(async () => {
         if (!nativePort || !isWelcomed) return;
@@ -319,6 +338,7 @@ function tellPopups(message) {
 async function storeCallStatus(callStatus) {
   await chrome.storage.session.set({ [CALL_STATUS_KEY]: callStatus });
   await showStatusOnTabs();
+  tabVideo.noteCallStatus();
 }
 
 async function requestSnapshots(sessionIds) {
@@ -422,6 +442,8 @@ function connectNative(sessions) {
       serially(() => noteFolderVersion(message.folder_version));
       serially(resendUnacked);
       serially(async () => sendPagesAway(restoreState(await store.readState(), Date.now())));
+      tabVideo.onAppWelcomed();
+      tabVideo.reconcile();
       // A restarted app has no health for the calls; each tab resends its own.
       for (const tabPort of tabPorts.values()) tellTab(tabPort, { type: "app_connected" });
       tellPopups({ type: "app_changed" });
@@ -467,6 +489,24 @@ function storeSettings(settings) {
   });
 }
 
+// Video messages from tab-video.js. They are not queued in storage: a lost fragment costs two
+// seconds of video, and tab-video.js holds a few in memory while the port is down.
+function sendToApp(message) {
+  if (nativePort && isWelcomed) {
+    nativePort.postMessage(message);
+    return true;
+  }
+  ensureNative();
+  return false;
+}
+
+// Its listeners must register in the worker's first run, as this file's do.
+const tabVideo = createTabVideo({
+  sendToApp,
+  refreshLook: () => serially(showStatusOnTabs),
+  readTabSessions: async () => restoreState(await store.readState(), Date.now()).tabSessions,
+});
+
 function ensureNative() {
   if (nativePort || reconnectTimer !== null) return;
   serially(async () => {
@@ -504,4 +544,5 @@ chrome.runtime.onInstalled.addListener(async (details) => {
 chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
 serially(holdSessionsOfMissingTabs);
 serially(showStatusOnTabs);
+tabVideo.reconcile();
 ensureNative();

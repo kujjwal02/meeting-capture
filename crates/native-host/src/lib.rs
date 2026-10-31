@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncWrite;
 use tracing::Instrument as _;
 
-use crate::frames::{LengthOrder, read_frame, write_frame};
+use crate::frames::{FrameFlow, LengthOrder, read_frame, write_frame};
 
 /// The native messaging host name the extension connects to.
 pub const HOST_NAME: &str = "com.meetingcapture.app";
@@ -66,7 +66,13 @@ async fn relay(origin: &str, socket: &Path) -> io::Result<()> {
     let Some(connection) = connect_or_start_app(socket).await else {
         tracing::warn!("the app did not start in time");
         let unavailable = serde_json::json!({ "type": "app_unavailable" });
-        return send_json(&mut to_chrome, LengthOrder::Native, &unavailable).await;
+        return send_json(
+            &mut to_chrome,
+            LengthOrder::Native,
+            FrameFlow::ToExtension,
+            &unavailable,
+        )
+        .await;
     };
     let (mut from_app, mut to_app) = tokio::io::split(connection);
     let hello = serde_json::json!({
@@ -74,20 +80,47 @@ async fn relay(origin: &str, socket: &Path) -> io::Result<()> {
         "origin": origin,
         "host_version": env!("CARGO_PKG_VERSION"),
     });
-    send_json(&mut to_app, LengthOrder::Little, &hello).await?;
+    // It travels with the extension's frames, so it takes their limit.
+    send_json(
+        &mut to_app,
+        LengthOrder::Little,
+        FrameFlow::FromExtension,
+        &hello,
+    )
+    .await?;
     tracing::info!("relaying");
 
     let mut from_chrome = tokio::io::stdin();
     let chrome_to_app = async {
-        while let Some(frame) = read_frame(&mut from_chrome, LengthOrder::Native).await? {
-            write_frame(&mut to_app, LengthOrder::Little, &frame).await?;
+        while let Some(frame) = read_frame(
+            &mut from_chrome,
+            LengthOrder::Native,
+            FrameFlow::FromExtension,
+        )
+        .await?
+        {
+            write_frame(
+                &mut to_app,
+                LengthOrder::Little,
+                FrameFlow::FromExtension,
+                &frame,
+            )
+            .await?;
         }
         tracing::info!("Chrome closed the port");
         io::Result::Ok(())
     };
     let app_to_chrome = async {
-        while let Some(frame) = read_frame(&mut from_app, LengthOrder::Little).await? {
-            write_frame(&mut to_chrome, LengthOrder::Native, &frame).await?;
+        while let Some(frame) =
+            read_frame(&mut from_app, LengthOrder::Little, FrameFlow::ToExtension).await?
+        {
+            write_frame(
+                &mut to_chrome,
+                LengthOrder::Native,
+                FrameFlow::ToExtension,
+                &frame,
+            )
+            .await?;
         }
         tracing::info!("the app closed the connection");
         io::Result::Ok(())
@@ -101,10 +134,11 @@ async fn relay(origin: &str, socket: &Path) -> io::Result<()> {
 async fn send_json<W: AsyncWrite + Unpin>(
     writer: &mut W,
     order: LengthOrder,
+    flow: FrameFlow,
     message: &serde_json::Value,
 ) -> io::Result<()> {
     let frame = serde_json::to_vec(message).map_err(io::Error::other)?;
-    write_frame(writer, order, &frame).await
+    write_frame(writer, order, flow, &frame).await
 }
 
 async fn connect_or_start_app(socket: &Path) -> Option<socket::HostEnd> {

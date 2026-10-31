@@ -6,15 +6,17 @@ mod call_book;
 mod call_log;
 mod log_folder;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use native_host::frames::{LengthOrder, read_frame, write_frame};
+use native_host::frames::{FrameFlow, LengthOrder, read_frame, write_frame};
 use native_host::socket::{AppEnd, CallListener};
 use pipeline::Pipeline;
 use pipeline::settings::MeetSettings;
@@ -22,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use sources::browser_call::HealthSource;
 use tauri::{AppHandle, Manager as _};
 use tokio::io::{AsyncWrite, ReadHalf};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, watch};
 use tracing::Instrument as _;
 
@@ -41,6 +44,9 @@ const PROTOCOL: u32 = 1;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// Snapshot requests a slow port may fall behind by before it misses some.
 const SNAPSHOT_REQUEST_BACKLOG: usize = 16;
+/// While a call wants its tab video, `call_status` goes out at least this often, changed or not.
+/// mc-meet stops capturing after 10 s without one, so a lost stop cannot leave it recording.
+const VIDEO_STATUS_HEARTBEAT: Duration = Duration::from_secs(5);
 
 /// The call book, shared by every connection.
 pub(crate) struct BrowserCalls {
@@ -52,6 +58,57 @@ pub(crate) struct BrowserCalls {
     call_status: watch::Sender<CallStatusMessage>,
     /// Session ids whose page snapshot the app wants. Every welcomed port forwards them.
     snapshot_requests: broadcast::Sender<Vec<String>>,
+    /// Each recording call's tab video task, by call id.
+    tab_video: Mutex<HashMap<PathBuf, TabVideoEntry>>,
+    /// When `call_status` last went out.
+    call_status_sent_at: Mutex<Instant>,
+}
+
+/// Where a call's tab video goes, and whether mc-meet should capture it.
+struct TabVideoEntry {
+    sink: mpsc::Sender<TabVideoInput>,
+    is_wanted: bool,
+}
+
+/// mc-meet's tab capture state, as `video_state` reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TabVideoState {
+    NeedsClick,
+    Capturing,
+    Stopped,
+    Failed,
+}
+
+impl TabVideoState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsClick => "needs_click",
+            Self::Capturing => "capturing",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// The last fragment of a capture that stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CaptureEnd {
+    pub capture_id: String,
+    /// 0 when the capture sent no fragment.
+    pub last_index: u64,
+}
+
+/// What the relay hands the call's tab video task.
+#[derive(Debug)]
+pub(crate) enum TabVideoInput {
+    Fragment(video_capture::TabFragment),
+    State {
+        state: TabVideoState,
+        detail: Option<String>,
+        /// Set on a `stopped` that names its capture's last fragment.
+        ended: Option<CaptureEnd>,
+    },
 }
 
 /// What the tray shows for mc-meet.
@@ -70,27 +127,48 @@ impl BrowserCalls {
             meet_settings: watch::Sender::new(meet_settings),
             call_status: watch::Sender::new(CallStatusMessage::default()),
             snapshot_requests: broadcast::channel(SNAPSHOT_REQUEST_BACKLOG).0,
+            tab_video: Mutex::new(HashMap::new()),
+            call_status_sent_at: Mutex::new(Instant::now()),
         }
     }
 
     /// Sends mc-meet the Meet calls' status when it changed. Times in labels use `time_zone`.
     pub fn publish_call_status(&self, view: &BoardView, time_zone: &TimeZone) {
-        let message = {
+        let meet_calls = view
+            .calls
+            .iter()
+            .filter(|call| call.platform == CallPlatform::Meet);
+        let mut message = {
             let book = self.lock();
             CallStatusMessage {
-                calls: view
-                    .calls
-                    .iter()
-                    .filter(|call| call.platform == CallPlatform::Meet)
+                calls: meet_calls
+                    .clone()
                     .map(|call| MeetCallStatus::new(call, book.sessions_of(&call.id), time_zone))
                     .collect(),
             }
         };
-        self.call_status.send_if_modified(|current| {
+        // After the book lock is released: the two locks are never held together.
+        {
+            let tab_video = self.lock_tab_video();
+            for (status, call) in message.calls.iter_mut().zip(meet_calls) {
+                status.is_video_wanted =
+                    tab_video.get(&call.id).is_some_and(|entry| entry.is_wanted);
+            }
+        }
+        let is_video_wanted = message.calls.iter().any(|call| call.is_video_wanted);
+        let mut sent_at = self
+            .call_status_sent_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let is_heartbeat_due = is_video_wanted && sent_at.elapsed() >= VIDEO_STATUS_HEARTBEAT;
+        let is_sent = self.call_status.send_if_modified(|current| {
             let is_changed = *current != message;
             *current = message;
-            is_changed
+            is_changed || is_heartbeat_due
         });
+        if is_sent {
+            *sent_at = Instant::now();
+        }
     }
 
     /// Takes the user's stop or resume onto the board. Logs it first in an open Meet call's
@@ -153,8 +231,44 @@ impl BrowserCalls {
         });
     }
 
+    /// Routes the call's tab video to `sink` and marks it wanted.
+    pub fn open_tab_video(&self, call_id: &Path, sink: mpsc::Sender<TabVideoInput>) {
+        self.lock_tab_video().insert(
+            call_id.to_path_buf(),
+            TabVideoEntry {
+                sink,
+                is_wanted: true,
+            },
+        );
+    }
+
+    /// Keeps the sink but tells mc-meet to stop or start capturing.
+    pub fn set_tab_video_wanted(&self, call_id: &Path, is_wanted: bool) {
+        if let Some(entry) = self.lock_tab_video().get_mut(call_id) {
+            entry.is_wanted = is_wanted;
+        }
+    }
+
+    /// Drops the sink. Later fragments for the call are dropped.
+    pub fn close_tab_video(&self, call_id: &Path) {
+        self.lock_tab_video().remove(call_id);
+    }
+
+    /// The call's tab video sink, if its task is open.
+    fn tab_video_sink(&self, call_id: &Path) -> Option<mpsc::Sender<TabVideoInput>> {
+        self.lock_tab_video()
+            .get(call_id)
+            .map(|entry| entry.sink.clone())
+    }
+
     fn lock(&self) -> MutexGuard<'_, CallBook> {
         self.book.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_tab_video(&self) -> MutexGuard<'_, HashMap<PathBuf, TabVideoEntry>> {
+        self.tab_video
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn status(&self) -> BrowserCallStatus {
@@ -219,9 +333,90 @@ enum ExtensionMessage {
     ResumeRecording {
         session_id: String,
     },
+    /// One fMP4 fragment of the Meet tab's video. Not queued or acked: mc-meet keeps a short
+    /// buffer across a reconnect, and the writer drops a repeat.
+    VideoFragment(VideoFragmentMessage),
+    /// mc-meet's tab capture changed state.
+    VideoState(VideoStateMessage),
     /// A type from a newer extension.
     #[serde(other)]
     Unknown,
+}
+
+/// The fields of a `video_state`, as mc-meet sends them.
+#[derive(Deserialize)]
+struct VideoStateMessage {
+    session_id: String,
+    state: TabVideoState,
+    /// Why capture stopped, or the error it failed with.
+    #[serde(default)]
+    detail: Option<String>,
+    /// With `last_index`, on a `stopped`: the capture that ended.
+    #[serde(default)]
+    capture_id: Option<String>,
+    #[serde(default)]
+    last_index: Option<u64>,
+}
+
+/// The fields of a `video_fragment`, as mc-meet sends them.
+#[derive(Deserialize)]
+struct VideoFragmentMessage {
+    session_id: String,
+    capture_id: String,
+    part: u32,
+    codec: video_capture::VideoCodec,
+    width_px: u32,
+    height_px: u32,
+    init_base64: String,
+    index: u64,
+    first_frame_utc_ms: f64,
+    duration_ms: f64,
+    frame_count: u32,
+    #[serde(default)]
+    playback_latency_ms: Option<f64>,
+    #[serde(default)]
+    playback_base_latency_ms: Option<f64>,
+    #[serde(default)]
+    part_clock_offset_ms: Option<f64>,
+    #[serde(default)]
+    clock_offset_ms: Option<f64>,
+    bytes_base64: String,
+}
+
+impl VideoFragmentMessage {
+    /// Decodes the base64 and the first frame's time. Runs on the relay task: a few hundred KB
+    /// every 2 s is cheap next to a hop to another thread.
+    fn decode(self) -> Result<video_capture::TabFragment, FragmentDecodeError> {
+        let decode = |field: &'static str, encoded: &str| {
+            BASE64
+                .decode(encoded)
+                .map_err(|source| FragmentDecodeError::Base64 { field, source })
+        };
+        let init_segment = decode("init_base64", &self.init_base64)?;
+        let bytes = decode("bytes_base64", &self.bytes_base64)?;
+        let first_frame_at = timestamp_of_utc_ms(self.first_frame_utc_ms).ok_or(
+            FragmentDecodeError::FirstFrameTime {
+                utc_ms: self.first_frame_utc_ms,
+            },
+        )?;
+        Ok(video_capture::TabFragment {
+            capture_id: self.capture_id,
+            part: self.part,
+            codec: self.codec,
+            width_px: self.width_px,
+            height_px: self.height_px,
+            init_segment,
+            index: self.index,
+            first_frame_at,
+            part_clock_offset_ms: self.part_clock_offset_ms.filter(|ms| ms.is_finite()),
+            clock_offset_ms: self.clock_offset_ms.filter(|ms| ms.is_finite()),
+            duration_ms: self.duration_ms,
+            frame_count: self.frame_count,
+            playback_latency_ms: self.playback_latency_ms,
+            playback_base_latency_ms: self.playback_base_latency_ms,
+            bytes,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -275,6 +470,9 @@ struct MeetCallStatus {
     caption_source: Option<CaptionSourceWord>,
     /// The last problems, oldest first.
     problems: Vec<ProblemStatus>,
+    /// The app records this call and wants its Meet tab's video. mc-meet captures the tab
+    /// while it holds.
+    is_video_wanted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -342,6 +540,8 @@ impl MeetCallStatus {
                     at_label: clock(problem.at, time_zone),
                 })
                 .collect(),
+            // `publish_call_status` fills it from the tab video registry.
+            is_video_wanted: false,
         }
     }
 }
@@ -552,6 +752,8 @@ impl Port {
                 | ExtensionMessage::SaveDebugReport { .. }
                 | ExtensionMessage::StopRecording { .. }
                 | ExtensionMessage::ResumeRecording { .. }
+                | ExtensionMessage::VideoFragment(_)
+                | ExtensionMessage::VideoState(_)
                     if !is_host_known =>
                 {
                     tracing::warn!("refused a connection that skipped the host hello");
@@ -597,6 +799,8 @@ impl Port {
                 | ExtensionMessage::SaveDebugReport { .. }) => {
                     self.take_debug_message(message, &reply_sender);
                 }
+                ExtensionMessage::VideoFragment(message) => self.take_tab_fragment(message),
+                ExtensionMessage::VideoState(message) => self.take_tab_video_state(message),
                 ExtensionMessage::Unknown => {}
             }
         }
@@ -748,6 +952,8 @@ impl Port {
             | ExtensionMessage::PagesAway { .. }
             | ExtensionMessage::StopRecording { .. }
             | ExtensionMessage::ResumeRecording { .. }
+            | ExtensionMessage::VideoFragment(_)
+            | ExtensionMessage::VideoState(_)
             | ExtensionMessage::Unknown => {}
         }
     }
@@ -847,6 +1053,118 @@ impl Port {
             }
         }
         is_acked(&logged)
+    }
+
+    /// The call a video message's session writes to, or `None` after logging why there is none.
+    fn call_of_video_session(&self, session_id: &str) -> Option<PathBuf> {
+        match self.calls().call_of_session(session_id) {
+            Ok(Some(call_id)) => Some(call_id),
+            Ok(None) => {
+                tracing::debug!(
+                    browser_call.session_id = session_id,
+                    "a video message names a session with no call"
+                );
+                None
+            }
+            Err(invalid) => {
+                tracing::warn!(exception.message = %invalid, "refused a video message");
+                None
+            }
+        }
+    }
+
+    // Never acked or answered: a lost fragment is a gap, and mc-meet resends its buffer after a
+    // reconnect.
+    fn take_tab_fragment(&self, message: VideoFragmentMessage) {
+        let session_id = message.session_id.clone();
+        let fragment = match message.decode() {
+            Ok(fragment) => fragment,
+            Err(error) => {
+                tracing::warn!(
+                    browser_call.session_id = session_id,
+                    exception.message = %error,
+                    "video.fragment_invalid"
+                );
+                return;
+            }
+        };
+        let Some(call_id) = self.call_of_video_session(&session_id) else {
+            return;
+        };
+        let Some(sink) = self.calls().tab_video_sink(&call_id) else {
+            tracing::debug!(
+                call.id = %call_id.display(),
+                video.capture_id = fragment.capture_id,
+                video.fragment_index = fragment.index,
+                "video.fragment_unrouted"
+            );
+            return;
+        };
+        let (capture_id, index) = (fragment.capture_id.clone(), fragment.index);
+        match sink.try_send(TabVideoInput::Fragment(fragment)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => tracing::warn!(
+                call.id = %call_id.display(),
+                video.capture_id = capture_id,
+                video.fragment_index = index,
+                "video.fragment_dropped"
+            ),
+            // The task ended between the lookup and the send; it closes its entry itself.
+            Err(TrySendError::Closed(_)) => tracing::debug!(
+                call.id = %call_id.display(),
+                video.capture_id = capture_id,
+                video.fragment_index = index,
+                "video.fragment_unrouted"
+            ),
+        }
+    }
+
+    fn take_tab_video_state(&self, message: VideoStateMessage) {
+        let VideoStateMessage {
+            session_id,
+            state,
+            detail,
+            capture_id,
+            last_index,
+        } = message;
+        tracing::info!(
+            browser_call.session_id = session_id,
+            video.tab_state = state.as_str(),
+            video.detail = detail.as_deref(),
+            video.capture_id = capture_id.as_deref(),
+            video.last_fragment_index = last_index,
+            "video.tab_state"
+        );
+        let ended = match state {
+            TabVideoState::Stopped => {
+                capture_id
+                    .zip(last_index)
+                    .map(|(capture_id, last_index)| CaptureEnd {
+                        capture_id,
+                        last_index,
+                    })
+            }
+            TabVideoState::NeedsClick | TabVideoState::Capturing | TabVideoState::Failed => None,
+        };
+        let Some(call_id) = self.call_of_video_session(&session_id) else {
+            return;
+        };
+        let Some(sink) = self.calls().tab_video_sink(&call_id) else {
+            return;
+        };
+        match sink.try_send(TabVideoInput::State {
+            state,
+            detail,
+            ended,
+        }) {
+            // A closed sink means the task ended between the lookup and the send.
+            Ok(()) | Err(TrySendError::Closed(_)) => {}
+            Err(TrySendError::Full(_)) => tracing::warn!(
+                call.id = %call_id.display(),
+                video.tab_state = state.as_str(),
+                "video.tab_state_dropped"
+            ),
+        }
     }
 
     // A frame of a session the app has no open call for is dropped: its call ended, or its
@@ -957,7 +1275,12 @@ impl PortFeeds {
 async fn read_next_frame(
     mut from_host: ReadHalf<AppEnd>,
 ) -> (ReadHalf<AppEnd>, std::io::Result<Option<Vec<u8>>>) {
-    let frame = read_frame(&mut from_host, LengthOrder::Little).await;
+    let frame = read_frame(
+        &mut from_host,
+        LengthOrder::Little,
+        FrameFlow::FromExtension,
+    )
+    .await;
     (from_host, frame)
 }
 
@@ -966,7 +1289,33 @@ async fn send(
     message: &AppMessage,
 ) -> std::io::Result<()> {
     let frame = serde_json::to_vec(message).map_err(std::io::Error::other)?;
-    write_frame(to_host, LengthOrder::Little, &frame).await
+    write_frame(to_host, LengthOrder::Little, FrameFlow::ToExtension, &frame).await
+}
+
+/// Why a `video_fragment` could not become a `TabFragment`.
+#[derive(Debug, thiserror::Error)]
+enum FragmentDecodeError {
+    #[error("{field} is not valid base64: {source}")]
+    Base64 {
+        field: &'static str,
+        source: base64::DecodeError,
+    },
+    #[error("first_frame_utc_ms {utc_ms} is not a time")]
+    FirstFrameTime { utc_ms: f64 },
+}
+
+fn timestamp_of_utc_ms(utc_ms: f64) -> Option<Timestamp> {
+    // Past year 9999 jiff refuses the time anyway; the bound keeps the cast exact.
+    const LIMIT_MS: f64 = 253_402_300_800_000.0;
+    if !utc_ms.is_finite() || utc_ms.abs() > LIMIT_MS {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the value is finite and checked against jiff's range above"
+    )]
+    let nanoseconds = (utc_ms * 1e6).round() as i128;
+    Timestamp::from_nanosecond(nanoseconds).ok()
 }
 
 // A browser that quit or crashed sends no `call_ended`, so a timer ends its calls.

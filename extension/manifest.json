@@ -11,7 +11,10 @@
     "unlimitedStorage",
     "alarms",
     "scripting",
-    "notifications"
+    "notifications",
+    "tabCapture",
+    "offscreen",
+    "contextMenus"
   ],
   "host_permissions": ["https://meet.google.com/*"],
   "icons": { "16": "icons/idle-16.png", "32": "icons/idle-32.png" },
@@ -19,6 +22,12 @@
     "default_icon": { "16": "icons/idle-16.png", "32": "icons/idle-32.png" },
     "default_title": "mc-meet",
     "default_popup": "popup/popup.html"
+  },
+  "commands": {
+    "toggle-recording": {
+      "suggested_key": { "default": "Alt+Shift+V" },
+      "description": "Stop or resume recording this Meet call"
+    }
   },
   "background": {
     "service_worker": "background.js",

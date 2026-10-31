@@ -17,7 +17,11 @@ to the meeting-capture app over native messaging. The design is in `docs/09-meet
 | `content/main.js` | Meet tab, isolated world | Call start and end, session, runs the DOM reader the policy picks, sends health events. |
 | `session-rules.js` | Service worker, or plain Node | Session rules and event numbers, with no `chrome.*` calls. |
 | `background.js` | Service worker | Storage, native port, queue, resend. Runs the effects `session-rules.js` returns. Sets each Meet tab's toolbar icon from the app's call status. |
-| `popup/` | Toolbar popup | The active tab's call status and a "Save debug report" button. |
+| `tab-video.js` | Service worker | Picks the Meet tab whose call wants video, starts and stops its capture, forwards fragments to the app. |
+| `offscreen/offscreen.html` | Offscreen document | Page that loads `capture.js`. |
+| `offscreen/capture.js` | Offscreen document | Opens the tab stream, plays its audio back, encodes video with WebCodecs, sends fMP4 fragments. |
+| `offscreen/fmp4.js` | Offscreen document, or plain Node | fMP4 init segment and fragment writer for one video track. No DOM. |
+| `popup/` | Toolbar popup | The active tab's call status, its video state and a "Save debug report" button. |
 | `icons/` | | Toolbar icons: idle, recording, problem and off, at 16 and 32 px. |
 | `PROTOCOL-NOTES.md` | | Field numbers the decoder relies on, with sources. |
 

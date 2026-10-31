@@ -272,6 +272,8 @@
   // renders no caption box, since the captions go to the hook's channels. A second press stops
   // the stream, so the policy asks for one press per call. Never touches the caption language.
   function requestCaptions(nowMs) {
+    // Meet may ignore the press while the page has no focus, as a notification can take it.
+    console.info("mc-meet: captions press", { has_focus: document.hasFocus() });
     const button = findIconButton(selectors.captionsOffIcon);
     if (button) {
       captionSource.decide({ kind: "captions_requested", atMs: nowMs });
