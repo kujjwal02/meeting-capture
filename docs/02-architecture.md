@@ -158,7 +158,7 @@ The app tracks each open Meet call and huddle in one status board
   icon. At a Meet call's first problem the app writes the lead-up and asks for a page snapshot.
   [mc-meet](09-meet-extension.md) has the debug material and the debug report.
 
-### Audio (phases 2, 3, 3b, 5, 7)
+### Audio and video (phases 2, 3, 3b, 3c, 5)
 
 ```mermaid
 flowchart LR
@@ -167,7 +167,9 @@ flowchart LR
     DET["detect"] -->|mic taken / released| CALLS
     CALLS -->|call started / ended| APP["app"]
     APP -->|start / stop| HELPER["mc-capture"]
-    APP --> OBS["obs-control"]
+    APP -->|start / window / stop| VIDEO["mc-capture video"]
+    VIDEO --> VC["video-capture"]
+    VC --> VMEDIA[("NNN-video/, video.json")]
     HELPER --> CAP["capture"]
     CAP -->|PCM frames| HELPER
     HELPER --> STEM["stem-writer"]
@@ -183,21 +185,46 @@ flowchart LR
   Windows module uses WASAPI process loopback. Both use `cpal` for the mic.
 - `mc-capture` is a helper process the app spawns and restarts. It connects `capture` to
   `stem-writer`; neither crate knows about the other. A crash in capture never stops the tray.
-- The app's `audio_capture` module supervises `mc-capture audio` over JSON lines on stdin and
+- The app's `call_capture` module supervises `mc-capture audio` over JSON lines on stdin and
   stdout. The `capture-protocol` crate holds the line types. [Phase 3
   detail](03-roadmap.md#phase-3-detail) has the messages and the restart rules.
 - Call folders live in the app data folder under `calls/`, one per call, named after the
   call log. They never go in the vault.
 - `capture` and `stem-writer` both depend on `stem-timing`, which holds the types they share:
   `Stem`, `BufferStamp`, `StemLosses` and `UtcAnchor`.
-- `obs-control` starts and stops OBS video recording with the call.
+- For a Slack huddle on the Mac, `call_capture` also runs `mc-capture video` with the huddle
+  window's id, title and pid, on the same segment number. One stop control stops both. Video may
+  fail alone while audio records on.
+- Video records the window id the huddle watcher read, never a window found by title: Slack's
+  main window shows private messages. The watcher sends the id only once the huddle's content
+  shows in the window, since a conversation popped out into its own window looks the same before
+  that. A huddle whose window id is unreadable gets no video. When the user reopens the huddle
+  window, the watcher reports its new id and `call_capture` hands it to the running video
+  process.
+- A stop from the macOS sharing controls holds for the rest of the run: a wake or a new window
+  starts no video until the call resumes.
+- A quiet stream gets a stall check only when its last frame was complete. A still window, or a
+  huddle with every camera off, sends one idle status and then nothing, so video cannot tell a
+  stream that hangs after its idle status from a still one. Such a hang goes unnoticed until the
+  window changes; rebuilding every quiet idle stream would cut still recordings instead.
+- A stream stop that times out leaves a capture that may still run, so the video process closes
+  the segment and exits, and `call_capture` restarts it.
+- Video follows the audio helper across a sleep: the audio's sleep report stops the video segment,
+  and its wake starts the next on the audio's wake segment. A video restart takes video's next
+  free number, so each video segment records the `audio_segment` it pairs with.
+- `video-capture` records that one window through ScreenCaptureKit at up to 1280x720 and 15 fps,
+  even while other windows cover it. VideoToolbox encodes HEVC in hardware, and AVAssetWriter cuts
+  2 s HLS fragments into `NNN-video/`. Each fragment is fsynced, then listed in `index.m3u8` and
+  `video.json`. Meet video comes from tab capture instead.
 - Each capture process keeps its own manifest in the call folder: `audio.json` from the audio
   process, `video.json` from the video process. Finalize reads both.
-- Repair lives in `stem-writer`, beside the WAV and manifest code it must match. The app runs it
-  over `calls/` at launch. Each segment start runs it on its own folder. `mc-capture repair
-  --folder` runs it by hand.
+- Audio repair lives in `stem-writer` and video repair in `video-capture`, each beside the
+  writer it must match. The app runs both over `calls/` at launch. Video repair ends each open
+  playlist with `#EXT-X-ENDLIST`, keeps listed fragments and drops unlisted partial ones. Each
+  segment start runs its process's repair on its own folder. `mc-capture repair --folder` runs
+  both by hand.
 - `call-folder` holds what every capture process shares about a call folder: the OS file lock
-  that marks a live writer (`audio.lock`, later `video.lock`) and the walk over `calls/`.
+  that marks a live writer (`audio.lock`, `video.lock`) and the walk over `calls/`.
 
 ## 2. Transcribe (phases 4, 6)
 
@@ -256,8 +283,9 @@ flowchart TB
     HC --> SRC
 ```
 
-Later crates attach in their phase: the app depends on `detect`, `capture`, `stem-writer` and
-`obs-control`; `sources` depends on `stt`.
+Later crates attach in their phase: the app depends on `detect`, `capture-protocol`,
+`stem-writer` and `video-capture`; `mc-capture` on `capture`, `stem-writer` and `video-capture`;
+`sources` depends on `stt`.
 
 - The two binaries own the wiring. Library crates never depend on `meeting-capture` or `cli`.
 - Only `meeting-capture` depends on Tauri.
@@ -279,12 +307,13 @@ Later crates attach in their phase: the app depends on `detect`, `capture`, `ste
 | call-folder | 3 | The per-process lock on a call folder and the walk over `calls/`, shared by every capture process and repair | std file locks |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV placed by host time, fsynced every 4.5 s, and `audio.json` | `rubato` |
 | stt | 4 | VAD, Parakeet TDT 0.6B v3 int8, diarization of the remote stem | `sherpa-onnx` |
-| obs-control | 7 | Start and stop OBS video recording with the call | `obws` |
+| video-capture | 3c | Record one window through ScreenCaptureKit, encode it with VideoToolbox, cut 2 s HLS fragments with AVAssetWriter, write `video.json`, repair dead segments. The writer and repair are portable | Mac: `cidre` |
 
 ## Design rules
 
-- OS code lives only in the capture adapters, the detector and `huddle-captions`. Each of them may
-  use unsafe code for its FFI; the workspace forbids it everywhere else.
+- OS code lives only in the capture adapters, `video-capture`, the detector and
+  `huddle-captions`. Each of them may use unsafe code for its FFI; the workspace forbids it
+  everywhere else.
 - The pipeline has no Tauri dependency. A CLI can rerun any meeting from its stored inputs.
 - Notes are written to a temp file outside the vault, then renamed into place. Syncthing never sees
   a half-written note.

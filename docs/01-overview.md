@@ -25,7 +25,7 @@ Meet also flags bots as risky and defaults the admit prompt to Deny. The bot wro
 - A bot participant of any kind.
 - Captions from calls in other browsers or in Teams and Zoom web. mc-meet reads Google Meet in
   Chromium browsers only; local capture covers the rest.
-- Our own screen recorder. OBS records video; the app only starts and stops it.
+- A general screen recorder. Video covers the call alone: the huddle window or the Meet tab.
 - Reading or acting on the vault after the note is written. Other tools use the vault directly.
 - Sharing the app with other people. It is built and signed for my own machines.
 

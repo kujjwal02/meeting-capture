@@ -21,6 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 sources.workspace = true
 stem-writer.workspace = true
+video-capture.workspace = true
 tauri.workspace = true
 tauri-plugin-autostart.workspace = true
 tauri-plugin-notification.workspace = true

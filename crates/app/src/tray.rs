@@ -19,7 +19,7 @@ use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 
-use crate::audio_capture::AudioState;
+use crate::call_capture::{AudioState, VideoState};
 use crate::call_status::{BoardView, CallState, CallView, Moment, TrayLook, display_time_zone};
 use crate::launch::{LaunchTarget, launch};
 use crate::{AppState, meetings, updates};
@@ -112,6 +112,7 @@ impl MenuAction {
             MenuAction::OpenAccessibilitySettings,
             MenuAction::OpenPrivacySettings(PermissionService::Microphone),
             MenuAction::OpenPrivacySettings(PermissionService::AudioCapture),
+            MenuAction::OpenPrivacySettings(PermissionService::ScreenRecording),
             MenuAction::InstallUpdate,
             MenuAction::CheckForUpdates,
             MenuAction::InstallMeetExtension,
@@ -137,28 +138,40 @@ struct CallLines {
 struct CallEntries {
     status: MenuItem<Wry>,
     audio: Option<MenuItem<Wry>>,
+    video: Option<MenuItem<Wry>>,
+}
+
+/// Each open call's audio and video state, read once per menu update.
+struct CaptureStates {
+    audio: HashMap<PathBuf, AudioState>,
+    video: HashMap<PathBuf, VideoState>,
 }
 
 /// The parts of the menu that change only when a call opens or ends.
 #[derive(PartialEq, Eq)]
 struct CallMenuShape {
     open_calls: usize,
-    /// Whether each open call has an audio line, and its stop or resume entry's label.
-    recording_rows: Vec<(bool, &'static str)>,
+    /// Whether each open call has an audio line, whether it has a video line and if that line
+    /// is an action, and its stop or resume entry's label.
+    recording_rows: Vec<(bool, Option<bool>, &'static str)>,
     recent_lines: Vec<String>,
     is_huddle_permission_missing: bool,
 }
 
 impl CallMenuShape {
-    fn of(view: &BoardView, audio: &HashMap<PathBuf, AudioState>, time_zone: &TimeZone) -> Self {
+    fn of(view: &BoardView, states: &CaptureStates, time_zone: &TimeZone) -> Self {
         Self {
             open_calls: view.calls.len(),
             recording_rows: view
                 .calls
                 .iter()
                 .map(|call| {
-                    let row = RecordingRow::of(call, audio);
-                    (row.audio_line.is_some(), row.action_label)
+                    let row = RecordingRow::of(call, states);
+                    (
+                        row.audio_line.is_some(),
+                        row.video.map(VideoState::is_permission_action),
+                        row.action_label,
+                    )
                 })
                 .collect(),
             recent_lines: view
@@ -174,12 +187,13 @@ impl CallMenuShape {
 /// What the menu shows under a call's status line about its recording.
 struct RecordingRow {
     audio_line: Option<String>,
+    video: Option<VideoState>,
     action: MenuAction,
     action_label: &'static str,
 }
 
 impl RecordingRow {
-    fn of(call: &CallView, audio: &HashMap<PathBuf, AudioState>) -> Self {
+    fn of(call: &CallView, states: &CaptureStates) -> Self {
         let (action, action_label) = match call.state {
             CallState::Stopped => (
                 MenuAction::ResumeRecording(call.id.clone()),
@@ -191,15 +205,20 @@ impl RecordingRow {
             ),
         };
         Self {
-            audio_line: audio.get(&call.id).map(|state| state.label()),
+            audio_line: states.audio.get(&call.id).map(|state| state.label()),
+            video: states.video.get(&call.id).copied(),
             action,
             action_label,
         }
     }
 }
 
-fn audio_states(app: &AppHandle) -> HashMap<PathBuf, AudioState> {
-    app.state::<AppState>().audio_capture.states()
+fn capture_states(app: &AppHandle) -> CaptureStates {
+    let capture = &app.state::<AppState>().call_capture;
+    CaptureStates {
+        audio: capture.states(),
+        video: capture.video_states(),
+    }
 }
 
 pub(crate) fn create(app: &AppHandle) -> tauri::Result<()> {
@@ -231,13 +250,13 @@ pub(crate) fn show_call_status(app: &AppHandle) {
             tracing::error!(exception.message = %error, "could not set the tray icon");
         }
         let time_zone = display_time_zone(&main_app.state::<AppState>());
-        let audio = audio_states(&main_app);
-        let shape = CallMenuShape::of(&view, &audio, &time_zone);
+        let states = capture_states(&main_app);
+        let shape = CallMenuShape::of(&view, &states, &time_zone);
         let is_updated = {
             let lines = CALL_LINES.lock().unwrap_or_else(PoisonError::into_inner);
             match lines.as_ref() {
                 Some(lines) if lines.shape == shape => {
-                    update_call_lines(lines, &view, &audio, &time_zone);
+                    update_call_lines(lines, &view, &states, &time_zone);
                     true
                 }
                 Some(_) | None => false,
@@ -259,16 +278,21 @@ pub(crate) fn show_call_status(app: &AppHandle) {
 fn update_call_lines(
     lines: &CallLines,
     view: &BoardView,
-    audio: &HashMap<PathBuf, AudioState>,
+    states: &CaptureStates,
     time_zone: &TimeZone,
 ) {
     for (entries, call) in lines.entries.iter().zip(&view.calls) {
-        let audio_line = RecordingRow::of(call, audio).audio_line;
+        let row = RecordingRow::of(call, states);
         let status_set = entries.status.set_text(call.status_line(time_zone));
-        let updated = status_set.and_then(|()| match (&entries.audio, audio_line) {
-            (Some(entry), Some(line)) => entry.set_text(line),
-            (Some(_) | None, _) => Ok(()),
-        });
+        let updated = status_set
+            .and_then(|()| match (&entries.audio, row.audio_line) {
+                (Some(entry), Some(line)) => entry.set_text(line),
+                (Some(_) | None, _) => Ok(()),
+            })
+            .and_then(|()| match (&entries.video, row.video) {
+                (Some(entry), Some(state)) => entry.set_text(state.label()),
+                (Some(_) | None, _) => Ok(()),
+            });
         if let Err(error) = updated {
             tracing::error!(exception.message = %error, "could not update a tray menu line");
         }
@@ -302,12 +326,12 @@ pub(crate) fn refresh(app: &AppHandle) {
 
 // The icon follows the worst call state, and the tooltip carries each call's status line.
 fn show_look(app: &AppHandle, tray: &TrayIcon, view: &BoardView) -> tauri::Result<()> {
-    let audio = &app.state::<AppState>().audio_capture;
-    let look = if audio.has_problem() || !audio.refused_permissions().is_empty() {
+    let capture = &app.state::<AppState>().call_capture;
+    let look = if capture.has_problem() || !capture.refused_permissions().is_empty() {
         TrayLook::Problem
     } else {
         match view.tray_look() {
-            TrayLook::Idle if audio.is_recording() => TrayLook::Recording,
+            TrayLook::Idle if capture.is_recording() => TrayLook::Recording,
             look @ (TrayLook::Idle | TrayLook::Recording | TrayLook::Problem) => look,
         }
     };
@@ -321,13 +345,17 @@ fn show_look(app: &AppHandle, tray: &TrayIcon, view: &BoardView) -> tauri::Resul
     if view.is_huddle_permission_missing {
         tooltip.push(HUDDLE_PERMISSION_LINE.to_owned());
     }
-    for service in audio.refused_permissions() {
+    for service in capture.refused_permissions() {
         tooltip.push(recording_permission_line(service));
     }
-    let audio_states = audio.states();
+    let audio_states = capture.states();
+    let video_states = capture.video_states();
     for call in &view.calls {
         tooltip.push(call.status_line(&time_zone));
         if let Some(state) = audio_states.get(&call.id) {
+            tooltip.push(state.label());
+        }
+        if let Some(state) = video_states.get(&call.id) {
             tooltip.push(state.label());
         }
     }
@@ -398,7 +426,7 @@ fn compose_menu(app: &AppHandle, view: &BoardView) -> tauri::Result<Menu<Wry>> {
             true,
         )?)?;
     }
-    for service in state.audio_capture.refused_permissions() {
+    for service in state.call_capture.refused_permissions() {
         menu.append(&action_entry(
             app,
             &MenuAction::OpenPrivacySettings(service),
@@ -470,7 +498,7 @@ const HUDDLE_PERMISSION_LINE: &str = "Slack huddles: allow Accessibility to read
 fn recording_permission_line(service: PermissionService) -> String {
     format!(
         "Recording: allow {}",
-        crate::audio_capture::permission_name(service)
+        crate::call_capture::permission_name(service)
     )
 }
 
@@ -497,12 +525,12 @@ fn append_calls(
     view: &BoardView,
 ) -> tauri::Result<()> {
     let time_zone = display_time_zone(state);
-    let audio = audio_states(app);
+    let capture = capture_states(app);
     let mut entries = Vec::new();
     for call in &view.calls {
         let status = label_entry(app, &call.status_line(&time_zone))?;
         menu.append(&status)?;
-        let row = RecordingRow::of(call, &audio);
+        let row = RecordingRow::of(call, &capture);
         let audio_entry = match &row.audio_line {
             Some(audio_line) => {
                 let entry = label_entry(app, audio_line)?;
@@ -511,14 +539,32 @@ fn append_calls(
             }
             None => None,
         };
+        let video_entry = match row.video {
+            Some(state) if state.is_permission_action() => {
+                menu.append(&action_entry(
+                    app,
+                    &MenuAction::OpenPrivacySettings(PermissionService::ScreenRecording),
+                    &state.label(),
+                    true,
+                )?)?;
+                None
+            }
+            Some(state) => {
+                let entry = label_entry(app, &state.label())?;
+                menu.append(&entry)?;
+                Some(entry)
+            }
+            None => None,
+        };
         entries.push(CallEntries {
             status,
             audio: audio_entry,
+            video: video_entry,
         });
         menu.append(&action_entry(app, &row.action, row.action_label, true)?)?;
     }
     *CALL_LINES.lock().unwrap_or_else(PoisonError::into_inner) = Some(CallLines {
-        shape: CallMenuShape::of(view, &audio, &time_zone),
+        shape: CallMenuShape::of(view, &capture, &time_zone),
         entries,
     });
     if view.recent.is_empty() {
@@ -707,8 +753,8 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
                 });
             }
         }
-        MenuAction::StopRecording(call_id) => crate::audio_capture::stop_call(app, &call_id),
-        MenuAction::ResumeRecording(call_id) => crate::audio_capture::resume_call(app, &call_id),
+        MenuAction::StopRecording(call_id) => crate::call_capture::stop_call(app, &call_id),
+        MenuAction::ResumeRecording(call_id) => crate::call_capture::resume_call(app, &call_id),
         MenuAction::RetryFailed => {
             if let Some(pipeline) = &state.pipeline {
                 let (app, pipeline) = (app.clone(), Arc::clone(pipeline));
@@ -730,7 +776,7 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
                     "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
                 }
                 // "Screen & System Audio Recording" holds "System Audio Recording Only".
-                PermissionService::AudioCapture => {
+                PermissionService::AudioCapture | PermissionService::ScreenRecording => {
                     "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
                 }
             };

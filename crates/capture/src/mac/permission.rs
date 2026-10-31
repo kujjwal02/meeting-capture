@@ -1,4 +1,5 @@
-//! The mic state comes from `AVCaptureDevice`. System audio has no public call, so its state
+//! The mic state comes from `AVCaptureDevice`, and screen recording from
+//! `CGPreflightScreenCaptureAccess`. System audio has no public call, so its state
 //! comes from the private `TCCAccessPreflight`, loaded with dlopen so a macOS without it only
 //! loses the check. Unsafe code: dlopen, dlsym and the call through the found pointer.
 #![allow(unsafe_code)]
@@ -21,6 +22,14 @@ pub(crate) fn state(service: PermissionService) -> PermissionState {
     let state = match service {
         PermissionService::Microphone => microphone_state(),
         PermissionService::AudioCapture => audio_capture_state(),
+        // The preflight never prompts. Its request twin would, so this process never calls it.
+        PermissionService::ScreenRecording => {
+            if cidre::cg::screen_capture_access::preflight() {
+                PermissionState::Granted
+            } else {
+                PermissionState::Denied
+            }
+        }
     };
     tracing::info!(
         permission.service = %service,

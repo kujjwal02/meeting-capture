@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
+use capture_protocol::WindowHint;
 use sources::browser_call::EndReason;
 use tokio::sync::broadcast;
 
@@ -25,6 +26,9 @@ pub(crate) enum CallEvent {
         call: Call,
         reason: CallEndReason,
     },
+    /// An open call's window changed: a huddle window closed and opened again. The call has
+    /// its new window hint.
+    WindowChanged(Call),
 }
 
 #[derive(Debug, Clone)]
@@ -34,6 +38,9 @@ pub(crate) struct Call {
     pub platform: CallPlatform,
     /// The Meet title or meeting code, or the huddle's channel. `None` for a call ended at launch.
     pub title: Option<String>,
+    /// The huddle's own window, which the video process records. `None` for Meet, whose video
+    /// comes from its tab.
+    pub window_hint: Option<WindowHint>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +104,7 @@ impl Calls {
         id: &Path,
         platform: CallPlatform,
         title: Option<String>,
+        window_hint: Option<WindowHint>,
         is_stopped_by_user: bool,
     ) {
         let mut tally = self.lock();
@@ -107,6 +115,7 @@ impl Calls {
             id: id.to_path_buf(),
             platform,
             title,
+            window_hint,
         };
         self.status.open(
             id,
@@ -123,6 +132,20 @@ impl Calls {
         };
         // Under the lock, so an end and a resume of one call cannot reach subscribers swapped.
         self.publish(event);
+    }
+
+    /// Gives an open call the window its source saw last. A call not open is ignored.
+    pub fn set_window_hint(&self, id: &Path, window_hint: WindowHint) {
+        let mut tally = self.lock();
+        let Some(call) = tally.open.get_mut(id) else {
+            return;
+        };
+        if call.window_hint.as_ref() == Some(&window_hint) {
+            return;
+        }
+        call.window_hint = Some(window_hint);
+        let call = call.clone();
+        self.publish(CallEvent::WindowChanged(call));
     }
 
     /// The open calls, for a subscriber that fell behind the stream.
@@ -149,6 +172,7 @@ impl Calls {
                 id: id.clone(),
                 platform,
                 title: None,
+                window_hint: None,
             };
             self.publish(CallEvent::Ended {
                 call,
@@ -191,6 +215,12 @@ fn log(event: &CallEvent) {
             call.title = call.title,
             call.end_reason = reason.as_str(),
             "call ended"
+        ),
+        CallEvent::WindowChanged(call) => tracing::info!(
+            event.name = "call.window_changed",
+            call.id = %call.id.display(),
+            video.window_id = call.window_hint.as_ref().map(|hint| hint.window_id),
+            "call window changed"
         ),
     }
 }

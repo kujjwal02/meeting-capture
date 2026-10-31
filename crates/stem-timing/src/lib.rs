@@ -40,6 +40,9 @@ pub enum PermissionService {
     Microphone,
     /// "System Audio Recording Only", which the tap needs.
     AudioCapture,
+    /// "Screen & System Audio Recording", which window video needs. Read with
+    /// `CGPreflightScreenCaptureAccess`, which never prompts.
+    ScreenRecording,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,7 +60,8 @@ pub enum PermissionState {
 }
 
 impl PermissionService {
-    pub const ALL: [PermissionService; 2] = [
+    /// The services the audio process needs.
+    pub const AUDIO: [PermissionService; 2] = [
         PermissionService::Microphone,
         PermissionService::AudioCapture,
     ];
@@ -67,6 +71,7 @@ impl PermissionService {
         match self {
             Self::Microphone => "microphone",
             Self::AudioCapture => "audio_capture",
+            Self::ScreenRecording => "screen_recording",
         }
     }
 }

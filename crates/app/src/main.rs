@@ -6,8 +6,8 @@
 // Release builds on Windows would otherwise open a console window next to the tray icon.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod audio_capture;
 mod browser_calls;
+mod call_capture;
 mod call_debug;
 mod call_status;
 mod calls;
@@ -38,7 +38,7 @@ pub(crate) struct AppState {
     pub settings: Arc<SettingsStore>,
     pub browser_calls: browser_calls::BrowserCalls,
     pub calls: calls::Calls,
-    pub audio_capture: audio_capture::AudioCapture,
+    pub call_capture: call_capture::CallCapture,
     pub call_debug: call_debug::CallDebug,
     pub updates: updates::Updates,
 }
@@ -151,7 +151,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         settings: settings_store,
         browser_calls,
         calls: calls::Calls::new(),
-        audio_capture: audio_capture::AudioCapture::new(),
+        call_capture: call_capture::CallCapture::new(),
         call_debug,
         updates: updates::Updates::default(),
     });
@@ -161,7 +161,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     call_status::start(app.handle());
     call_debug::start(app.handle());
     // Before the call sources, so it hears every call from the first.
-    audio_capture::start(app.handle());
+    call_capture::start(app.handle());
     if let Some(pipeline) = pipeline {
         check_google_accounts(app.handle().clone());
         huddles::start(app.handle(), &pipeline);

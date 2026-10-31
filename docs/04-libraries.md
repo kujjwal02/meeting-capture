@@ -57,4 +57,3 @@ crates.io on 2026-10-17.
 | 4 | Local STT | sherpa-onnx 1.13 with Parakeet TDT 0.6B v3 |
 | 5 | Windows capture | wasapi 0.26, cpal |
 | 6 | Hinglish routing | whatlang 0.18 for the language check, reqwest for Soniox (no Rust SDK) |
-| 7 | OBS | obws 0.15 |

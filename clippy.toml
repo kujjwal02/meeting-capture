@@ -1,2 +1,11 @@
-# Product names in doc comments, not code identifiers.
-doc-valid-idents = ["TranscripTonic", ".."]
+# Product and framework names in doc comments, not code identifiers.
+doc-valid-idents = [
+  "TranscripTonic",
+  "ScreenCaptureKit",
+  "VideoToolbox",
+  "AVAssetWriter",
+  "AVFoundation",
+  "CoreGraphics",
+  "HIServices",
+  "..",
+]

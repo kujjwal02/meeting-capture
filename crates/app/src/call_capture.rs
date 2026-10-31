@@ -1,6 +1,9 @@
 //! Records each call through `mc-capture` child processes that own the devices and the media
-//! files. The app never links Core Audio, so a crash or a hung HAL call in a capture process
-//! never takes the tray down. Audio is the one capture process today; video joins in phase 3c.
+//! files. The app never links Core Audio or ScreenCaptureKit, so a crash or a hung framework call
+//! in a capture process never takes the tray down. `mc-capture audio` records every call.
+//! `mc-capture video` records a Slack huddle's own window next to it, with the same segment
+//! number; Meet video comes from its tab instead. Each process restarts on its own, so video may
+//! fail while audio carries on. One stop control stops both.
 //!
 //! A supervisor task follows the call stream: `call.started` and `call.resumed` start a
 //! recording, `call.ended` stops it, with no click. One call records at a time, since the
@@ -15,8 +18,13 @@
 //! `mc-capture await-device-change` watches the HAL, so a new device restarts it 1.5 s later.
 //!
 //! A sleep closes the segment inside the helper, which stays running. On wake the helper says
-//! so and the supervisor starts the call's next segment in it. The helper's permission reports
-//! feed the tray: a refused microphone or system audio permission shows as a problem.
+//! so and the supervisor starts the call's next segment in it. The video process follows the
+//! audio helper: its segment stops at the audio sleep report, and the next one starts at wake
+//! with the audio's new segment number. A video segment records the audio segment it pairs with,
+//! since a video restart takes video's next free number. The helper's permission reports
+//! feed the tray: a refused microphone or system audio permission shows as a problem. A refused
+//! screen recording permission turns the call's video row into "Video off: allow Screen
+//! Recording", which opens System Settings.
 
 mod restart_backoff;
 
@@ -28,14 +36,15 @@ use std::time::{Duration, Instant};
 
 use capture_protocol::{
     AudioCommand, AudioErrorKind, AudioReport, DeviceChangeCause, MicMoment, PermissionService,
-    PermissionState, Platform, Stem,
+    PermissionState, Platform, Stem, VideoCommand, VideoErrorKind, VideoReport, WindowChangeCause,
+    WindowHint,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tauri::{AppHandle, Manager as _};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::Instrument as _;
 
 use self::restart_backoff::{FAILURES_SHOWN, RestartBackoff};
@@ -60,8 +69,6 @@ const SIDECAR_FILE_NAME: &str = "mc-capture";
 /// After a device change ends a backoff early, the wait before the restart: Bluetooth routes
 /// take this long to settle.
 const DEVICE_CHANGE_SETTLE: Duration = Duration::from_millis(1_500);
-/// The video process's manifest, which phase 3c writes beside `audio.json`.
-const VIDEO_MANIFEST_FILE_NAME: &str = "video.json";
 
 /// What a call's audio is doing, as the tray shows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,24 +115,76 @@ impl AudioState {
     }
 }
 
-/// The supervisor's wake-up for each stop or resume, and each open call's audio state.
-pub(crate) struct AudioCapture {
+/// What a huddle's video is doing, as the tray shows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VideoState {
+    /// The process runs and no frame went to the encoder yet: it may be looking for the window.
+    Starting {
+        segment: u32,
+    },
+    Recording {
+        segment: u32,
+    },
+    /// The huddle window closed. The process looks for it every second.
+    WindowMissing {
+        segment: u32,
+    },
+    /// The process exited or hung; it restarts after the backoff.
+    Restarting,
+    /// The process failed 3 times within 60 s and has not recorded since.
+    Failing,
+    /// The audio helper reported a sleep, so the video segment closed. The next opens at wake.
+    Sleeping,
+    /// macOS refuses screen recording. The row opens System Settings.
+    ScreenRecordingRefused,
+    /// The user ended the capture through the system's sharing controls. Audio goes on.
+    StoppedFromSharingControls,
+}
+
+impl VideoState {
+    pub(crate) fn label(self) -> String {
+        match self {
+            Self::Starting { segment } => format!("Video: starting segment {segment:03}"),
+            Self::Recording { segment } => format!("Video: recording segment {segment:03}"),
+            Self::WindowMissing { segment } => {
+                format!("Video: segment {segment:03} lost the huddle window, looking for it")
+            }
+            Self::Restarting => "Video: the helper stopped, restarting".to_owned(),
+            Self::Failing => "Video: recording failed, retrying".to_owned(),
+            Self::Sleeping => "Video: paused while the Mac sleeps".to_owned(),
+            Self::ScreenRecordingRefused => "Video off: allow Screen Recording".to_owned(),
+            Self::StoppedFromSharingControls => {
+                "Video: stopped from the sharing controls".to_owned()
+            }
+        }
+    }
+
+    /// Whether the row is an action that opens the screen recording settings.
+    pub(crate) fn is_permission_action(self) -> bool {
+        matches!(self, Self::ScreenRecordingRefused)
+    }
+}
+
+/// The supervisor's wake-up for each stop or resume, and each open call's audio and video state.
+pub(crate) struct CallCapture {
     /// The call whose stop or resume the board just took.
     stop_changes: mpsc::UnboundedSender<PathBuf>,
     /// Taken once, by `start`.
     stop_change_receiver: Mutex<Option<mpsc::UnboundedReceiver<PathBuf>>>,
     states: Mutex<HashMap<PathBuf, AudioState>>,
+    video_states: Mutex<HashMap<PathBuf, VideoState>>,
     /// The last state the helper read for each permission.
     permissions: Mutex<HashMap<PermissionService, PermissionState>>,
 }
 
-impl AudioCapture {
+impl CallCapture {
     pub fn new() -> Self {
         let (stop_changes, stop_change_receiver) = mpsc::unbounded_channel();
         Self {
             stop_changes,
             stop_change_receiver: Mutex::new(Some(stop_change_receiver)),
             states: Mutex::new(HashMap::new()),
+            video_states: Mutex::new(HashMap::new()),
             permissions: Mutex::new(HashMap::new()),
         }
     }
@@ -190,14 +249,52 @@ impl AudioCapture {
         })
     }
 
-    /// Whether any call fails to record, or records without the user's mic.
+    /// Whether any call fails to record, records without the user's mic, or has its video off
+    /// for a refused permission.
     pub fn has_problem(&self) -> bool {
-        self.lock().values().any(|state| {
+        let is_audio_problem = self.lock().values().any(|state| {
             matches!(
                 state,
                 AudioState::Failing | AudioState::RecordingWithoutMic { .. }
             )
-        })
+        });
+        is_audio_problem
+            || self.lock_video().values().any(|state| {
+                matches!(
+                    state,
+                    VideoState::Failing | VideoState::ScreenRecordingRefused
+                )
+            })
+    }
+
+    /// The video state of each open call that has one.
+    pub fn video_states(&self) -> HashMap<PathBuf, VideoState> {
+        self.lock_video().clone()
+    }
+
+    fn lock_video(&self) -> MutexGuard<'_, HashMap<PathBuf, VideoState>> {
+        self.video_states
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_video_state(&self, app: &AppHandle, call_id: &Path, state: Option<VideoState>) {
+        let is_changed = {
+            let mut states = self.lock_video();
+            let previous = match state {
+                Some(state) => states.insert(call_id.to_path_buf(), state),
+                None => states.remove(call_id),
+            };
+            previous != state
+        };
+        if is_changed {
+            tracing::info!(
+                call.id = %call_id.display(),
+                video.state = state.map(VideoState::label),
+                "video state changed"
+            );
+            crate::tray::show_call_status(app);
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, HashMap<PathBuf, AudioState>> {
@@ -240,6 +337,7 @@ pub(crate) fn permission_name(service: PermissionService) -> &'static str {
     match service {
         PermissionService::Microphone => "the microphone",
         PermissionService::AudioCapture => "system audio recording",
+        PermissionService::ScreenRecording => "screen recording",
     }
 }
 
@@ -277,7 +375,7 @@ fn set_recording_stopped(app: &AppHandle, call_id: &Path, is_stopped: bool) {
         .browser_calls
         .publish_call_status(&board.view(Moment::now()), &display_time_zone(&state));
     // An error only means no supervisor runs: no capture on this OS yet.
-    let _unheard = state.audio_capture.stop_changes.send(call_id.to_path_buf());
+    let _unheard = state.call_capture.stop_changes.send(call_id.to_path_buf());
     crate::tray::show_call_status(app);
 }
 
@@ -287,7 +385,7 @@ pub(crate) fn start(app: &AppHandle) {
     let state = app.state::<AppState>();
     repair_call_folders(state.settings.app_dirs().calls_dir());
     let stop_changes = state
-        .audio_capture
+        .call_capture
         .stop_change_receiver
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -318,7 +416,7 @@ pub(crate) fn start(app: &AppHandle) {
 /// empty, so the folder locks decide: a folder whose helper is still recording, as one that
 /// outlived a killed app, is skipped, and that helper closes its own segment. Each segment start
 /// repairs its folder again under the lock, so a call that starts at once loses nothing to the
-/// race. stem-writer logs each repaired stem. Phase 3c adds the video repair to each folder.
+/// race. stem-writer logs each repaired stem, and video-capture each video segment it ended.
 fn repair_call_folders(calls_dir: PathBuf) {
     tauri::async_runtime::spawn_blocking(move || {
         let folders = match call_folder::call_folders(&calls_dir) {
@@ -335,17 +433,33 @@ fn repair_call_folders(calls_dir: PathBuf) {
         let mut repaired_count = 0_usize;
         let mut failed_count = 0_usize;
         for folder in &folders {
-            match stem_writer::repair_folder(folder) {
-                Ok(stem_writer::FolderRepair::Repaired { .. }) => repaired_count += 1,
-                Ok(stem_writer::FolderRepair::Busy | stem_writer::FolderRepair::Clean) => {}
-                Err(error) => {
-                    failed_count += 1;
+            let audio = match stem_writer::repair_folder(folder) {
+                Ok(stem_writer::FolderRepair::Repaired { .. }) => Ok(true),
+                Ok(stem_writer::FolderRepair::Busy | stem_writer::FolderRepair::Clean) => Ok(false),
+                Err(error) => Err(error.to_string()),
+            };
+            let video = match video_capture::repair_folder(folder) {
+                Ok(video_capture::VideoFolderRepair::Repaired { .. }) => Ok(true),
+                Ok(
+                    video_capture::VideoFolderRepair::Busy
+                    | video_capture::VideoFolderRepair::Clean,
+                ) => Ok(false),
+                Err(error) => Err(error.to_string()),
+            };
+            for (process, outcome) in [("audio", &audio), ("video", &video)] {
+                if let Err(message) = outcome {
                     tracing::error!(
                         file.directory = %folder.display(),
-                        exception.message = %error,
+                        process.command = process,
+                        exception.message = message,
                         "repair.failed"
                     );
                 }
+            }
+            if audio.is_err() || video.is_err() {
+                failed_count += 1;
+            } else if audio == Ok(true) || video == Ok(true) {
+                repaired_count += 1;
             }
         }
         tracing::info!(
@@ -369,6 +483,79 @@ struct RunningProcess {
 struct ActiveRecording {
     call_id: PathBuf,
     processes: Vec<RunningProcess>,
+    /// Where the audio process stands, for a video process that starts late.
+    audio_phase: watch::Receiver<AudioPhase>,
+    /// New window hints for the video process. `None` while no video process runs.
+    window_hints: Option<mpsc::UnboundedSender<WindowHint>>,
+}
+
+/// Where the call's audio process stands. The video process follows it across a sleep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AudioPhase {
+    /// The audio segment open now, or the last one before a sleep.
+    segment: u32,
+    is_asleep: bool,
+    /// Sleeps the audio process reported. A follower that saw neither a sleep nor its wake, as
+    /// both came between two of its reads, still restarts on the wake segment.
+    sleep_count: u64,
+}
+
+/// What one process of a recording shares with the other.
+#[derive(Default)]
+struct ProcessLinks {
+    /// The audio process publishes its phase here.
+    audio_phase_out: Option<watch::Sender<AudioPhase>>,
+    /// The video process follows the audio phase.
+    audio_phase_in: Option<watch::Receiver<AudioPhase>>,
+    /// The video process takes each window hint the huddle watcher sends.
+    window_hints: Option<mpsc::UnboundedReceiver<WindowHint>>,
+}
+
+impl ProcessLinks {
+    fn publish_audio(&self, change: impl FnOnce(&mut AudioPhase)) {
+        if let Some(phase) = &self.audio_phase_out {
+            phase.send_modify(change);
+        }
+    }
+
+    /// The audio phase now, and marks it seen.
+    fn audio_phase(&mut self) -> Option<AudioPhase> {
+        self.audio_phase_in
+            .as_mut()
+            .map(|phase| *phase.borrow_and_update())
+    }
+
+    /// The next audio phase change. Never ends once the audio process is gone.
+    async fn next_audio_phase(phase: &mut Option<watch::Receiver<AudioPhase>>) -> AudioPhase {
+        if let Some(receiver) = phase {
+            if receiver.changed().await.is_ok() {
+                return *receiver.borrow_and_update();
+            }
+            *phase = None;
+        }
+        std::future::pending().await
+    }
+
+    /// The next window hint. Never ends once the supervisor dropped the sender.
+    async fn next_hint(hints: &mut Option<mpsc::UnboundedReceiver<WindowHint>>) -> WindowHint {
+        if let Some(receiver) = hints {
+            if let Some(hint) = receiver.recv().await {
+                return hint;
+            }
+            *hints = None;
+        }
+        std::future::pending().await
+    }
+
+    /// The latest hint that came while no process ran.
+    fn latest_hint(&mut self) -> Option<WindowHint> {
+        let receiver = self.window_hints.as_mut()?;
+        let mut latest = None;
+        while let Ok(hint) = receiver.try_recv() {
+            latest = Some(hint);
+        }
+        latest
+    }
 }
 
 struct Supervisor {
@@ -393,7 +580,7 @@ impl Supervisor {
                     Err(broadcast::error::RecvError::Lagged(missed)) => {
                         tracing::error!(
                             call.missed_events = missed,
-                            "audio capture missed call events; reading the open calls"
+                            "call capture missed call events; reading the open calls"
                         );
                         self.resync().await;
                     }
@@ -419,12 +606,52 @@ impl Supervisor {
                 let state = self
                     .is_stopped_by_user(&call.id)
                     .then_some(AudioState::StoppedByUser);
-                self.audio().set_state(&self.app, &call.id, state);
+                self.capture().set_state(&self.app, &call.id, state);
                 self.open_calls.push(call);
             }
             CallEvent::Ended { call, .. } => {
                 self.forget_call(&call.id).await;
             }
+            CallEvent::WindowChanged(call) => self.follow_window(&call),
+        }
+    }
+
+    /// Gives the call's video process the window the huddle watcher saw reopen, or starts one
+    /// for a call that had no readable window before.
+    fn follow_window(&mut self, call: &Call) {
+        if let Some(open) = self.open_calls.iter_mut().find(|open| open.id == call.id) {
+            *open = call.clone();
+        }
+        let Some(hint) = VideoProcess::is_for(call).cloned() else {
+            return;
+        };
+        let folder = self.calls_dir.join(call_folder_name(&call.id));
+        let Some(active) = self
+            .active
+            .as_mut()
+            .filter(|active| active.call_id == call.id)
+        else {
+            return;
+        };
+        if let Some(hints) = &active.window_hints {
+            // An error only means the video task ended with the recording.
+            let _unheard = hints.send(hint);
+            return;
+        }
+        let audio_segment = active.audio_phase.borrow().segment;
+        let segment = VideoProcess::next_free_segment(&folder)
+            .map_or(audio_segment, |free| free.max(audio_segment));
+        let (hints, hint_receiver) = mpsc::unbounded_channel();
+        let links = ProcessLinks {
+            audio_phase_out: None,
+            audio_phase_in: Some(active.audio_phase.clone()),
+            window_hints: Some(hint_receiver),
+        };
+        active.window_hints = Some(hints);
+        let process =
+            spawn_process::<VideoProcess>(&self.app, &self.log_file, call, &folder, segment, links);
+        if let Some(active) = self.active.as_mut() {
+            active.processes.push(process);
         }
     }
 
@@ -450,7 +677,8 @@ impl Supervisor {
     async fn forget_call(&mut self, call_id: &Path) {
         self.open_calls.retain(|open| open.id != call_id);
         self.stop_active_if(call_id).await;
-        self.audio().set_state(&self.app, call_id, None);
+        self.capture().set_state(&self.app, call_id, None);
+        self.capture().set_video_state(&self.app, call_id, None);
     }
 
     /// The board took a stop or a resume of `call_id`.
@@ -460,11 +688,12 @@ impl Supervisor {
         }
         if self.is_stopped_by_user(call_id) {
             self.stop_active_if(call_id).await;
-            self.audio()
+            self.capture()
                 .set_state(&self.app, call_id, Some(AudioState::StoppedByUser));
+            self.capture().set_video_state(&self.app, call_id, None);
         } else if !self.is_active(call_id) {
             // `start_next` starts it at once with the call's next segment number.
-            self.audio().set_state(&self.app, call_id, None);
+            self.capture().set_state(&self.app, call_id, None);
         }
     }
 
@@ -482,8 +711,9 @@ impl Supervisor {
             .is_stopped_by_user(call_id)
     }
 
-    fn audio(&self) -> &AudioCapture {
-        &self.app.state::<AppState>().inner().audio_capture
+    /// The capture state store, audio and video.
+    fn capture(&self) -> &CallCapture {
+        &self.app.state::<AppState>().inner().call_capture
     }
 
     async fn stop_active_if(&mut self, call_id: &Path) {
@@ -522,46 +752,85 @@ impl Supervisor {
                 tracing::error!(exception.message = reason, "could not read the call folder");
                 1
             });
-            // Phase 3c: the video process starts here too, with the same segment number.
-            let processes = vec![self.spawn_process::<AudioProcess>(&call, &folder, segment)];
+            let (audio_phase_out, audio_phase) = watch::channel(AudioPhase {
+                segment,
+                is_asleep: false,
+                sleep_count: 0,
+            });
+            let audio_links = ProcessLinks {
+                audio_phase_out: Some(audio_phase_out),
+                ..ProcessLinks::default()
+            };
+            let mut processes = vec![spawn_process::<AudioProcess>(
+                &self.app,
+                &self.log_file,
+                &call,
+                &folder,
+                segment,
+                audio_links,
+            )];
+            // Meet video is the tab's, from mc-meet. A huddle without a window id has nothing
+            // that tells its window from the Slack main window, which shows private messages.
+            let mut window_hints = None;
+            if VideoProcess::is_for(&call).is_some() {
+                let (hints, hint_receiver) = mpsc::unbounded_channel();
+                let video_links = ProcessLinks {
+                    audio_phase_out: None,
+                    audio_phase_in: Some(audio_phase.clone()),
+                    window_hints: Some(hint_receiver),
+                };
+                processes.push(spawn_process::<VideoProcess>(
+                    &self.app,
+                    &self.log_file,
+                    &call,
+                    &folder,
+                    segment,
+                    video_links,
+                ));
+                window_hints = Some(hints);
+            }
             self.active = Some(ActiveRecording {
                 call_id: call.id,
                 processes,
+                audio_phase,
+                window_hints,
             });
         }
         let active_id = self.active.as_ref().map(|active| active.call_id.clone());
         for call in &self.open_calls {
             if Some(&call.id) != active_id.as_ref() && !self.is_stopped_by_user(&call.id) {
-                self.audio()
+                self.capture()
                     .set_state(&self.app, &call.id, Some(AudioState::Queued));
             }
         }
     }
+}
 
-    fn spawn_process<P: CaptureProcess>(
-        &self,
-        call: &Call,
-        folder: &Path,
-        segment: u32,
-    ) -> RunningProcess {
-        let (stop, stop_receiver) = oneshot::channel();
-        let recording = Recording::<P> {
-            app: self.app.clone(),
-            call: call.clone(),
-            folder: folder.to_path_buf(),
-            log_file: self.log_file.clone(),
-            segment,
-            backoff: RestartBackoff::default(),
-            process: std::marker::PhantomData,
-        };
-        let span = tracing::info_span!(
-            "capture.recording",
-            call.id = %call.id.display(),
-            process.command = P::SUBCOMMAND
-        );
-        let task = tauri::async_runtime::spawn(recording.run(stop_receiver).instrument(span));
-        RunningProcess { stop, task }
-    }
+fn spawn_process<P: CaptureProcess>(
+    app: &AppHandle,
+    log_file: &Path,
+    call: &Call,
+    folder: &Path,
+    segment: u32,
+    links: ProcessLinks,
+) -> RunningProcess {
+    let (stop, stop_receiver) = oneshot::channel();
+    let recording = Recording::<P> {
+        app: app.clone(),
+        call: call.clone(),
+        folder: folder.to_path_buf(),
+        log_file: log_file.to_path_buf(),
+        segment,
+        backoff: RestartBackoff::default(),
+        process: std::marker::PhantomData,
+    };
+    let span = tracing::info_span!(
+        "capture.recording",
+        call.id = %call.id.display(),
+        process.command = P::SUBCOMMAND
+    );
+    let task = tauri::async_runtime::spawn(recording.run(stop_receiver, links).instrument(span));
+    RunningProcess { stop, task }
 }
 
 /// The call folder's name: the call log's file name without its extension, which is unique per
@@ -573,37 +842,14 @@ fn call_folder_name(call_id: &Path) -> String {
     )
 }
 
-/// One above every segment any capture process used in the folder: in `audio.json`, in
-/// `video.json`, and in every `NNN-` file name, which stem-writer's scan covers.
+/// One above every segment any capture process used in the folder: in `audio.json` and the stem
+/// files, and in `video.json` and the `NNN-video` folders.
 fn next_call_segment(folder: &Path) -> Result<u32, String> {
     let from_audio = stem_writer::next_segment_number(folder)
         .map_err(|error| format!("could not read the call folder: {error}"))?;
-    Ok(from_audio.max(highest_video_segment(folder)? + 1))
-}
-
-fn highest_video_segment(folder: &Path) -> Result<u32, String> {
-    #[derive(serde::Deserialize)]
-    struct VideoManifest {
-        segments: Vec<VideoSegment>,
-    }
-    #[derive(serde::Deserialize)]
-    struct VideoSegment {
-        number: u32,
-    }
-    let path = folder.join(VIDEO_MANIFEST_FILE_NAME);
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
-    };
-    let manifest: VideoManifest = serde_json::from_str(&text)
-        .map_err(|error| format!("{} is not valid: {error}", path.display()))?;
-    Ok(manifest
-        .segments
-        .iter()
-        .map(|segment| segment.number)
-        .max()
-        .unwrap_or(0))
+    let from_video = video_capture::next_segment_number(folder)
+        .map_err(|error| format!("could not read the call folder's video: {error}"))?;
+    Ok(from_audio.max(from_video))
 }
 
 /// What the supervisor needs from one report line.
@@ -620,22 +866,17 @@ enum ReportSign {
     Rotated {
         to_segment: u32,
     },
-    /// The segment is closed and its manifest says so.
-    Closed,
+    /// `segment` is closed and its manifest says so.
+    Closed {
+        segment: u32,
+    },
+    /// The process opened no segment for its last `start`, and waits for the next command.
+    Refused,
+    /// The user stopped video through the system's sharing controls. The process closes the
+    /// segment and waits for the next command.
+    StoppedByUser,
     /// A device did not open. Restarts back off further.
     DeviceOpenFailed,
-    Permission {
-        service: PermissionService,
-        state: PermissionState,
-    },
-    /// The mic is gone and no safe input is left; the mic stem records a gap.
-    MicUnavailable {
-        segment: u32,
-    },
-    /// The mic moved to another device, which ends a time without one.
-    MicChanged {
-        segment: u32,
-    },
     /// The Mac is about to sleep. Any open segment is already closed.
     Asleep,
     /// The Mac woke. The process waits for the next `start`.
@@ -644,25 +885,50 @@ enum ReportSign {
     Logged,
 }
 
-/// One kind of `mc-capture` child process: audio now, video in phase 3c.
+/// Where one process of a call's recording stands, for its tray row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessPhase {
+    Starting {
+        segment: u32,
+    },
+    Recording {
+        segment: u32,
+    },
+    /// Recording went on into `segment` at a rotation.
+    Rotated {
+        segment: u32,
+    },
+    Restarting,
+    Failing,
+    Sleeping,
+}
+
+/// One kind of `mc-capture` child process: audio or video.
 trait CaptureProcess: Send + 'static {
     type Command: Serialize + Send + Sync;
     type Report: DeserializeOwned;
     /// The `mc-capture` subcommand that runs it.
     const SUBCOMMAND: &'static str;
 
-    fn start_command(call: &Call, folder: &Path, segment: u32) -> Self::Command;
+    /// `None` when the call has nothing for the process to record.
+    fn start_command(
+        call: &Call,
+        folder: &Path,
+        segment: u32,
+        audio_segment: u32,
+    ) -> Option<Self::Command>;
     fn stop_command() -> Self::Command;
+    /// The command that hands a running process a new window, for a process that records one.
+    fn window_command(hint: WindowHint) -> Option<Self::Command>;
     /// The lowest segment number the process may start in the folder.
     fn next_free_segment(folder: &Path) -> Result<u32, String>;
     /// The files whose growth shows the process still writes `segment`.
     fn segment_files(folder: &Path, segment: u32) -> Vec<PathBuf>;
-    /// Logs the report and says what it means for the supervisor.
-    fn read_report(call_id: &Path, report: &Self::Report) -> ReportSign;
-    /// Shows the process's state for the call in the tray. Takes `AudioState` because audio is
-    /// the only process with a tray line; phase 3c keys the states by process when video adds
-    /// its own line.
-    fn show_state(app: &AppHandle, call_id: &Path, state: Option<AudioState>);
+    /// Logs the report, shows what only this process knows in the tray, and says what the
+    /// report means for the supervisor.
+    fn read_report(app: &AppHandle, call_id: &Path, report: &Self::Report) -> ReportSign;
+    /// Shows the process's phase for the call in the tray, on its own row.
+    fn show_phase(app: &AppHandle, call_id: &Path, phase: ProcessPhase);
 }
 
 struct AudioProcess;
@@ -672,8 +938,13 @@ impl CaptureProcess for AudioProcess {
     type Report = AudioReport;
     const SUBCOMMAND: &'static str = "audio";
 
-    fn start_command(call: &Call, folder: &Path, segment: u32) -> AudioCommand {
-        AudioCommand::Start {
+    fn start_command(
+        call: &Call,
+        folder: &Path,
+        segment: u32,
+        _audio_segment: u32,
+    ) -> Option<AudioCommand> {
+        Some(AudioCommand::Start {
             call_id: call.id.display().to_string(),
             folder: folder.to_path_buf(),
             segment,
@@ -688,11 +959,15 @@ impl CaptureProcess for AudioProcess {
             } else {
                 MicMoment::MidCall
             },
-        }
+        })
     }
 
     fn stop_command() -> AudioCommand {
         AudioCommand::Stop
+    }
+
+    fn window_command(_hint: WindowHint) -> Option<AudioCommand> {
+        None
     }
 
     fn next_free_segment(folder: &Path) -> Result<u32, String> {
@@ -707,8 +982,9 @@ impl CaptureProcess for AudioProcess {
             .collect()
     }
 
-    fn read_report(call_id: &Path, report: &AudioReport) -> ReportSign {
+    fn read_report(app: &AppHandle, call_id: &Path, report: &AudioReport) -> ReportSign {
         log_audio_report(call_id, report);
+        let capture = &app.state::<AppState>().call_capture;
         match report {
             AudioReport::Recording { segment, .. } => ReportSign::Recording { segment: *segment },
             AudioReport::Heartbeat {
@@ -726,25 +1002,38 @@ impl CaptureProcess for AudioProcess {
             AudioReport::Rotated { to_segment, .. } => ReportSign::Rotated {
                 to_segment: *to_segment,
             },
-            AudioReport::Stopped { .. } => ReportSign::Closed,
+            AudioReport::Stopped { segment } => ReportSign::Closed { segment: *segment },
             AudioReport::Error {
                 kind: AudioErrorKind::DeviceOpenFailed,
                 ..
             } => ReportSign::DeviceOpenFailed,
-            AudioReport::Permission { service, state } => ReportSign::Permission {
-                service: *service,
-                state: *state,
-            },
+            AudioReport::Permission { service, state } => {
+                capture.set_permission(app, *service, *state);
+                ReportSign::Logged
+            }
             AudioReport::SystemSleep { .. } => ReportSign::Asleep,
             AudioReport::SystemWake => ReportSign::Woke,
             AudioReport::MicUnavailable { segment, .. } => {
-                ReportSign::MicUnavailable { segment: *segment }
+                capture.set_state(
+                    app,
+                    call_id,
+                    Some(AudioState::RecordingWithoutMic { segment: *segment }),
+                );
+                ReportSign::Logged
             }
             AudioReport::DeviceChanged {
                 segment,
                 stream: Stem::Mic,
                 ..
-            } => ReportSign::MicChanged { segment: *segment },
+            } => {
+                // The mic moved to another device, which ends a time without one.
+                capture.set_state(
+                    app,
+                    call_id,
+                    Some(AudioState::Recording { segment: *segment }),
+                );
+                ReportSign::Logged
+            }
             AudioReport::Gap { .. }
             | AudioReport::DeviceChanged {
                 stream: Stem::Remote,
@@ -754,10 +1043,248 @@ impl CaptureProcess for AudioProcess {
         }
     }
 
-    fn show_state(app: &AppHandle, call_id: &Path, state: Option<AudioState>) {
+    fn show_phase(app: &AppHandle, call_id: &Path, phase: ProcessPhase) {
+        let state = match phase {
+            ProcessPhase::Starting { segment } => AudioState::Starting { segment },
+            ProcessPhase::Recording { segment } => {
+                audio_recording_state(app, call_id, segment, false)
+            }
+            ProcessPhase::Rotated { segment } => audio_recording_state(app, call_id, segment, true),
+            ProcessPhase::Restarting => AudioState::Restarting,
+            ProcessPhase::Failing => AudioState::Failing,
+            ProcessPhase::Sleeping => AudioState::Sleeping,
+        };
         app.state::<AppState>()
-            .audio_capture
-            .set_state(app, call_id, state);
+            .call_capture
+            .set_state(app, call_id, Some(state));
+    }
+}
+
+/// The state for stems open in `segment`. A segment that recorded without the user's mic stays
+/// so when its remote stem starts, and across a rotation, until the mic returns.
+fn audio_recording_state(
+    app: &AppHandle,
+    call_id: &Path,
+    segment: u32,
+    is_rotation: bool,
+) -> AudioState {
+    let shown = app
+        .state::<AppState>()
+        .call_capture
+        .states()
+        .get(call_id)
+        .copied();
+    let is_without_mic = matches!(
+        shown,
+        Some(AudioState::RecordingWithoutMic { segment: shown_segment })
+            if is_rotation || shown_segment == segment
+    );
+    if is_without_mic {
+        AudioState::RecordingWithoutMic { segment }
+    } else {
+        AudioState::Recording { segment }
+    }
+}
+
+struct VideoProcess;
+
+impl VideoProcess {
+    /// The window the call's video records: a huddle's, once the watcher read its id.
+    fn is_for(call: &Call) -> Option<&WindowHint> {
+        match call.platform {
+            CallPlatform::SlackHuddle => call.window_hint.as_ref(),
+            CallPlatform::Meet => None,
+        }
+    }
+
+    fn show(app: &AppHandle, call_id: &Path, state: VideoState) {
+        app.state::<AppState>()
+            .call_capture
+            .set_video_state(app, call_id, Some(state));
+    }
+}
+
+impl CaptureProcess for VideoProcess {
+    type Command = VideoCommand;
+    type Report = VideoReport;
+    const SUBCOMMAND: &'static str = "video";
+
+    fn start_command(
+        call: &Call,
+        folder: &Path,
+        segment: u32,
+        audio_segment: u32,
+    ) -> Option<VideoCommand> {
+        let window_hint = Self::is_for(call)?.clone();
+        Some(VideoCommand::Start {
+            call_id: call.id.display().to_string(),
+            folder: folder.to_path_buf(),
+            segment,
+            audio_segment,
+            platform: match call.platform {
+                CallPlatform::Meet => Platform::Meet,
+                CallPlatform::SlackHuddle => Platform::Slack,
+            },
+            window_hint,
+        })
+    }
+
+    fn stop_command() -> VideoCommand {
+        VideoCommand::Stop
+    }
+
+    fn window_command(hint: WindowHint) -> Option<VideoCommand> {
+        Some(VideoCommand::Window { window_hint: hint })
+    }
+
+    fn next_free_segment(folder: &Path) -> Result<u32, String> {
+        video_capture::next_segment_number(folder)
+            .map_err(|error| format!("could not read the call folder's video: {error}"))
+    }
+
+    fn segment_files(folder: &Path, segment: u32) -> Vec<PathBuf> {
+        vec![
+            folder
+                .join(video_capture::segment_folder_name(segment))
+                .join(video_capture::PLAYLIST_FILE_NAME),
+        ]
+    }
+
+    fn read_report(app: &AppHandle, call_id: &Path, report: &VideoReport) -> ReportSign {
+        log_video_report(call_id, report);
+        match report {
+            VideoReport::Recording { segment, .. } => ReportSign::Recording { segment: *segment },
+            VideoReport::Heartbeat {
+                segment,
+                frames_output,
+                fragments_written,
+                window_lookups,
+                ..
+            } => ReportSign::Progress {
+                segment: *segment,
+                // Frames handed to the encoder still count up when VideoToolbox hangs, so only
+                // its output counts. Lookups count, so a process that looks for a closed or
+                // hidden window is not hung.
+                counter_total: [frames_output, fragments_written, window_lookups]
+                    .into_iter()
+                    .fold(0_u64, |total, counter| total.saturating_add(*counter)),
+            },
+            VideoReport::Stopped { segment } => ReportSign::Closed { segment: *segment },
+            VideoReport::WindowChanged { segment, cause, .. } => {
+                match cause {
+                    WindowChangeCause::Closed => Self::show(
+                        app,
+                        call_id,
+                        VideoState::WindowMissing { segment: *segment },
+                    ),
+                    WindowChangeCause::Returned | WindowChangeCause::Replaced => {
+                        Self::show(app, call_id, VideoState::Recording { segment: *segment });
+                    }
+                    WindowChangeCause::Resized => {}
+                }
+                ReportSign::Logged
+            }
+            // The process waits for the next command with no segment open, so nothing grows.
+            VideoReport::Error {
+                kind: VideoErrorKind::PermissionDenied,
+                ..
+            } => {
+                Self::show(app, call_id, VideoState::ScreenRecordingRefused);
+                ReportSign::Refused
+            }
+            VideoReport::Error {
+                kind: VideoErrorKind::StoppedByUser,
+                ..
+            } => {
+                Self::show(app, call_id, VideoState::StoppedFromSharingControls);
+                ReportSign::StoppedByUser
+            }
+            VideoReport::Gap { .. }
+            | VideoReport::Permission { .. }
+            | VideoReport::Error { .. } => ReportSign::Logged,
+        }
+    }
+
+    fn show_phase(app: &AppHandle, call_id: &Path, phase: ProcessPhase) {
+        let state = match phase {
+            ProcessPhase::Starting { segment } => VideoState::Starting { segment },
+            ProcessPhase::Recording { segment } | ProcessPhase::Rotated { segment } => {
+                VideoState::Recording { segment }
+            }
+            ProcessPhase::Restarting => VideoState::Restarting,
+            ProcessPhase::Failing => VideoState::Failing,
+            ProcessPhase::Sleeping => VideoState::Sleeping,
+        };
+        Self::show(app, call_id, state);
+    }
+}
+
+fn log_video_report(call_id: &Path, report: &VideoReport) {
+    let call_id = call_id.display().to_string();
+    match report {
+        VideoReport::Recording {
+            segment,
+            window,
+            width_px,
+            height_px,
+            codec,
+            first_host_time_ns,
+        } => tracing::info!(
+            call.id = call_id,
+            segment.number = segment,
+            video.window_id = window.window_id,
+            video.width_px = width_px,
+            video.height_px = height_px,
+            video.codec = %codec,
+            video.first_host_time_ns = first_host_time_ns,
+            "video recording"
+        ),
+        VideoReport::Gap {
+            segment,
+            length_ms,
+            cause,
+            ..
+        } => tracing::warn!(
+            call.id = call_id,
+            segment.number = segment,
+            video.gap_length_ms = length_ms,
+            error.type = %cause,
+            "video gap"
+        ),
+        VideoReport::WindowChanged {
+            segment,
+            cause,
+            window,
+            ..
+        } => tracing::info!(
+            call.id = call_id,
+            segment.number = segment,
+            video.change_cause = %cause,
+            video.window_id = window.as_ref().map(|window| window.window_id),
+            "video window changed"
+        ),
+        VideoReport::Permission { service, state } => tracing::info!(
+            call.id = call_id,
+            permission.service = %service,
+            permission.state = %state,
+            "permission checked"
+        ),
+        VideoReport::Heartbeat { segment, .. } => tracing::debug!(
+            call.id = call_id,
+            segment.number = segment,
+            "video heartbeat"
+        ),
+        VideoReport::Stopped { segment } => tracing::info!(
+            call.id = call_id,
+            segment.number = segment,
+            "video segment closed"
+        ),
+        VideoReport::Error { kind, message } => tracing::error!(
+            call.id = call_id,
+            error.type = %kind,
+            exception.message = message,
+            "video helper error"
+        ),
     }
 }
 
@@ -899,9 +1426,13 @@ enum ProcessEnd {
 }
 
 impl<P: CaptureProcess> Recording<P> {
-    async fn run(mut self, mut stop: oneshot::Receiver<()>) {
+    async fn run(mut self, mut stop: oneshot::Receiver<()>, mut links: ProcessLinks) {
         loop {
-            let end = self.run_once(&mut stop).await;
+            // Restarts use the latest window, never one the watcher saw close.
+            if let Some(hint) = links.latest_hint() {
+                self.call.window_hint = Some(hint);
+            }
+            let end = self.run_once(&mut stop, &mut links).await;
             let (reason, is_device_open_failed) = match end {
                 ProcessEnd::Stopped => {
                     tracing::info!(call.id = %self.call.id.display(), "capture process stopped");
@@ -935,12 +1466,12 @@ impl<P: CaptureProcess> Recording<P> {
                     ),
                 );
             }
-            let state = if restart.is_failing {
-                AudioState::Failing
+            let phase = if restart.is_failing {
+                ProcessPhase::Failing
             } else {
-                AudioState::Restarting
+                ProcessPhase::Restarting
             };
-            P::show_state(&self.app, &self.call.id, Some(state));
+            P::show_phase(&self.app, &self.call.id, phase);
             // A device that would not open may come back, as a headset that reconnects: a
             // device change ends the long wait early.
             let is_device_watched =
@@ -974,21 +1505,17 @@ impl<P: CaptureProcess> Recording<P> {
     }
 
     /// Runs the process once, until the supervisor stops it, or it exits or hangs.
-    async fn run_once(&mut self, stop: &mut oneshot::Receiver<()>) -> ProcessEnd {
-        let (mut child, stdin, stdout) = match self.launch().await {
-            Ok(launched) => launched,
+    async fn run_once(
+        &mut self,
+        stop: &mut oneshot::Receiver<()>,
+        links: &mut ProcessLinks,
+    ) -> ProcessEnd {
+        let (mut child, stdout, mut run) = match self.open_run(links).await {
+            Ok(opened) => opened,
             Err(reason) => return failed(reason),
         };
         let pid = child.id().unwrap_or_default();
         let mut reports = BufReader::new(stdout).lines();
-        let mut run = ProcessRun {
-            stdin: Some(stdin),
-            liveness: Liveness::new(self.segment),
-            open_segment: Some(self.segment),
-            has_closed_segment: false,
-            is_device_open_failed: false,
-            next_command_seq: 2,
-        };
         let mut check = tokio::time::interval(LIVENESS_CHECK_INTERVAL);
         check.tick().await;
         let mut stop_deadline: Option<tokio::time::Instant> = None;
@@ -1003,7 +1530,8 @@ impl<P: CaptureProcess> Recording<P> {
             tokio::select! {
                 line = reports.next_line() => match line {
                     Ok(Some(line)) => {
-                        if let Err(error) = self.follow_report(&line, &mut run).await {
+                        let audio_out = links.audio_phase_out.as_ref();
+                        if let Err(error) = self.follow_report(&line, &mut run, audio_out).await {
                             kill(&mut child).await;
                             return failed(format!("could not send start after a wake: {error}"));
                         }
@@ -1038,6 +1566,22 @@ impl<P: CaptureProcess> Recording<P> {
                     run.send_stop::<P>().await;
                     stop_deadline = Some(tokio::time::Instant::now() + STOP_LIMIT);
                 }
+                phase = ProcessLinks::next_audio_phase(&mut links.audio_phase_in),
+                    if stop_deadline.is_none() =>
+                {
+                    if let Err(error) = self.follow_audio(phase, &mut run).await {
+                        kill(&mut child).await;
+                        return failed(format!("could not follow the audio's sleep: {error}"));
+                    }
+                }
+                hint = ProcessLinks::next_hint(&mut links.window_hints),
+                    if stop_deadline.is_none() =>
+                {
+                    if let Err(error) = self.follow_hint(hint, &mut run).await {
+                        kill(&mut child).await;
+                        return failed(format!("could not send the new window: {error}"));
+                    }
+                }
                 () = stop_limit => {
                     tracing::warn!(
                         process.pid = pid,
@@ -1059,6 +1603,39 @@ impl<P: CaptureProcess> Recording<P> {
                 }
             }
         }
+    }
+
+    /// Launches the process for the current segment, as the audio phase allows.
+    async fn open_run(
+        &mut self,
+        links: &mut ProcessLinks,
+    ) -> Result<(Child, ChildStdout, ProcessRun), String> {
+        let audio_phase = links.audio_phase();
+        // A video process that starts while the Mac sleeps waits for the audio's wake segment.
+        let is_sleeping = audio_phase.is_some_and(|phase| phase.is_asleep);
+        let audio_segment = audio_phase.map_or(self.segment, |phase| phase.segment);
+        let (child, stdin, stdout) = self.launch(is_sleeping, audio_segment).await?;
+        // An audio start opens a segment, after a sleep too: its helper died while the Mac slept.
+        let segment = self.segment;
+        links.publish_audio(|phase| {
+            phase.segment = segment;
+            phase.is_asleep = false;
+        });
+        let run = ProcessRun {
+            stdin: Some(stdin),
+            liveness: Liveness::new(segment),
+            open_segment: (!is_sleeping).then_some(segment),
+            has_closed_segment: false,
+            is_device_open_failed: false,
+            next_command_seq: 2,
+            hold: if is_sleeping {
+                RunHold::Asleep
+            } else {
+                RunHold::Free
+            },
+            seen_sleep_count: audio_phase.map_or(0, |phase| phase.sleep_count),
+        };
+        Ok((child, stdout, run))
     }
 
     /// Waits for a stopped process that closed its stdout to exit. One that never exits is
@@ -1089,27 +1666,34 @@ impl<P: CaptureProcess> Recording<P> {
         }
     }
 
-    /// Starts the process and sends it `start` for the current segment.
-    async fn launch(&mut self) -> Result<(Child, ChildStdin, ChildStdout), String> {
+    /// Starts the process and sends it `start` for the current segment, unless the Mac sleeps:
+    /// then the start waits for the wake.
+    async fn launch(
+        &mut self,
+        is_sleeping: bool,
+        audio_segment: u32,
+    ) -> Result<(Child, ChildStdin, ChildStdout), String> {
         let segment = self.segment;
+        let start = P::start_command(&self.call, &self.folder, segment, audio_segment)
+            .ok_or_else(|| "the call has nothing for this process to record".to_owned())?;
         let mut child = self.spawn_sidecar()?;
         let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             kill(&mut child).await;
             return Err("the helper has no stdin or stdout pipe".to_owned());
         };
-        P::show_state(
-            &self.app,
-            &self.call.id,
-            Some(AudioState::Starting { segment }),
-        );
         tracing::info!(
             call.id = %self.call.id.display(),
             process.pid = child.id().unwrap_or_default(),
             segment.number = segment,
             file.directory = %self.folder.display(),
+            capture.is_sleeping = is_sleeping,
             "capture process started"
         );
-        let start = P::start_command(&self.call, &self.folder, segment);
+        if is_sleeping {
+            P::show_phase(&self.app, &self.call.id, ProcessPhase::Sleeping);
+            return Ok((child, stdin, stdout));
+        }
+        P::show_phase(&self.app, &self.call.id, ProcessPhase::Starting { segment });
         if let Err(error) = send_command(&mut stdin, 1, &start).await {
             kill(&mut child).await;
             return Err(format!("could not send start: {error}"));
@@ -1148,14 +1732,14 @@ impl<P: CaptureProcess> Recording<P> {
                 return None;
             }
         };
-        let sign = P::read_report(&self.call.id, &report);
+        let sign = P::read_report(&self.app, &self.call.id, &report);
         match sign {
             ReportSign::Recording { segment } => {
                 self.backoff.note_recording();
-                P::show_state(
+                P::show_phase(
                     &self.app,
                     &self.call.id,
-                    Some(self.recording_state(segment, false)),
+                    ProcessPhase::Recording { segment },
                 );
             }
             ReportSign::Progress {
@@ -1165,31 +1749,18 @@ impl<P: CaptureProcess> Recording<P> {
             ReportSign::Rotated { to_segment } => {
                 self.segment = self.segment.max(to_segment);
                 liveness.segment = to_segment;
-                P::show_state(
+                P::show_phase(
                     &self.app,
                     &self.call.id,
-                    Some(self.recording_state(to_segment, true)),
+                    ProcessPhase::Rotated {
+                        segment: to_segment,
+                    },
                 );
             }
-            ReportSign::Permission { service, state } => self
-                .app
-                .state::<AppState>()
-                .audio_capture
-                .set_permission(&self.app, service, state),
-            ReportSign::Asleep => {
-                P::show_state(&self.app, &self.call.id, Some(AudioState::Sleeping));
-            }
-            ReportSign::MicUnavailable { segment } => P::show_state(
-                &self.app,
-                &self.call.id,
-                Some(AudioState::RecordingWithoutMic { segment }),
-            ),
-            ReportSign::MicChanged { segment } => P::show_state(
-                &self.app,
-                &self.call.id,
-                Some(AudioState::Recording { segment }),
-            ),
-            ReportSign::Closed
+            ReportSign::Asleep => P::show_phase(&self.app, &self.call.id, ProcessPhase::Sleeping),
+            ReportSign::Closed { .. }
+            | ReportSign::Refused
+            | ReportSign::StoppedByUser
             | ReportSign::DeviceOpenFailed
             | ReportSign::Woke
             | ReportSign::Logged => {}
@@ -1197,75 +1768,142 @@ impl<P: CaptureProcess> Recording<P> {
         Some(sign)
     }
 
-    /// The state for stems open in `segment`. A segment that recorded without the user's mic
-    /// stays so when its remote stem starts, and across a rotation, until the mic returns.
-    fn recording_state(&self, segment: u32, is_rotation: bool) -> AudioState {
-        let shown = self
-            .app
-            .state::<AppState>()
-            .audio_capture
-            .states()
-            .get(&self.call.id)
-            .copied();
-        let is_without_mic = matches!(
-            shown,
-            Some(AudioState::RecordingWithoutMic { segment: shown_segment })
-                if is_rotation || shown_segment == segment
-        );
-        if is_without_mic {
-            AudioState::RecordingWithoutMic { segment }
-        } else {
-            AudioState::Recording { segment }
-        }
-    }
-
-    /// Takes one report line into the run. Fails only when a wake's `start` cannot be sent.
-    async fn follow_report(&mut self, line: &str, run: &mut ProcessRun) -> std::io::Result<()> {
+    /// Takes one report line into the run, and publishes the audio phase it shows. Fails only
+    /// when a wake's `start` cannot be sent.
+    async fn follow_report(
+        &mut self,
+        line: &str,
+        run: &mut ProcessRun,
+        audio_out: Option<&watch::Sender<AudioPhase>>,
+    ) -> std::io::Result<()> {
+        let publish = |change: &dyn Fn(&mut AudioPhase)| {
+            if let Some(phase) = audio_out {
+                phase.send_modify(change);
+            }
+        };
         match self.take_report(line, &mut run.liveness) {
-            Some(ReportSign::Closed) => {
+            // A sleep's stop can report after the wake's start opened the next segment.
+            Some(ReportSign::Closed { segment }) if run.open_segment == Some(segment) => {
                 run.has_closed_segment = true;
                 run.open_segment = None;
             }
+            Some(ReportSign::Refused) => {
+                run.has_closed_segment = true;
+                run.open_segment = None;
+            }
+            Some(ReportSign::StoppedByUser) => run.hold = RunHold::StoppedByUser,
             Some(ReportSign::DeviceOpenFailed) => run.is_device_open_failed = true,
-            Some(
-                ReportSign::Recording { segment }
-                | ReportSign::Rotated {
-                    to_segment: segment,
-                },
-            ) => run.open_segment = Some(segment),
+            Some(ReportSign::Recording { segment }) => run.open_segment = Some(segment),
+            Some(ReportSign::Rotated {
+                to_segment: segment,
+            }) => {
+                run.open_segment = Some(segment);
+                publish(&|phase| phase.segment = segment);
+            }
+            Some(ReportSign::Asleep) => publish(&|phase| {
+                phase.is_asleep = true;
+                phase.sleep_count += 1;
+            }),
             // stdin is gone once a stop went out: then the wake starts nothing.
             Some(ReportSign::Woke) if run.open_segment.is_none() => {
-                if let Some(stdin) = run.stdin.as_mut() {
-                    let segment = self.next_segment_after_sleep();
-                    let start = P::start_command(&self.call, &self.folder, segment);
-                    send_command(stdin, run.next_command_seq, &start).await?;
-                    tracing::info!(
-                        segment.number = segment,
-                        "started the next segment after a wake"
-                    );
-                    run.next_command_seq += 1;
-                    run.open_segment = Some(segment);
-                    run.has_closed_segment = false;
-                    run.liveness = Liveness::new(segment);
-                    self.segment = segment;
-                    P::show_state(
-                        &self.app,
-                        &self.call.id,
-                        Some(AudioState::Starting { segment }),
-                    );
+                let segment = self.next_segment_after_sleep();
+                if self.send_start(segment, segment, run).await? {
+                    publish(&|phase| {
+                        phase.segment = segment;
+                        phase.is_asleep = false;
+                    });
                 }
             }
             Some(
-                ReportSign::Progress { .. }
-                | ReportSign::Permission { .. }
-                | ReportSign::MicUnavailable { .. }
-                | ReportSign::MicChanged { .. }
-                | ReportSign::Asleep
+                ReportSign::Closed { .. }
+                | ReportSign::Progress { .. }
                 | ReportSign::Woke
                 | ReportSign::Logged,
             )
             | None => {}
         }
+        Ok(())
+    }
+
+    /// Sends `start` for `segment` to a process that waits with no segment open. False once a
+    /// stop went out, which took stdin.
+    async fn send_start(
+        &mut self,
+        segment: u32,
+        audio_segment: u32,
+        run: &mut ProcessRun,
+    ) -> std::io::Result<bool> {
+        let Some(stdin) = run.stdin.as_mut() else {
+            return Ok(false);
+        };
+        let Some(start) = P::start_command(&self.call, &self.folder, segment, audio_segment) else {
+            return Ok(false);
+        };
+        send_command(stdin, run.next_command_seq, &start).await?;
+        tracing::info!(
+            segment.number = segment,
+            "started the next segment after a wake"
+        );
+        run.next_command_seq += 1;
+        run.open_segment = Some(segment);
+        run.has_closed_segment = false;
+        run.liveness = Liveness::new(segment);
+        self.segment = segment;
+        P::show_phase(&self.app, &self.call.id, ProcessPhase::Starting { segment });
+        Ok(true)
+    }
+
+    /// The video side of a sleep: the segment stops at the audio's sleep report, and the next
+    /// starts at its wake, on the audio's wake segment.
+    async fn follow_audio(
+        &mut self,
+        phase: AudioPhase,
+        run: &mut ProcessRun,
+    ) -> std::io::Result<()> {
+        let is_new_sleep = phase.sleep_count != run.seen_sleep_count;
+        run.seen_sleep_count = phase.sleep_count;
+        // After the user's stop no segment is open, and the tray keeps saying who stopped it.
+        if is_new_sleep && run.hold == RunHold::Free {
+            run.hold = RunHold::Asleep;
+            if run.open_segment.is_some()
+                && let Some(stdin) = run.stdin.as_mut()
+            {
+                send_command(stdin, run.next_command_seq, &P::stop_command()).await?;
+                run.next_command_seq += 1;
+                tracing::info!(
+                    segment.number = run.open_segment,
+                    "stopped the segment for a sleep"
+                );
+            }
+            P::show_phase(&self.app, &self.call.id, ProcessPhase::Sleeping);
+        }
+        if run.hold == RunHold::Asleep && !phase.is_asleep {
+            // The audio's wake segment is above every number in the folder, video's included.
+            let segment = P::next_free_segment(&self.folder)
+                .map_or(phase.segment, |free| free.max(phase.segment));
+            if self.send_start(segment, phase.segment, run).await? {
+                run.hold = RunHold::Free;
+            }
+        }
+        Ok(())
+    }
+
+    /// Keeps the huddle watcher's new window for restarts, and hands it to an open segment.
+    async fn follow_hint(&mut self, hint: WindowHint, run: &mut ProcessRun) -> std::io::Result<()> {
+        tracing::info!(
+            video.window_id = hint.window_id,
+            "the call's window changed"
+        );
+        self.call.window_hint = Some(hint.clone());
+        // A segment that starts later takes the hint from the call.
+        if run.open_segment.is_none() || run.hold != RunHold::Free {
+            return Ok(());
+        }
+        let (Some(stdin), Some(command)) = (run.stdin.as_mut(), P::window_command(hint)) else {
+            return Ok(());
+        };
+        send_command(stdin, run.next_command_seq, &command).await?;
+        run.next_command_seq += 1;
         Ok(())
     }
 
@@ -1297,16 +1935,34 @@ struct ProcessRun {
     is_device_open_failed: bool,
     /// `start` went out as 1.
     next_command_seq: u64,
+    hold: RunHold,
+    /// The audio phase's sleep count when this run last read it.
+    seen_sleep_count: u64,
+}
+
+/// What keeps a video run from recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunHold {
+    /// Nothing: it records, or records at its next `start`.
+    Free,
+    /// The process closed its segment for a sleep, or started while the Mac slept, and waits
+    /// for the audio's wake.
+    Asleep,
+    /// The user stopped video through the system's sharing controls. Wakes and window hints
+    /// start nothing until the call resumes, which starts a new run.
+    StoppedByUser,
 }
 
 impl ProcessRun {
     /// Sends `stop` to an open segment, then closes stdin: after the segment closes, the
-    /// process exits. With no segment open, closing stdin alone ends it.
+    /// process exits. With no segment open, or one a sleep already stopped, closing stdin alone
+    /// ends it.
     async fn send_stop<P: CaptureProcess>(&mut self) {
         let Some(mut stdin) = self.stdin.take() else {
             return;
         };
         if self.open_segment.is_some()
+            && self.hold == RunHold::Free
             && let Err(error) =
                 send_command(&mut stdin, self.next_command_seq, &P::stop_command()).await
         {

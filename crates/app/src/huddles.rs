@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use huddle_captions::{HuddleHealth, Notice, WatchPaths, WatchSettings};
+use capture_protocol::WindowHint;
+use huddle_captions::{HuddleHealth, HuddleWindow, Notice, WatchPaths, WatchSettings};
 use pipeline::Pipeline;
 use tauri::{AppHandle, Manager as _};
 
@@ -14,6 +15,8 @@ use crate::call_status::{Moment, Observation};
 use crate::calls::{CallEndReason, CallPlatform};
 use crate::finished_logs::{self, LogSource};
 use crate::notify;
+
+const SLACK_BUNDLE_ID: &str = "com.tinyspeck.slackmacgap";
 
 pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
     let state = app.state::<AppState>();
@@ -72,6 +75,22 @@ struct Reporter {
     notified: BTreeSet<(PathBuf, HuddleHealth)>,
 }
 
+/// The hint video records the huddle window by. `None` while the watcher has not seen huddle
+/// content in the window, or could not read its id: a title alone could pick a conversation
+/// window, which shows private messages. Video starts when `HuddleWindowFound` brings the id.
+fn window_hint(window: HuddleWindow) -> Option<WindowHint> {
+    let Some(window_id) = window.window_id else {
+        tracing::info!("the huddle window is not confirmed yet; video waits for its id");
+        return None;
+    };
+    Some(WindowHint {
+        bundle_id: SLACK_BUNDLE_ID.to_owned(),
+        title: Some(window.title),
+        pid: Some(window.pid),
+        window_id,
+    })
+}
+
 impl Reporter {
     fn report(&mut self, notice: Notice) {
         match notice {
@@ -88,11 +107,25 @@ impl Reporter {
                 self.calls().status().set_huddle_permission_missing(false);
                 crate::tray::refresh(&self.app);
             }
-            Notice::HuddleStarted { log_path, channel } => {
+            Notice::HuddleStarted {
+                log_path,
+                channel,
+                window,
+            } => {
                 // Each huddle gets a new log, so none starts stopped.
-                self.calls()
-                    .open(&log_path, CallPlatform::SlackHuddle, Some(channel), false);
+                self.calls().open(
+                    &log_path,
+                    CallPlatform::SlackHuddle,
+                    Some(channel),
+                    window_hint(window),
+                    false,
+                );
                 crate::tray::refresh(&self.app);
+            }
+            Notice::HuddleWindowFound { log_path, window } => {
+                if let Some(hint) = window_hint(window) {
+                    self.calls().set_window_hint(&log_path, hint);
+                }
             }
             Notice::CaptionsRead {
                 log_path,

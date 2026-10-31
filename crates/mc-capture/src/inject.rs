@@ -1,4 +1,4 @@
-//! Device and power events a debug build injects on a timetable, so the device rules and the
+//! Device, power and video events a debug build injects on a timetable, so the device rules and the
 //! sleep path run without touching the user's devices or sleeping the Mac. Set
 //! `MC_CAPTURE_INJECT` to a list such as `5:mic-lost,12:tap-stall,30:sleep,32:wake`: seconds
 //! since the process started, then the event. Release builds do not contain this module.
@@ -9,6 +9,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use capture::{PowerEvent, SleepAck};
+use video_capture::mac::stream::StreamEvent;
 
 const SCHEDULE_VARIABLE: &str = "MC_CAPTURE_INJECT";
 
@@ -42,9 +43,16 @@ pub(crate) enum DeviceEvent {
     TapDead,
     /// A private aggregate appears and goes, so the real device-list listener fires.
     HalProbe,
+    /// The video stream's callbacks are dropped from now on, as a hung stream sends none.
+    VideoStall,
+    /// The video stream sends one idle status and then nothing, as ScreenCaptureKit does for a
+    /// window whose picture stops changing.
+    VideoStill,
+    /// The video stream's callbacks arrive again.
+    VideoResume,
 }
 
-const DEVICE_EVENTS_ALL: [DeviceEvent; 15] = [
+const DEVICE_EVENTS_ALL: [DeviceEvent; 18] = [
     DeviceEvent::DefaultInput,
     DeviceEvent::DefaultOutput,
     DeviceEvent::DeviceList,
@@ -60,6 +68,9 @@ const DEVICE_EVENTS_ALL: [DeviceEvent; 15] = [
     DeviceEvent::TapStallQuiet,
     DeviceEvent::TapDead,
     DeviceEvent::HalProbe,
+    DeviceEvent::VideoStall,
+    DeviceEvent::VideoStill,
+    DeviceEvent::VideoResume,
 ];
 
 impl fmt::Display for DeviceEvent {
@@ -80,6 +91,9 @@ impl fmt::Display for DeviceEvent {
             Self::TapStallQuiet => "tap-stall-quiet",
             Self::TapDead => "tap-dead",
             Self::HalProbe => "hal-probe",
+            Self::VideoStall => "video-stall",
+            Self::VideoStill => "video-still",
+            Self::VideoResume => "video-resume",
         })
     }
 }
@@ -118,6 +132,7 @@ static DEVICE_EVENTS: Mutex<Vec<(Instant, DeviceEvent)>> = Mutex::new(Vec::new()
 static IS_MIC_ZEROED: AtomicBool = AtomicBool::new(false);
 static IS_CANDIDATE_SILENCED: AtomicBool = AtomicBool::new(false);
 static IS_TAP_SILENCED: AtomicBool = AtomicBool::new(false);
+static VIDEO_FEED: Mutex<VideoFeed> = Mutex::new(VideoFeed::Live);
 /// 0 while the real lid state counts, 1 for open, 2 for closed.
 static LID_STATE: AtomicU8 = AtomicU8::new(0);
 
@@ -215,6 +230,49 @@ pub(crate) fn silence_next_tap() {
 /// Whether this new tap should deliver nothing. Applies to one tap.
 pub(crate) fn take_tap_silenced() -> bool {
     IS_TAP_SILENCED.swap(false, Ordering::Relaxed)
+}
+
+/// What the video stream's callbacks reach the loop as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VideoFeed {
+    Live,
+    /// Every callback but a stop is dropped.
+    Stalled,
+    /// The next callback arrives as an idle status, then every one but a stop is dropped.
+    Still {
+        is_idle_sent: bool,
+    },
+}
+
+impl VideoFeed {
+    pub(crate) fn still() -> Self {
+        Self::Still {
+            is_idle_sent: false,
+        }
+    }
+}
+
+pub(crate) fn set_video_feed(feed: VideoFeed) {
+    *VIDEO_FEED.lock().unwrap_or_else(PoisonError::into_inner) = feed;
+}
+
+/// The callback as the injected feed lets it through, if at all. Runs on the stream's queue. A
+/// stop always passes, as a hung stream still reports one.
+pub(crate) fn pass_video_event(event: StreamEvent) -> Option<StreamEvent> {
+    if matches!(event, StreamEvent::Stopped(_)) {
+        return Some(event);
+    }
+    let mut feed = VIDEO_FEED.lock().unwrap_or_else(PoisonError::into_inner);
+    match *feed {
+        VideoFeed::Live => Some(event),
+        VideoFeed::Stalled | VideoFeed::Still { is_idle_sent: true } => None,
+        VideoFeed::Still {
+            is_idle_sent: false,
+        } => {
+            *feed = VideoFeed::Still { is_idle_sent: true };
+            Some(StreamEvent::Idle)
+        }
+    }
 }
 
 pub(crate) fn set_lid_closed(is_closed: bool) {

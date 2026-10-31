@@ -71,6 +71,16 @@ impl Element {
         Ok(unsafe { CFRetained::from_raw(value) })
     }
 
+    /// The window server's id of a window element, which `ScreenCaptureKit` lists windows by.
+    /// Accessibility has no public call for it; every window recorder uses this private one.
+    pub(crate) fn window_id(&self) -> Option<u32> {
+        let mut window_id = 0_u32;
+        // SAFETY: the element is a live AXUIElement and `window_id` a valid out pointer. The
+        // call reads the element and writes the id only.
+        let status = unsafe { _AXUIElementGetWindow(&self.0, &raw mut window_id) };
+        (status == AXError::Success.0 && window_id != 0).then_some(window_id)
+    }
+
     pub(crate) fn string(&self, name: &str) -> Option<String> {
         let value = self.attribute(name).ok()?;
         value
@@ -210,4 +220,9 @@ fn bundle_version(bundle: &Path) -> Option<String> {
     let value = after_key.trim_start().strip_prefix("<string>")?;
     let (version, _) = value.split_once("</string>")?;
     Some(version.trim().to_owned())
+}
+
+unsafe extern "C" {
+    /// Private in `HIServices` since macOS 10.x; Loom, OBS and Hammerspoon call it.
+    fn _AXUIElementGetWindow(element: &AXUIElement, window_id: *mut u32) -> i32;
 }

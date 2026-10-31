@@ -44,6 +44,17 @@ pub struct WatchPaths {
     pub layout_override_dir: PathBuf,
 }
 
+/// The window a huddle runs in, as the window server knows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HuddleWindow {
+    pub pid: i32,
+    /// The whole title, "<channel> - <workspace> - Slack".
+    pub title: String,
+    /// `None` until the huddle content shows in the window, since a conversation popped out of
+    /// the main window looks the same before it. `None` too when the private lookup fails.
+    pub window_id: Option<u32>,
+}
+
 /// What the watcher tells the app. Each huddle is named by its log path.
 #[derive(Debug, Clone)]
 pub enum Notice {
@@ -54,6 +65,14 @@ pub enum Notice {
         log_path: PathBuf,
         /// A channel name, or the other people's names in a DM.
         channel: String,
+        /// The huddle window, so video records that window and no other.
+        window: HuddleWindow,
+    },
+    /// The huddle content showed in the huddle's window, after the start or after the user
+    /// reopened a closed window. Video records this window; it never looks for one by title.
+    HuddleWindowFound {
+        log_path: PathBuf,
+        window: HuddleWindow,
     },
     /// The huddle's health changed. Reported once per change.
     Health {
