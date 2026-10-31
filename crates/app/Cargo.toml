@@ -11,6 +11,7 @@ tauri-build.workspace = true
 
 [dependencies]
 base64.workspace = true
+browser-shortcut.workspace = true
 call-folder.workspace = true
 capture-protocol.workspace = true
 huddle-captions.workspace = true

@@ -9,7 +9,7 @@ mod log_folder;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -42,11 +42,18 @@ use crate::finished_logs::{self, LogSource};
 /// The protocol this app speaks. An extension that says an older one gets a tray warning.
 const PROTOCOL: u32 = 1;
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
-/// Snapshot requests a slow port may fall behind by before it misses some.
-const SNAPSHOT_REQUEST_BACKLOG: usize = 16;
+/// Session requests a slow port may fall behind by before it misses some.
+const SESSION_REQUEST_BACKLOG: usize = 16;
 /// While a call wants its tab video, `call_status` goes out at least this often, changed or not.
 /// mc-meet stops capturing after 10 s without one, so a lost stop cannot leave it recording.
 const VIDEO_STATUS_HEARTBEAT: Duration = Duration::from_secs(5);
+
+/// What the app asks of the worker that holds some sessions.
+#[derive(Debug, Clone)]
+enum SessionRequest {
+    PageSnapshot(Vec<String>),
+    ShortcutPressExpected(String),
+}
 
 /// The call book, shared by every connection.
 pub(crate) struct BrowserCalls {
@@ -56,8 +63,9 @@ pub(crate) struct BrowserCalls {
     meet_settings: watch::Sender<MeetSettings>,
     /// The Meet calls' status, which every welcomed port sends mc-meet when it changes.
     call_status: watch::Sender<CallStatusMessage>,
-    /// Session ids whose page snapshot the app wants. Every welcomed port forwards them.
-    snapshot_requests: broadcast::Sender<Vec<String>>,
+    /// Page snapshot requests and shortcut press notices. Every welcomed port forwards them;
+    /// the worker that holds the named sessions acts on them.
+    session_requests: broadcast::Sender<SessionRequest>,
     /// Each recording call's tab video task, by call id.
     tab_video: Mutex<HashMap<PathBuf, TabVideoEntry>>,
     /// When `call_status` last went out.
@@ -91,6 +99,22 @@ impl TabVideoState {
     }
 }
 
+impl TabVideoInput {
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Fragment(_) => "fragment",
+            Self::NeedsClick(_) => "needs_click",
+            Self::PressReady { .. } => "press_ready",
+            Self::PressNoted { .. } => "press_noted",
+            Self::PressRefused => "press_refused",
+            Self::PressUnseen(_) => "press_unseen",
+            Self::Capturing => "capturing",
+            Self::Stopped { .. } => "stopped",
+            Self::Failed { .. } => "failed",
+        }
+    }
+}
+
 /// The last fragment of a capture that stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CaptureEnd {
@@ -99,15 +123,83 @@ pub(crate) struct CaptureEnd {
     pub last_index: u64,
 }
 
+/// How mc-meet learned that a press missed the Meet tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PressMiss {
+    /// The target worker saw no command within 1 s of its ready reply. An older mc-meet sends
+    /// no reason, and this is what it means.
+    #[default]
+    NoCommand,
+    /// The target worker saw the command on another tab, and left it alone.
+    OtherTab,
+    /// Another mc-meet, in another profile of the same browser, saw the command after the
+    /// press notice for a session it does not hold, and left it alone.
+    OtherWorker,
+}
+
+impl PressMiss {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCommand => "no_command",
+            Self::OtherTab => "other_tab",
+            Self::OtherWorker => "other_worker",
+        }
+    }
+}
+
+/// What mc-meet reports with a `needs_click`: the facts the app's shortcut press depends on.
+/// An older mc-meet sends neither field.
+#[derive(Debug, Clone)]
+pub(crate) struct PressChance {
+    pub session_id: String,
+    pub meet_tab: Option<MeetTabFocus>,
+    /// mc-meet's bound shortcut from `chrome.commands.getAll()`, empty when none is bound.
+    pub shortcut: Option<String>,
+}
+
+/// Where the Meet tab is in its Chrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub(crate) struct MeetTabFocus {
+    /// The Meet tab is the active tab of its window.
+    pub is_tab_active: bool,
+    /// The Meet tab's window is the Chrome window focused last, which gets a posted key even
+    /// while another app is in front.
+    pub is_window_last_focused: bool,
+}
+
 /// What the relay hands the call's tab video task.
 #[derive(Debug)]
 pub(crate) enum TabVideoInput {
     Fragment(video_capture::TabFragment),
-    State {
-        state: TabVideoState,
-        detail: Option<String>,
+    /// Chrome refused the stream id because mc-meet was not invoked on the tab. mc-meet sends it
+    /// again when the tab's focus changes.
+    NeedsClick(PressChance),
+    /// mc-meet read the press facts again and the Meet tab is still where the press lands, so
+    /// the app may press now.
+    PressReady {
+        /// The browser that started the replying port's host, which is where the press goes.
+        browser_pid: Option<u32>,
+        port_id: u64,
+    },
+    /// An mc-meet that does not hold the session heard the press notice, and leaves alone any
+    /// command for the next 1 s.
+    PressNoted {
+        port_id: u64,
+    },
+    /// mc-meet read the press facts again and they no longer hold; a `needs_click` with the
+    /// new facts came first.
+    PressRefused,
+    /// The press did not reach the Meet tab: the key went to a window the target mc-meet cannot
+    /// see, such as another Chrome profile.
+    PressUnseen(PressMiss),
+    Capturing,
+    Stopped {
         /// Set on a `stopped` that names its capture's last fragment.
         ended: Option<CaptureEnd>,
+    },
+    Failed {
+        detail: Option<String>,
     },
 }
 
@@ -126,7 +218,7 @@ impl BrowserCalls {
             next_port_id: AtomicU64::new(0),
             meet_settings: watch::Sender::new(meet_settings),
             call_status: watch::Sender::new(CallStatusMessage::default()),
-            snapshot_requests: broadcast::channel(SNAPSHOT_REQUEST_BACKLOG).0,
+            session_requests: broadcast::channel(SESSION_REQUEST_BACKLOG).0,
             tab_video: Mutex::new(HashMap::new()),
             call_status_sent_at: Mutex::new(Instant::now()),
         }
@@ -197,7 +289,9 @@ impl BrowserCalls {
             return;
         }
         // An error only means no port is open; the snapshot is then lost, as the page is.
-        let _unheard = self.snapshot_requests.send(session_ids);
+        let _unheard = self
+            .session_requests
+            .send(SessionRequest::PageSnapshot(session_ids));
     }
 
     /// The log a session writes to, open or ended. `session_id` is checked: it names files.
@@ -249,6 +343,23 @@ impl BrowserCalls {
         }
     }
 
+    /// Tells every welcomed mc-meet that the app presses the shortcut for this session's tab
+    /// next. The one that holds the session answers; every other one leaves alone a command
+    /// that comes within 1 s and reports it as `shortcut_press_landed`, since the press then
+    /// landed in its profile instead.
+    ///
+    /// Returns the ports that hear it. The app presses only after each one answered, so no
+    /// mc-meet can get the key before it knows the key is not the user's.
+    pub fn expect_shortcut_press(&self, session_id: &str) -> HashSet<u64> {
+        let book = self.lock();
+        // No receiver means no port is welcomed; the press wait then times out. The book lock
+        // is held across the send, so no port is greeted between the snapshot and the notice.
+        let _unheard = self
+            .session_requests
+            .send(SessionRequest::ShortcutPressExpected(session_id.to_owned()));
+        book.greeted_port_ids()
+    }
+
     /// Drops the sink. Later fragments for the call are dropped.
     pub fn close_tab_video(&self, call_id: &Path) {
         self.lock_tab_video().remove(call_id);
@@ -282,6 +393,9 @@ impl BrowserCalls {
 enum ExtensionMessage {
     HostHello {
         origin: String,
+        /// The host's parent process, which is the browser on macOS.
+        #[serde(default)]
+        browser_pid: Option<u32>,
     },
     Hello {
         protocol: u32,
@@ -338,6 +452,28 @@ enum ExtensionMessage {
     VideoFragment(VideoFragmentMessage),
     /// mc-meet's tab capture changed state.
     VideoState(VideoStateMessage),
+    /// mc-meet's answers to `shortcut_press_expected`: ready to see the press, refused because
+    /// the tab moved, or unseen when the press did not reach the tab.
+    ShortcutPressReady {
+        session_id: String,
+    },
+    ShortcutPressRefused {
+        session_id: String,
+    },
+    ShortcutPressUnseen {
+        session_id: String,
+        #[serde(default)]
+        reason: PressMiss,
+    },
+    /// From an mc-meet that does not hold the session: it heard the press notice.
+    ShortcutPressNoted {
+        session_id: String,
+    },
+    /// From an mc-meet that does not hold the session: the press for it landed in this one's
+    /// window. Every welcomed port hears the press notice, so this one knew to leave it alone.
+    ShortcutPressLanded {
+        session_id: String,
+    },
     /// A type from a newer extension.
     #[serde(other)]
     Unknown,
@@ -356,6 +492,36 @@ struct VideoStateMessage {
     capture_id: Option<String>,
     #[serde(default)]
     last_index: Option<u64>,
+    /// On a `needs_click`: where the Meet tab is.
+    #[serde(default)]
+    meet_tab: Option<MeetTabFocus>,
+    /// On a `needs_click`: mc-meet's bound shortcut, empty when none is bound.
+    #[serde(default)]
+    shortcut: Option<String>,
+}
+
+impl ExtensionMessage {
+    /// Whether the message may come only after the host's hello.
+    fn needs_host_hello(&self) -> bool {
+        match self {
+            Self::HostHello { .. } | Self::Unknown => false,
+            Self::Hello { .. }
+            | Self::Event { .. }
+            | Self::FrameFailed { .. }
+            | Self::PageSnapshot { .. }
+            | Self::PagesAway { .. }
+            | Self::SaveDebugReport { .. }
+            | Self::StopRecording { .. }
+            | Self::ResumeRecording { .. }
+            | Self::VideoFragment(_)
+            | Self::VideoState(_)
+            | Self::ShortcutPressReady { .. }
+            | Self::ShortcutPressRefused { .. }
+            | Self::ShortcutPressUnseen { .. }
+            | Self::ShortcutPressLanded { .. }
+            | Self::ShortcutPressNoted { .. } => true,
+        }
+    }
 }
 
 /// The fields of a `video_fragment`, as mc-meet sends them.
@@ -439,6 +605,10 @@ enum AppMessage {
     CallStatus(CallStatusMessage),
     SnapshotRequest {
         session_ids: Vec<String>,
+    },
+    /// The app presses mc-meet's shortcut for this session's tab once mc-meet answers.
+    ShortcutPressExpected {
+        session_id: String,
     },
     DebugReportSaved {
         path: String,
@@ -650,6 +820,7 @@ async fn listen(app: AppHandle, pipeline: Arc<Pipeline>, socket: PathBuf) {
                     app: app.clone(),
                     pipeline: Arc::clone(&pipeline),
                     id: port_id,
+                    browser_pid: OnceLock::new(),
                 };
                 tauri::async_runtime::spawn(port.serve(connection).instrument(span));
             }
@@ -667,6 +838,10 @@ struct Port {
     app: AppHandle,
     pipeline: Arc<Pipeline>,
     id: u64,
+    /// The browser that started this port's host, as its hello claims. Only a process of this
+    /// user can reach the app's socket, but it can claim any pid, so the press checks that the
+    /// pid is a Chromium browser before it posts a key there.
+    browser_pid: OnceLock<u32>,
 }
 
 impl Port {
@@ -736,26 +911,17 @@ impl Port {
                 }
             };
             match message {
-                ExtensionMessage::HostHello { origin } => {
-                    if origin != native_host::EXTENSION_ORIGIN {
-                        tracing::warn!(browser.origin = origin, "refused an unknown extension");
+                ExtensionMessage::HostHello {
+                    origin,
+                    browser_pid,
+                } => {
+                    if !self.take_host_hello(&origin, browser_pid) {
                         return Ok(());
                     }
                     is_host_known = true;
                 }
                 // Only host mode connects here, and it always speaks first.
-                ExtensionMessage::Hello { .. }
-                | ExtensionMessage::Event { .. }
-                | ExtensionMessage::FrameFailed { .. }
-                | ExtensionMessage::PageSnapshot { .. }
-                | ExtensionMessage::PagesAway { .. }
-                | ExtensionMessage::SaveDebugReport { .. }
-                | ExtensionMessage::StopRecording { .. }
-                | ExtensionMessage::ResumeRecording { .. }
-                | ExtensionMessage::VideoFragment(_)
-                | ExtensionMessage::VideoState(_)
-                    if !is_host_known =>
-                {
+                _ if !is_host_known && message.needs_host_hello() => {
                     tracing::warn!("refused a connection that skipped the host hello");
                     return Ok(());
                 }
@@ -766,16 +932,7 @@ impl Port {
                 } => {
                     let open_sessions =
                         self.greet(protocol, extension_version.as_deref(), &sessions);
-                    let welcome = AppMessage::Welcome {
-                        protocol: PROTOCOL,
-                        app_version: env!("CARGO_PKG_VERSION"),
-                        folder_version: crate::meet_extension::folder_version(&self.app),
-                        open_sessions,
-                        settings: (*feeds.meet_settings.borrow_and_update()).into(),
-                    };
-                    send(to_host, &welcome).await?;
-                    let status = feeds.call_status.borrow_and_update().clone();
-                    send(to_host, &AppMessage::CallStatus(status)).await?;
+                    welcome(to_host, &self.app, &mut feeds, open_sessions).await?;
                     is_welcomed = true;
                 }
                 ExtensionMessage::Event {
@@ -799,12 +956,32 @@ impl Port {
                 | ExtensionMessage::SaveDebugReport { .. }) => {
                     self.take_debug_message(message, &reply_sender);
                 }
-                ExtensionMessage::VideoFragment(message) => self.take_tab_fragment(message),
-                ExtensionMessage::VideoState(message) => self.take_tab_video_state(message),
+                message @ (ExtensionMessage::VideoFragment(_)
+                | ExtensionMessage::VideoState(_)
+                | ExtensionMessage::ShortcutPressReady { .. }
+                | ExtensionMessage::ShortcutPressRefused { .. }
+                | ExtensionMessage::ShortcutPressUnseen { .. }
+                | ExtensionMessage::ShortcutPressLanded { .. }
+                | ExtensionMessage::ShortcutPressNoted { .. }) => {
+                    self.take_video_message(message);
+                }
                 ExtensionMessage::Unknown => {}
             }
         }
         Ok(())
+    }
+
+    /// Whether the host speaks for mc-meet. Keeps the browser's pid for the shortcut press.
+    fn take_host_hello(&self, origin: &str, browser_pid: Option<u32>) -> bool {
+        if origin != native_host::EXTENSION_ORIGIN {
+            tracing::warn!(browser.origin = origin, "refused an unknown extension");
+            return false;
+        }
+        if let Some(pid) = browser_pid {
+            let _ = self.browser_pid.set(pid);
+        }
+        tracing::info!(process.parent_pid = browser_pid, "host connected");
+        true
     }
 
     /// Records the hello and returns the open sessions for `welcome`.
@@ -954,6 +1131,11 @@ impl Port {
             | ExtensionMessage::ResumeRecording { .. }
             | ExtensionMessage::VideoFragment(_)
             | ExtensionMessage::VideoState(_)
+            | ExtensionMessage::ShortcutPressReady { .. }
+            | ExtensionMessage::ShortcutPressRefused { .. }
+            | ExtensionMessage::ShortcutPressUnseen { .. }
+            | ExtensionMessage::ShortcutPressLanded { .. }
+            | ExtensionMessage::ShortcutPressNoted { .. }
             | ExtensionMessage::Unknown => {}
         }
     }
@@ -1073,6 +1255,46 @@ impl Port {
         }
     }
 
+    /// Fragments, states and press replies, for the session's tab video task.
+    fn take_video_message(&self, message: ExtensionMessage) {
+        match message {
+            ExtensionMessage::VideoFragment(message) => self.take_tab_fragment(message),
+            ExtensionMessage::VideoState(message) => self.take_tab_video_state(message),
+            ExtensionMessage::ShortcutPressReady { session_id } => {
+                let browser_pid = self.browser_pid.get().copied();
+                let input = TabVideoInput::PressReady {
+                    browser_pid,
+                    port_id: self.id,
+                };
+                self.route_tab_video(&session_id, input);
+            }
+            ExtensionMessage::ShortcutPressNoted { session_id } => {
+                let input = TabVideoInput::PressNoted { port_id: self.id };
+                self.route_tab_video(&session_id, input);
+            }
+            ExtensionMessage::ShortcutPressRefused { session_id } => {
+                self.route_tab_video(&session_id, TabVideoInput::PressRefused);
+            }
+            ExtensionMessage::ShortcutPressUnseen { session_id, reason } => {
+                self.route_tab_video(&session_id, TabVideoInput::PressUnseen(reason));
+            }
+            ExtensionMessage::ShortcutPressLanded { session_id } => {
+                let input = TabVideoInput::PressUnseen(PressMiss::OtherWorker);
+                self.route_tab_video(&session_id, input);
+            }
+            ExtensionMessage::HostHello { .. }
+            | ExtensionMessage::Hello { .. }
+            | ExtensionMessage::Event { .. }
+            | ExtensionMessage::FrameFailed { .. }
+            | ExtensionMessage::PageSnapshot { .. }
+            | ExtensionMessage::PagesAway { .. }
+            | ExtensionMessage::SaveDebugReport { .. }
+            | ExtensionMessage::StopRecording { .. }
+            | ExtensionMessage::ResumeRecording { .. }
+            | ExtensionMessage::Unknown => {}
+        }
+    }
+
     // Never acked or answered: a lost fragment is a gap, and mc-meet resends its buffer after a
     // reconnect.
     fn take_tab_fragment(&self, message: VideoFragmentMessage) {
@@ -1126,6 +1348,8 @@ impl Port {
             detail,
             capture_id,
             last_index,
+            meet_tab,
+            shortcut,
         } = message;
         tracing::info!(
             browser_call.session_id = session_id,
@@ -1133,35 +1357,45 @@ impl Port {
             video.detail = detail.as_deref(),
             video.capture_id = capture_id.as_deref(),
             video.last_fragment_index = last_index,
+            video.is_tab_active = meet_tab.map(|tab| tab.is_tab_active),
+            video.is_window_last_focused = meet_tab.map(|tab| tab.is_window_last_focused),
+            video.shortcut = shortcut.as_deref(),
             "video.tab_state"
         );
-        let ended = match state {
-            TabVideoState::Stopped => {
-                capture_id
+        let input = match state {
+            TabVideoState::NeedsClick => TabVideoInput::NeedsClick(PressChance {
+                session_id: session_id.clone(),
+                meet_tab,
+                shortcut,
+            }),
+            TabVideoState::Capturing => TabVideoInput::Capturing,
+            TabVideoState::Stopped => TabVideoInput::Stopped {
+                ended: capture_id
                     .zip(last_index)
                     .map(|(capture_id, last_index)| CaptureEnd {
                         capture_id,
                         last_index,
-                    })
-            }
-            TabVideoState::NeedsClick | TabVideoState::Capturing | TabVideoState::Failed => None,
+                    }),
+            },
+            TabVideoState::Failed => TabVideoInput::Failed { detail },
         };
-        let Some(call_id) = self.call_of_video_session(&session_id) else {
+        self.route_tab_video(&session_id, input);
+    }
+
+    /// Hands a video state or press reply to the session's call task, if it runs.
+    fn route_tab_video(&self, session_id: &str, input: TabVideoInput) {
+        let Some(call_id) = self.call_of_video_session(session_id) else {
             return;
         };
         let Some(sink) = self.calls().tab_video_sink(&call_id) else {
             return;
         };
-        match sink.try_send(TabVideoInput::State {
-            state,
-            detail,
-            ended,
-        }) {
+        match sink.try_send(input) {
             // A closed sink means the task ended between the lookup and the send.
             Ok(()) | Err(TrySendError::Closed(_)) => {}
-            Err(TrySendError::Full(_)) => tracing::warn!(
+            Err(TrySendError::Full(input)) => tracing::warn!(
                 call.id = %call_id.display(),
-                video.tab_state = state.as_str(),
+                video.input = input.kind(),
                 "video.tab_state_dropped"
             ),
         }
@@ -1208,17 +1442,17 @@ fn is_acked(logged: &Result<Logged, EventError>) -> bool {
     }
 }
 
-/// What the app sends a welcomed port unasked: settings, call status, snapshot requests and
-/// debug report replies.
+/// What the app sends a welcomed port unasked: settings, call status, snapshot requests,
+/// shortcut press notices and debug report replies.
 struct PortFeeds {
     meet_settings: watch::Receiver<MeetSettings>,
     call_status: watch::Receiver<CallStatusMessage>,
-    snapshot_requests: broadcast::Receiver<Vec<String>>,
+    session_requests: broadcast::Receiver<SessionRequest>,
     replies: mpsc::UnboundedReceiver<AppMessage>,
     // A closed sender would end every later wait at once.
     is_settings_open: bool,
     is_call_status_open: bool,
-    is_snapshot_open: bool,
+    is_session_request_open: bool,
 }
 
 impl PortFeeds {
@@ -1226,11 +1460,11 @@ impl PortFeeds {
         Self {
             meet_settings: calls.meet_settings.subscribe(),
             call_status: calls.call_status.subscribe(),
-            snapshot_requests: calls.snapshot_requests.subscribe(),
+            session_requests: calls.session_requests.subscribe(),
             replies,
             is_settings_open: true,
             is_call_status_open: true,
-            is_snapshot_open: true,
+            is_session_request_open: true,
         }
     }
 
@@ -1253,16 +1487,24 @@ impl PortFeeds {
                     }
                     return AppMessage::CallStatus(self.call_status.borrow_and_update().clone());
                 }
-                request = self.snapshot_requests.recv(), if self.is_snapshot_open => {
+                request = self.session_requests.recv(), if self.is_session_request_open => {
                     match request {
-                        Ok(session_ids) => return AppMessage::SnapshotRequest { session_ids },
+                        Ok(SessionRequest::PageSnapshot(session_ids)) => {
+                            return AppMessage::SnapshotRequest { session_ids };
+                        }
+                        Ok(SessionRequest::ShortcutPressExpected(session_id)) => {
+                            return AppMessage::ShortcutPressExpected { session_id };
+                        }
+                        // A missed press notice only means that press waits out its reply.
                         Err(broadcast::error::RecvError::Lagged(missed)) => {
                             tracing::warn!(
                                 browser_call.missed_requests = missed,
-                                "dropped page snapshot requests"
+                                "dropped requests to mc-meet"
                             );
                         }
-                        Err(broadcast::error::RecvError::Closed) => self.is_snapshot_open = false,
+                        Err(broadcast::error::RecvError::Closed) => {
+                            self.is_session_request_open = false;
+                        }
                     }
                 }
                 Some(reply) = self.replies.recv() => return reply,
@@ -1270,6 +1512,25 @@ impl PortFeeds {
             }
         }
     }
+}
+
+/// Sends `welcome` and the current call status, which a port needs before anything else.
+async fn welcome(
+    to_host: &mut (impl AsyncWrite + Unpin),
+    app: &AppHandle,
+    feeds: &mut PortFeeds,
+    open_sessions: Vec<String>,
+) -> std::io::Result<()> {
+    let welcome = AppMessage::Welcome {
+        protocol: PROTOCOL,
+        app_version: env!("CARGO_PKG_VERSION"),
+        folder_version: crate::meet_extension::folder_version(app),
+        open_sessions,
+        settings: (*feeds.meet_settings.borrow_and_update()).into(),
+    };
+    send(to_host, &welcome).await?;
+    let status = feeds.call_status.borrow_and_update().clone();
+    send(to_host, &AppMessage::CallStatus(status)).await
 }
 
 async fn read_next_frame(

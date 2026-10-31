@@ -234,9 +234,32 @@ flowchart LR
   `call_status` marks it `is_video_wanted` and goes out at least every 5 s. mc-meet then asks
   `chrome.tabCapture.getMediaStreamId` for the call's tab. Chrome grants it only after an
   invocation of mc-meet on that tab: a click on its toolbar icon, its context menu entry, or its
-  shortcut (Alt+Shift+V by default). The grant should last while the tab stays on
-  meet.google.com, so one click would cover later calls in that tab; this is untested. With no
-  grant, the icon shows "REC?" and the tray video row asks for the click. One notification asks
+  shortcut (Command+Shift+U on the Mac, Alt+Shift+V elsewhere, by default). The grant should
+  last while the tab stays on meet.google.com, so one invocation would cover later calls in
+  that tab; this is untested.
+- With no grant, mc-meet reports `needs_click` with the Meet tab's focus and the bound
+  shortcut, and on the Mac the app presses that shortcut itself. The native host sends its
+  parent pid, which is the Chrome that started it, and `browser-shortcut` posts the key down
+  and up to that pid as CGEvents. Chrome counts the press as an invocation, so video starts
+  with no click. A key posted to the pid reaches Chrome even while another app is in front, so
+  the app needs no focus change: it presses when the Meet tab is the active tab of Chrome's last
+  focused window, and tries again on each tab or window focus change, at most once per 3 s and
+  3 times per refusal. The press needs the Accessibility grant, which the user gives by hand;
+  the app reads it with `AXIsProcessTrusted` and never raises the prompt. Without it the tray
+  video row reads "Video: allow Accessibility for automatic Meet video" and opens that pane.
+  mc-meet takes any press on a tab that waits for the invocation as arming only, so the
+  app's press never stops a recording. The app sends `shortcut_press_expected` first; mc-meet
+  reads the tab's facts again and answers ready or refused.
+- Every Chrome profile runs in one process, and mc-meet cannot see another profile's windows.
+  A press can land there, so the app presses only a shortcut that holds Command or Control,
+  which types no text where nothing is bound, and finds its key on the current layout with
+  `UCKeyTranslate`. mc-meet reports a press that never reached it; after one the app stops
+  pressing for the call. The pid comes from the host, so the app presses only into a pid
+  whose bundle id is Chrome, Chrome Beta, Dev or Canary, or Chromium.
+- The click is the fallback, for a shortcut that is unbound, types text or names a key the
+  app cannot send, a missing grant, a press that went unseen, or Windows, which has no key
+  sender yet. The icon shows "REC?" and
+  the tray video row asks for the click. One notification asks
   too, once the call has a caption source or a problem, so it cannot take focus while
   mc-meet's captions press is due. The click starts capture at once. A call that never
   got a stream reads "no video" in "Recent calls".
@@ -413,8 +436,8 @@ flowchart TB
 ```
 
 Later crates attach in their phase: the app depends on `detect`, `capture-protocol`,
-`stem-writer` and `video-capture`; `mc-capture` on `capture`, `stem-writer`, `video-capture` and
-`call-finalize`;
+`stem-writer`, `video-capture` and `browser-shortcut`; `mc-capture` on `capture`, `stem-writer`,
+`video-capture` and `call-finalize`;
 `sources` depends on `stt`.
 
 - The two binaries own the wiring. Library crates never depend on `meeting-capture` or `cli`.
@@ -439,12 +462,13 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 | call-finalize | 3c | Place a call's video parts and stems on one timeline, mix the stems, write `call.mp4`. Purge call video after 90 days. The planning, mixing and purge are portable | Mac: AVFoundation via `cidre` |
 | stt | 4 | VAD, Parakeet TDT 0.6B v3 int8, diarization of the remote stem | `sherpa-onnx` |
 | video-capture | 3c | Record one window through ScreenCaptureKit, encode it with VideoToolbox, cut 2 s HLS fragments with AVAssetWriter, write `video.json`, repair dead segments. The writer and repair are portable | Mac: `cidre` |
+| browser-shortcut | 3c | Press mc-meet's shortcut into one Chrome process: parse Chrome's shortcut text, find the key on the current keyboard layout, read the Accessibility grant, post the key events. Builds everywhere; only the Mac presses | Mac: `objc2-core-graphics`, `objc2-app-kit`, `objc2-application-services`, `dispatch2`, Carbon's `UCKeyTranslate` |
 
 ## Design rules
 
-- OS code lives only in the capture adapters, `video-capture`, `call-finalize`, the detector and
-  `huddle-captions`. Each of them may use unsafe code for its FFI; the workspace forbids it
-  everywhere else.
+- OS code lives only in the capture adapters, `video-capture`, `call-finalize`, the detector,
+  `huddle-captions` and `browser-shortcut`. Each of them may use unsafe code for its FFI; the
+  workspace forbids it everywhere else.
 - The pipeline has no Tauri dependency. A CLI can rerun any meeting from its stored inputs.
 - Notes are written to a temp file outside the vault, then renamed into place. Syncthing never sees
   a half-written note.

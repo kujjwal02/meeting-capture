@@ -34,6 +34,7 @@ const signingIdentity = process.env.MEET_E2E_SIGNING_IDENTITY ?? devAppName;
 const homeDir = join(workDir, "home");
 const vaultDir = join(workDir, "vault");
 const logDir = join(homeDir, "data", "browser-calls");
+const appLogPath = join(homeDir, "data", "logs", "app.log");
 // The app registers its native host with each of these browsers at start. patchrome runs Chrome.
 const hostManifestPaths = [
   "Google/Chrome",
@@ -329,57 +330,91 @@ const idleSleepHolds = () =>
     .split("\n")
     .filter((line) => line.includes("Meeting Capture is recording a call"));
 
-// Sends what mc-meet's popup button sends: `stop_recording` or `resume_recording` for the Meet
-// tab. The app handles it as the tray's "Stop recording this call" and "Resume recording". A
-// script cannot click the tray: a Tauri tray menu is not in the accessibility tree.
-// The worker drops a popup port from a tab, so popup.html opened with Target.createTarget is
-// refused. The action popup has no tab, and the worker can open it.
-async function pressRecordingButton(cdp, workerSessionId, extensionId, meetingCode, type) {
-  const popupUrl = `chrome-extension://${extensionId}/popup/popup.html`;
-  const opened = await cdp.send(
-    "Runtime.evaluate",
-    {
-      // openPopup refuses an inactive window, and the guest browser or another app may be in front.
-      // The profile can hold other Meet tabs in other windows. The host's URL is
-      // /meet/<code> or /<code>, so match the test's meeting code.
-      expression: `(async () => {
-        const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
-        const meet = tabs.find((tab) => new URL(tab.url).pathname.endsWith("/${meetingCode}"));
-        await chrome.windows.update(meet.windowId, { focused: true });
-        await chrome.action.openPopup({ windowId: meet.windowId });
-      })()`,
-      awaitPromise: true,
-      userGesture: true,
-    },
-    workerSessionId,
+// Sends one message to the app as mc-meet's worker would, through a host process of the run's
+// own. The tray's "Resume recording" makes the same request inside the app, and a script cannot
+// click the tray. No popup opens, so mc-meet is not invoked on the tab.
+async function sendThroughHost(wrapper, extensionId, message) {
+  const host = spawn(wrapper, [`chrome-extension://${extensionId}/`], {
+    stdio: ["pipe", "ignore", "ignore"],
+  });
+  const exited = new Promise((resolve) => host.once("exit", resolve));
+  const body = Buffer.from(JSON.stringify(message));
+  const length = Buffer.alloc(4);
+  length.writeUInt32LE(body.length);
+  host.stdin.write(Buffer.concat([length, body]));
+  // The host sends its hello first, so the app hears the message only after it.
+  await sleep(2000);
+  host.stdin.end();
+  const timeout = sleep(5000).then(() => "timeout");
+  if ((await Promise.race([exited, timeout])) === "timeout") host.kill();
+}
+
+// Starts second-mc-meet.mjs, a welcomed port that holds no session, as another profile's
+// mc-meet would be. Returns the notices it heard and a stop.
+function startSecondMcMeet(wrapper, extensionId) {
+  const child = spawn(
+    process.execPath,
+    [join(dirname(fileURLToPath(import.meta.url)), "second-mc-meet.mjs"), wrapper, extensionId],
+    { stdio: ["ignore", "pipe", "ignore"] },
   );
-  if (opened.result?.exceptionDetails)
-    throw new Error(`could not open mc-meet's popup: ${opened.result.exceptionDetails.text}`);
-  const popup = await until("mc-meet's popup opens", 10000, async () => {
-    const { result } = await cdp.send("Target.getTargets");
-    return result.targetInfos.find((info) => info.url === popupUrl);
+  const heard = { notices: [], noticeAtMs: undefined };
+  let lines = "";
+  child.stdout.on("data", (chunk) => {
+    lines += chunk;
+    for (let end = lines.indexOf("\n"); end >= 0; end = lines.indexOf("\n")) {
+      const notice = JSON.parse(lines.slice(0, end));
+      lines = lines.slice(end + 1);
+      heard.notices.push(notice.session_id);
+      heard.noticeAtMs ??= notice.at_ms;
+    }
   });
-  const { result: attached } = await cdp.send("Target.attachToTarget", {
-    targetId: popup.targetId,
-    flatten: true,
-  });
+  return { heard, stop: () => child.kill("SIGTERM") };
+}
+
+// The session id mc-meet's worker keeps for the Meet tab of this run.
+async function meetSessionId(cdp, workerSessionId, meetingCode) {
   const { result } = await cdp.send(
     "Runtime.evaluate",
     {
       expression: `(async () => {
-        const [meet] = await chrome.tabs.query({ url: "https://meet.google.com/*" });
-        const port = chrome.runtime.connect({ name: "mc-meet-popup" });
-        port.postMessage({ type: ${JSON.stringify(type)}, tab_id: meet.id });
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        return meet.id;
+        const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
+        const meet = tabs.find((tab) => new URL(tab.url).pathname.endsWith("/${meetingCode}"));
+        const { tabSessions } = await chrome.storage.local.get("tabSessions");
+        return tabSessions?.[meet.id] ?? null;
       })()`,
       awaitPromise: true,
       returnByValue: true,
     },
-    attached.sessionId,
+    workerSessionId,
   );
-  await cdp.send("Target.closeTarget", { targetId: popup.targetId });
-  if (result?.exceptionDetails) throw new Error(`${type} failed in the popup page`);
+  return result?.result?.value ?? null;
+}
+
+// What the host page's text fields hold. A press that reached the page instead of mc-meet
+// would type there: Option+Shift+V types "◊". Only lengths leave the page, never the text.
+async function pageTextFields(cdp, tab) {
+  const { result } = await cdp.send(
+    "Runtime.evaluate",
+    {
+      expression: `(() => {
+        const skipped = new Set(["hidden", "checkbox", "radio", "button", "submit", "range"]);
+        const fields = [
+          ...document.querySelectorAll("input, textarea, [contenteditable]"),
+        ].filter((field) => !skipped.has(field.type) && field.contentEditable !== "false");
+        const texts = fields.map((field) =>
+          field.isContentEditable ? field.textContent : field.value,
+        );
+        return {
+          fieldCount: fields.length,
+          filledLengths: texts.filter((text) => text.length > 0).map((text) => text.length),
+          hasLozenge: document.body.innerText.includes("◊") || texts.some((t) => t.includes("◊")),
+        };
+      })()`,
+      returnByValue: true,
+    },
+    tab,
+  );
+  return result?.result?.value ?? { fieldCount: 0, filledLengths: [], hasLozenge: true };
 }
 
 function readLog(meetingCode) {
@@ -411,6 +446,47 @@ function findNote(meetingCode) {
   };
   walk(vaultDir);
   return notes.find((path) => readFileSync(path, "utf8").includes(meetingCode));
+}
+
+// The app's log lines with this message since the run started.
+function appLogLines(message) {
+  if (!existsSync(appLogPath)) return [];
+  return readFileSync(appLogPath, "utf8")
+    .split("\n")
+    .filter((line) => line.includes(`"${message}"`))
+    .map((line) => JSON.parse(line))
+    .filter((line) => Date.parse(line.timestamp) >= startedMs);
+}
+
+// The fMP4 fragments the app wrote from the Meet tab, in every NNN-video folder.
+function videoFragments(callDir) {
+  if (!existsSync(callDir)) return [];
+  return readdirSync(callDir)
+    .filter((name) => /^\d{3}-video$/.test(name))
+    .flatMap((folder) =>
+      readdirSync(join(callDir, folder)).filter((name) => name.endsWith(".m4s")),
+    );
+}
+
+// Makes the Meet tab the active tab of its window through the extensions API, as a user who
+// switched to the call would. Chrome may stay behind another app: the app presses mc-meet's
+// shortcut into Chrome's process whenever the Meet tab is the active tab of Chrome's last
+// focused window. No key or click is sent from here.
+async function activateMeetTab(cdp, workerSessionId, meetingCode) {
+  const focused = await cdp.send(
+    "Runtime.evaluate",
+    {
+      expression: `(async () => {
+        const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
+        const meet = tabs.find((tab) => new URL(tab.url).pathname.endsWith("/${meetingCode}"));
+        await chrome.tabs.update(meet.id, { active: true });
+      })()`,
+      awaitPromise: true,
+    },
+    workerSessionId,
+  );
+  if (focused.result?.exceptionDetails)
+    throw new Error(`could not activate the Meet tab: ${focused.result.exceptionDetails.text}`);
 }
 
 // ---- The run.
@@ -502,6 +578,24 @@ try {
   );
   pressIfShown("host", /^Join now$/);
   await until("the host is in the call", 30000, () => findButton("host", /^Leave call$/));
+  // The test Chrome is a fresh tab with no grant, so Chrome refuses the stream and mc-meet
+  // reports needs_click. The app then presses the shortcut once the Meet tab is active.
+  const secondMcMeet = startSecondMcMeet(wrapper, loaded.result.id);
+  await sleep(1000);
+  await activateMeetTab(cdp, workerSessionId, meetingCode);
+  step("made the Meet tab active");
+  const sentPress = await until("the app presses mc-meet's shortcut", 30000, () =>
+    appLogLines("video.shortcut_sent").at(0),
+  ).catch(() => null);
+  if (!sentPress) {
+    const skips = appLogLines("video.shortcut_skipped").map(
+      (line) => line.fields["video.press_skip_reason"],
+    );
+    step(`  shortcut skips: ${JSON.stringify(skips)}`);
+  }
+  expect(Boolean(sentPress), "the app pressed mc-meet's shortcut with no click");
+  const sentShortcut = sentPress?.fields["video.shortcut"] ?? "";
+  expect(sentShortcut.includes("⌘"), `the pressed shortcut ${sentShortcut} holds Command`);
   // A fake microphone's AudioContext starts suspended until a user gesture.
   await cdp.send(
     "Runtime.evaluate",
@@ -562,9 +656,48 @@ try {
       : null;
   });
   expect(idleSleepHolds().length > 0, "macOS holds off idle sleep while recording");
+  const fragments = await until("a Meet video fragment in the call folder", 30000, () => {
+    const found = videoFragments(callDir);
+    return found.length > 0 ? found : null;
+  }).catch(() => []);
+  expect(fragments.length > 0, `${fragments.length} video fragments with no click`);
+  expect(
+    !readLog(meetingCode)?.events.some((event) => event.kind === "recording_stopped"),
+    "the app's press did not stop the recording",
+  );
+  expect(audioHelperPids(app.pid).length === 1, "the audio helper still records after the press");
+  const afterPress = await pageTextFields(cdp, tab);
+  step(
+    `  host page: ${afterPress.fieldCount} text fields, filled lengths ${JSON.stringify(afterPress.filledLengths)}`,
+  );
+  expect(
+    !afterPress.hasLozenge && afterPress.filledLengths.length === 0,
+    "the press typed nothing into the Meet page",
+  );
+  const unseen = appLogLines("video.shortcut_unseen").map(
+    (line) => line.fields["video.press_miss"],
+  );
+  secondMcMeet.stop();
+  const noticeLeadMs = Date.parse(sentPress?.timestamp) - secondMcMeet.heard.noticeAtMs;
+  expect(
+    noticeLeadMs > 0,
+    `the second mc-meet heard the notice ${noticeLeadMs} ms before the press`,
+  );
+  const targetSessionId = await meetSessionId(cdp, workerSessionId, meetingCode);
+  expect(
+    secondMcMeet.heard.notices.includes(targetSessionId),
+    "a second connected mc-meet heard the press notice for the Meet tab's session",
+  );
+  expect(
+    unseen.includes("other_worker"),
+    `the app took the second mc-meet's report as a missed press (${JSON.stringify(unseen)})`,
+  );
+  expect(
+    unseen.every((miss) => miss === "other_worker"),
+    "mc-meet's own worker saw the press",
+  );
 
   await press("guest", /^Chat with everyone$/);
-  const sentMs = Date.now();
   const chatBox = await until("the guest sees the chat box", 30000, () => {
     const box = nodes("guest", "textbox").find((node) => /message/i.test(node.name));
     if (!box)
@@ -573,14 +706,26 @@ try {
       );
     return box;
   });
+  // Each patchrome call can take seconds, so the send is bounded by the times around the fill
+  // and the Enter press.
+  const fillStartMs = Date.now();
   patchrome("guest", "fill", `@${chatBox.ref}`, chatText);
   patchrome("guest", "press", "Enter");
+  const sentMs = Date.now();
+  step(`  chat fill and Enter took ${sentMs - fillStartMs} ms`);
   const chat = await until("the guest's chat in the call log", 30000, () =>
     readLog(meetingCode)?.events.find((event) => event.kind === "chat" && event.text === chatText),
   );
 
-  await pressRecordingButton(cdp, workerSessionId, loaded.result.id, meetingCode, "stop_recording");
-  step("pressed Stop recording this call in mc-meet's popup");
+  // Stop and resume as the tray does, with no popup: the popup invokes mc-meet on the tab, and
+  // that grant alone would restart the video.
+  const sessionId = await meetSessionId(cdp, workerSessionId, meetingCode);
+  if (!sessionId) throw new Error("mc-meet holds no session for the Meet tab");
+  await sendThroughHost(wrapper, loaded.result.id, {
+    type: "stop_recording",
+    session_id: sessionId,
+  });
+  step("sent stop_recording through a host of the run's own, no popup");
   const afterStop = await until("the helper exits with every segment closed", 15000, () => {
     const audio = readAudio(callDir);
     return audioHelperPids(app.pid).length === 0 &&
@@ -593,14 +738,12 @@ try {
   );
   expect(idleSleepHolds().length === 0, "macOS may idle sleep once recording stops");
   await sleep(10000);
-  await pressRecordingButton(
-    cdp,
-    workerSessionId,
-    loaded.result.id,
-    meetingCode,
-    "resume_recording",
-  );
-  step("pressed Resume recording in mc-meet's popup");
+  const resumeSentMs = Date.now();
+  await sendThroughHost(wrapper, loaded.result.id, {
+    type: "resume_recording",
+    session_id: sessionId,
+  });
+  step("sent resume_recording through a host of the run's own, no popup");
   await until("the helper records the next segment", 30000, () => {
     const audio = readAudio(callDir);
     return audio && audio.segments.length > afterStop.segments.length ? audio : null;
@@ -613,7 +756,50 @@ try {
       : null;
   });
 
-  await sleep(10000);
+  const resumedVideo = await until("tab video after the resume", 30000, () =>
+    appLogLines("video.tab_state").find(
+      (line) =>
+        line.fields["video.tab_state"] === "capturing" &&
+        Date.parse(line.timestamp) >= resumeSentMs,
+    ),
+  ).catch(() => null);
+  const pressesAfterResume = appLogLines("video.shortcut_sent").filter(
+    (line) => Date.parse(line.timestamp) >= resumeSentMs,
+  ).length;
+  expect(Boolean(resumedVideo), "tab video restarted after a stop and resume with no popup");
+  expect(
+    pressesAfterResume === 0,
+    `the resumed video needed no app press (${pressesAfterResume} presses after the resume)`,
+  );
+
+  // Opens the host's chat panel from the page, so its chat box is among the fields read.
+  const chatOpened = await cdp.send(
+    "Runtime.evaluate",
+    {
+      expression: `(() => {
+        const button = [...document.querySelectorAll("button")].find((candidate) =>
+          /^Chat with everyone/.test(candidate.getAttribute("aria-label") ?? ""),
+        );
+        if (!button) return "no chat button";
+        if (button.getAttribute("aria-pressed") !== "true") button.click();
+        return "open";
+      })()`,
+      returnByValue: true,
+    },
+    tab,
+  );
+  expect(chatOpened.result?.result?.value === "open", "the host's chat panel is open");
+  await sleep(1000);
+  const atEnd = await pageTextFields(cdp, tab);
+  step(
+    `  host page with chat open: ${atEnd.fieldCount} text fields, filled lengths ${JSON.stringify(atEnd.filledLengths)}`,
+  );
+  expect(
+    !atEnd.hasLozenge && atEnd.filledLengths.length === 0,
+    "no stray text in Meet's chat box or page fields",
+  );
+
+  await sleep(5000);
   await press("guest", /^Leave call$/);
   await press("host", /^Leave call$/);
   const ended = await until("call_ended in the call log", 60000, () => {
@@ -649,7 +835,7 @@ try {
     "the roster lists both people",
   );
   expect(
-    Math.abs(Date.parse(chat.at) - sentMs) < 15000,
+    Date.parse(chat.at) >= fillStartMs - 1000 && Date.parse(chat.at) - sentMs < 15000,
     `chat time within 15 s of sending (${chat.at})`,
   );
   // Meet's captions button may read on: its state does not matter, only what is on screen.

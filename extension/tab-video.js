@@ -2,9 +2,15 @@
 // is_video_wanted flags, opens the offscreen document that records it, and forwards the
 // document's fragments and states to the app. It owns one capture at a time.
 //
-// Chrome hands out a tab's stream id only after the user invoked mc-meet on that tab (toolbar
+// Chrome hands out a tab's stream id only after an invocation of mc-meet on that tab (toolbar
 // click, popup, context menu or the shortcut). Until then the tab sits in video_needs_click and
-// the toolbar asks for a click.
+// the toolbar asks for a click. The app tries first: each needs_click tells it whether the Meet
+// tab is the active tab of Chrome's last focused window and which key the shortcut is bound
+// to, and the app presses that key into Chrome's process, which takes it even from behind
+// another app. A press on a tab in video_needs_click only arms it, whoever pressed, so the
+// app's press never stops a recording. Before it presses, the app sends
+// shortcut_press_expected; the worker reads the facts again and answers ready or refused, and
+// reports a press that never arrives as unseen.
 //
 // chrome.storage.session keys, which the popup reads:
 //   video_capture      { tab_id, session_id, capture_id } of the running capture, or null
@@ -25,11 +31,17 @@ const MAX_START_ATTEMPTS = 2;
 // The app sends call_status at least every 5 s while it wants video. Without one for this long,
 // capture stops: a stop the app sent may be lost, and nothing would pair with the frames.
 const APP_SILENCE_LIMIT_MS = 10_000;
+// The app presses at most 1 s after its shortcut_press_expected notice, and skips the press
+// once that limit passes. Both press windows open at the notice and last 1 s past that limit,
+// for the key to arrive. A press missing by then went to a Chrome window this worker cannot
+// see, such as another profile.
+const PRESS_SEEN_LIMIT_MS = 2_000;
 
 // sendToApp(message) posts on the native port and returns false when the port is not welcomed.
+// isAppWelcomed() is true while the native port is open and welcomed.
 // refreshLook() redraws the toolbar; it must not wait on this module.
 // readTabSessions() resolves to the worker's { [tabId]: session_id }.
-export function createTabVideo({ sendToApp, refreshLook, readTabSessions }) {
+export function createTabVideo({ sendToApp, isAppWelcomed, refreshLook, readTabSessions }) {
   // Messages for the app while its port is not welcomed, oldest first.
   const pendingForApp = [];
   // The last { state, detail, captureId } sent per session, so each change goes out once. The
@@ -44,6 +56,16 @@ export function createTabVideo({ sendToApp, refreshLook, readTabSessions }) {
   // Monotonic, so a Mac sleep does not count as app silence. A restarted worker gives the app a
   // full limit.
   let lastCallStatusMonoMs = performance.now();
+  // A call_status came on the welcomed port. Until then the stored calls are an earlier port's.
+  let isCallStatusCurrent = false;
+  // The app's press this worker answered ready for: { sessionId, tabId, timer }, until the
+  // command arrives or the timer reports it unseen. Memory only: the native port keeps the
+  // worker alive for the 1 s it matters.
+  let awaitedPress = null;
+  // The app's press notice for a session this worker does not hold: { sessionId, untilMs } on
+  // performance.now(). Another profile's mc-meet is the target, and a command in this window is
+  // the app's press landing here, not the user's.
+  let foreignPress = null;
 
   let chain = Promise.resolve();
   function serially(task) {
@@ -71,20 +93,114 @@ export function createTabVideo({ sendToApp, refreshLook, readTabSessions }) {
   }
 
   // ended: { capture_id, last_index } of the capture a "stopped" ends, so the app knows which
-  // fragment is the last.
-  function sendState(sessionId, state, detail, ended = null) {
+  // fragment is the last. facts: the needs_click fields from readPressFacts, which count as a
+  // change of their own, so a focus change reaches the app.
+  function sendState(sessionId, state, detail, ended = null, facts = null) {
     const captureId = ended?.capture_id ?? null;
+    const factsKey = JSON.stringify(facts);
     const previous = sentStates.get(sessionId);
     if (
       previous?.state === state &&
       previous.detail === detail &&
-      previous.captureId === captureId
+      previous.captureId === captureId &&
+      previous.factsKey === factsKey
     ) {
       return;
     }
-    sentStates.set(sessionId, { state, detail, captureId });
-    console.info("mc-meet video:", sessionId, state, detail ?? "", ended ?? "");
-    forwardToApp({ type: "video_state", session_id: sessionId, state, detail, ...ended });
+    sentStates.set(sessionId, { state, detail, captureId, factsKey });
+    console.info("mc-meet video:", sessionId, state, detail ?? "", ended ?? "", facts ?? "");
+    forwardToApp({
+      type: "video_state",
+      session_id: sessionId,
+      state,
+      detail,
+      ...ended,
+      ...facts,
+    });
+  }
+
+  // What the app's shortcut press depends on: Chrome gives the invocation to the active tab of
+  // its last focused window, and the user may bind the shortcut to another key or to none.
+  async function readPressFacts(tabId) {
+    const tab = await chrome.tabs.get(tabId).catch(() => undefined);
+    const lastFocused = await chrome.windows.getLastFocused().catch(() => undefined);
+    const commands = await chrome.commands.getAll().catch(() => []);
+    return {
+      meet_tab: {
+        is_tab_active: tab?.active === true,
+        is_window_last_focused: tab !== undefined && lastFocused?.id === tab.windowId,
+      },
+      shortcut: commands.find((command) => command.name === COMMAND)?.shortcut ?? "",
+    };
+  }
+
+  async function sendNeedsClick(tabId, sessionId) {
+    sendState(sessionId, "needs_click", null, null, await readPressFacts(tabId));
+  }
+
+  // The tab focus changed, so the app may be able to press now.
+  function onFocusChanged() {
+    return serially(async () => {
+      const { needsClick } = await readSession();
+      for (const [tabId, sessionId] of Object.entries(needsClick)) {
+        await sendNeedsClick(Number(tabId), sessionId);
+      }
+    });
+  }
+
+  // The app presses the shortcut once it has the answer. The tab may have moved since its
+  // needs_click, so the facts are read again; the new ones go first, then the refusal.
+  function onPressExpected(sessionId) {
+    return serially(async () => {
+      const tabSessions = await readTabSessions();
+      const tabEntry = Object.entries(tabSessions).find(([, id]) => id === sessionId);
+      // Another profile's worker holds the session. The app presses only after this answer,
+      // so the window is open before the key can land here.
+      if (!tabEntry) {
+        foreignPress = { sessionId, untilMs: performance.now() + PRESS_SEEN_LIMIT_MS };
+        sendToApp({ type: "shortcut_press_noted", session_id: sessionId });
+        return;
+      }
+      const tabId = Number(tabEntry[0]);
+      const { needsClick } = await readSession();
+      const facts = await readPressFacts(tabId);
+      const isWherePressLands =
+        facts.meet_tab.is_tab_active && facts.meet_tab.is_window_last_focused;
+      if (!(tabId in needsClick) || !isWherePressLands) {
+        if (tabId in needsClick) sendState(sessionId, "needs_click", null, null, facts);
+        sendToApp({ type: "shortcut_press_refused", session_id: sessionId });
+        return;
+      }
+      clearAwaitedPress();
+      awaitedPress = {
+        sessionId,
+        tabId,
+        timer: setTimeout(() => onPressUnseen(sessionId), PRESS_SEEN_LIMIT_MS),
+      };
+      sendToApp({ type: "shortcut_press_ready", session_id: sessionId });
+    });
+  }
+
+  function onPressUnseen(sessionId) {
+    if (awaitedPress?.sessionId !== sessionId) return;
+    awaitedPress = null;
+    console.warn("mc-meet video: the app's shortcut press never arrived for", sessionId);
+    sendToApp({ type: "shortcut_press_unseen", session_id: sessionId, reason: "no_command" });
+  }
+
+  // Returns the session of a foreign press notice still in its window, and clears it.
+  function takeForeignPress() {
+    const foreign = foreignPress;
+    foreignPress = null;
+    return foreign && performance.now() <= foreign.untilMs ? foreign.sessionId : null;
+  }
+
+  // Returns the awaited press, if any, and stops its unseen timer.
+  function clearAwaitedPress() {
+    const awaited = awaitedPress;
+    if (awaited) clearTimeout(awaited.timer);
+    awaitedPress = null;
+    return awaited;
   }
 
   async function readSession() {
@@ -191,7 +307,7 @@ export function createTabVideo({ sendToApp, refreshLook, readTabSessions }) {
       await chrome.storage.session.set({
         [NEEDS_CLICK_KEY]: { ...needsClick, [tabId]: sessionId },
       });
-      sendState(sessionId, "needs_click", null);
+      await sendNeedsClick(tabId, sessionId);
       refreshLook();
       return;
     }
@@ -282,6 +398,7 @@ export function createTabVideo({ sendToApp, refreshLook, readTabSessions }) {
   // Each call_status from the app, including the unchanged ones it repeats while it wants video.
   function noteCallStatus() {
     lastCallStatusMonoMs = performance.now();
+    isCallStatusCurrent = true;
     return reconcile();
   }
 
@@ -315,25 +432,42 @@ export function createTabVideo({ sendToApp, refreshLook, readTabSessions }) {
     });
   }
 
-  // The shortcut is the user's stop, so it always stops a recording call, whatever its video
-  // does. The press also grants the tab, so a resume can capture it with no click. The toolbar
-  // click and the context menu retry the video.
+  // On a tab that needs the invocation, the shortcut only arms it: the app presses it there
+  // too. Elsewhere the shortcut is the user's stop, so it stops a recording call, whatever its
+  // video does. The press also grants the tab, so a resume can capture it with no click. The
+  // toolbar click and the context menu retry the video.
   function isCallRecording(call) {
     return call?.state === "waiting" || call?.state === "recording" || call?.state === "problem";
   }
 
-  // Each welcome is a fresh app or a fresh port, which may not have seen the last states.
+  // Each welcome is a fresh app or a fresh port, which may not have seen the last states. A
+  // press awaited by the old app is moot.
   function onAppWelcomed() {
+    isCallStatusCurrent = false;
     sentStates.clear();
+    clearAwaitedPress();
+    foreignPress = null;
     flushBuffered();
   }
 
   function onShortcut(tabId) {
     if (!Number.isInteger(tabId)) return Promise.resolve();
     return serially(async () => {
-      const { calls } = await readSession();
+      const { calls, needsClick } = await readSession();
+      if (tabId in needsClick) {
+        console.info("mc-meet video: the shortcut arms tab", tabId);
+        onInvoked(tabId);
+        return;
+      }
       const sessionId = (await readTabSessions())[tabId];
       invokedTabIds.add(tabId);
+      // A worker with no welcomed port heard no press notice, so the press may be the app's
+      // for another profile. Its stored calls may also be an earlier port's. A stop sent then
+      // would reconnect and end a call this profile does not hold.
+      if (!isAppWelcomed() || !isCallStatusCurrent) {
+        console.info("mc-meet video: no current call status, the shortcut stops nothing");
+        return;
+      }
       // A press away from Meet stops whatever records, as a press on the Meet tab does.
       if (!sessionId) {
         const recording = calls.filter(isCallRecording);
@@ -441,9 +575,34 @@ export function createTabVideo({ sendToApp, refreshLook, readTabSessions }) {
 
   chrome.commands.onCommand.addListener(async (command, tab) => {
     if (command !== COMMAND) return;
+    // Taken before any await, so the unseen timer cannot fire for a press that arrived.
+    const awaited = clearAwaitedPress();
+    const foreignSessionId = takeForeignPress();
+    // The app pressed for another profile's Meet tab and the key landed here. Taking it as the
+    // user's stop would end a call in this profile, so it does nothing and the app hears where
+    // it went.
+    if (!awaited && foreignSessionId) {
+      console.warn("mc-meet video: the app's press for another profile landed here");
+      sendToApp({ type: "shortcut_press_landed", session_id: foreignSessionId });
+      return;
+    }
     const target = tab ?? (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0];
+    // The app's press landed on another tab: arming or stopping that tab would be wrong, so the
+    // press does nothing and the app hears it as unseen.
+    if (awaited && awaited.tabId !== target?.id) {
+      console.warn("mc-meet video: the app's press reached tab", target?.id, "not", awaited.tabId);
+      sendToApp({
+        type: "shortcut_press_unseen",
+        session_id: awaited.sessionId,
+        reason: "other_tab",
+      });
+      return;
+    }
     onShortcut(target?.id);
   });
+
+  chrome.tabs.onActivated.addListener(() => onFocusChanged());
+  chrome.windows.onFocusChanged.addListener(() => onFocusChanged());
 
   chrome.tabs.onRemoved.addListener((tabId) => onTabGone(tabId));
 
@@ -453,5 +612,5 @@ export function createTabVideo({ sendToApp, refreshLook, readTabSessions }) {
     if (!tab.url?.startsWith(MEET_PREFIX)) onTabGone(tabId);
   });
 
-  return { reconcile, noteCallStatus, onInvoked, onAppWelcomed };
+  return { reconcile, noteCallStatus, onInvoked, onAppWelcomed, onPressExpected };
 }

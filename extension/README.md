@@ -17,7 +17,7 @@ to the meeting-capture app over native messaging. The design is in `docs/09-meet
 | `content/main.js` | Meet tab, isolated world | Call start and end, session, runs the DOM reader the policy picks, sends health events. |
 | `session-rules.js` | Service worker, or plain Node | Session rules and event numbers, with no `chrome.*` calls. |
 | `background.js` | Service worker | Storage, native port, queue, resend. Runs the effects `session-rules.js` returns. Sets each Meet tab's toolbar icon from the app's call status. |
-| `tab-video.js` | Service worker | Picks the Meet tab whose call wants video, starts and stops its capture, forwards fragments to the app. |
+| `tab-video.js` | Service worker | Picks the Meet tab whose call wants video, starts and stops its capture, forwards fragments to the app. Tells the app where the Meet tab is and which key the shortcut uses, so the app can press it and start video with no click. |
 | `offscreen/offscreen.html` | Offscreen document | Page that loads `capture.js`. |
 | `offscreen/capture.js` | Offscreen document | Opens the tab stream, plays its audio back, encodes video with WebCodecs, sends fMP4 fragments. |
 | `offscreen/fmp4.js` | Offscreen document, or plain Node | fMP4 init segment and fragment writer for one video track. No DOM. |
@@ -61,6 +61,16 @@ was not running when the tab opened.
 A `health` event with a `skeleton` in `detail` means Meet changed a frame format. Compare the
 skeleton with `PROTOCOL-NOTES.md`. "Save debug report with caption text" in the tray keeps the
 failing frames; `just replay-frames <report folder>` runs them through `page/wire.js`.
+
+## Meet video
+
+Chrome lets mc-meet record a tab only after an invocation on that tab. On the Mac the app makes
+it: it presses mc-meet's `toggle-recording` shortcut (Command+Shift+U unless rebound in
+`chrome://extensions/shortcuts`) into Chrome once the Meet tab is the active tab. The app needs
+the Accessibility grant for this. It presses only a shortcut that holds Command or Control,
+since such a press types no text if it lands in another Chrome profile's window. Without the
+grant, with no such shortcut bound, or after a press that mc-meet never saw, click the mc-meet
+icon on the Meet tab when it shows `REC?`.
 
 ## Rules
 

@@ -17,9 +17,10 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tracing::Instrument as _;
 use video_capture::{AudioPairing, TabFragment, TabFragmentOutcome, TabSegmentEnd, TabVideoWriter};
 
+use super::meet_shortcut::MeetShortcut;
 use super::{AudioPhase, RunningProcess, VideoState};
 use crate::AppState;
-use crate::browser_calls::{CaptureEnd, TabVideoInput, TabVideoState};
+use crate::browser_calls::{CaptureEnd, TabVideoInput};
 use crate::call_status::{Moment, Observation, display_time_zone};
 use crate::calls::Call;
 
@@ -52,6 +53,7 @@ pub(super) fn spawn(
         stopped_at: None,
         last_arrived: None,
         logged_capture_id: None,
+        shortcut: MeetShortcut::new(call.id.display().to_string()),
     };
     let task = tauri::async_runtime::spawn(task.run(stop_receiver, audio_phase).instrument(span));
     RunningProcess { stop, task }
@@ -74,6 +76,8 @@ struct TabVideoTask {
     last_arrived: Option<(String, u64)>,
     /// The capture whose playback latency the log has.
     logged_capture_id: Option<String>,
+    /// The app's presses of mc-meet's shortcut, which start the video with no click.
+    shortcut: MeetShortcut,
 }
 
 impl TabVideoTask {
@@ -91,8 +95,18 @@ impl TabVideoTask {
         let mut seen_sleep_count = audio_phase.borrow_and_update().sleep_count;
         let mut is_audio_gone = false;
         loop {
+            let press_deadline = self.shortcut.next_deadline();
             tokio::select! {
                 _ = &mut stop => break,
+                () = tokio::time::sleep_until(press_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if press_deadline.is_some() =>
+                {
+                    let state = self.app.state::<AppState>();
+                    let shown = self
+                        .shortcut
+                        .on_deadline(self.stopped_at.is_some(), &state.inner().browser_calls);
+                    self.show_if_any(shown);
+                }
                 input = inputs.recv() => match input {
                     Some(input) => {
                         let phase = *audio_phase.borrow();
@@ -141,16 +155,19 @@ impl TabVideoTask {
             let phase = *audio_phase.borrow();
             let mut is_capture_over = false;
             match &input {
-                TabVideoInput::Fragment(_) => {}
-                TabVideoInput::State { state, ended, .. } => match state {
-                    TabVideoState::Stopped => match ended {
-                        Some(end) => awaited_end = Some(end.clone()),
-                        // An older mc-meet names no last fragment; its stop flushed already.
-                        None => is_capture_over = true,
-                    },
-                    TabVideoState::Failed => is_capture_over = true,
-                    TabVideoState::NeedsClick | TabVideoState::Capturing => {}
+                TabVideoInput::Fragment(_)
+                | TabVideoInput::NeedsClick(_)
+                | TabVideoInput::PressReady { .. }
+                | TabVideoInput::PressNoted { .. }
+                | TabVideoInput::PressRefused
+                | TabVideoInput::PressUnseen(_)
+                | TabVideoInput::Capturing => {}
+                TabVideoInput::Stopped { ended } => match ended {
+                    Some(end) => awaited_end = Some(end.clone()),
+                    // An older mc-meet names no last fragment; its stop flushed already.
+                    None => is_capture_over = true,
                 },
+                TabVideoInput::Failed { .. } => is_capture_over = true,
             }
             self.take(input, phase).await;
             if is_capture_over
@@ -219,19 +236,46 @@ impl TabVideoTask {
                     self.write(fragment, audio).await;
                 }
             }
-            TabVideoInput::State { state, detail, .. } => match state {
-                TabVideoState::NeedsClick => self.show(VideoState::TabNeedsClick),
-                TabVideoState::Capturing => {}
-                TabVideoState::Stopped => self.show(VideoState::TabStopped),
-                TabVideoState::Failed => {
-                    tracing::warn!(
-                        call.id = %self.call_id.display(),
-                        exception.message = detail,
-                        "video.tab_capture_failed"
-                    );
-                    self.show(VideoState::TabFailed);
-                }
-            },
+            TabVideoInput::NeedsClick(chance) => {
+                let state = self.app.state::<AppState>();
+                let shown = self.shortcut.on_needs_click(
+                    chance,
+                    self.stopped_at.is_some(),
+                    &state.inner().browser_calls,
+                );
+                self.show_if_any(shown);
+            }
+            TabVideoInput::PressReady {
+                browser_pid,
+                port_id,
+            } => {
+                let shown = self
+                    .shortcut
+                    .on_ready(browser_pid, port_id, self.stopped_at.is_some());
+                self.show_if_any(shown);
+            }
+            TabVideoInput::PressNoted { port_id } => {
+                let shown = self.shortcut.on_noted(port_id, self.stopped_at.is_some());
+                self.show_if_any(shown);
+            }
+            TabVideoInput::PressRefused => {
+                let shown = self.shortcut.on_refused();
+                self.show_if_any(shown);
+            }
+            TabVideoInput::PressUnseen(miss) => {
+                let shown = self.shortcut.on_unseen(miss);
+                self.show_if_any(shown);
+            }
+            TabVideoInput::Capturing => self.shortcut.on_stream_open(),
+            TabVideoInput::Stopped { .. } => self.show(VideoState::TabStopped),
+            TabVideoInput::Failed { detail } => {
+                tracing::warn!(
+                    call.id = %self.call_id.display(),
+                    exception.message = detail,
+                    "video.tab_capture_failed"
+                );
+                self.show(VideoState::TabFailed);
+            }
         }
     }
 
@@ -364,6 +408,12 @@ impl TabVideoTask {
 
     fn state(&self) -> &AppState {
         self.app.state::<AppState>().inner()
+    }
+
+    fn show_if_any(&self, state: Option<VideoState>) {
+        if let Some(state) = state {
+            self.show(state);
+        }
     }
 
     fn show(&self, state: VideoState) {

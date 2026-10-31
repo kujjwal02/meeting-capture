@@ -19,7 +19,7 @@ use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_opener::OpenerExt as _;
 
-use crate::call_capture::{AudioState, VideoState};
+use crate::call_capture::{AudioState, VideoSettingsPane, VideoState};
 use crate::call_status::{BoardView, CallState, CallView, Moment, TrayLook, display_time_zone};
 use crate::launch::{LaunchTarget, launch};
 use crate::{AppState, meetings, updates};
@@ -147,13 +147,20 @@ struct CaptureStates {
     video: HashMap<PathBuf, VideoState>,
 }
 
+/// A video row is a plain label, or an action that opens a settings pane.
+#[derive(PartialEq, Eq)]
+enum VideoRowKind {
+    Label,
+    Action(VideoSettingsPane),
+}
+
 /// The parts of the menu that change only when a call opens or ends.
 #[derive(PartialEq, Eq)]
 struct CallMenuShape {
     open_calls: usize,
-    /// Whether each open call has an audio line, whether it has a video line and if that line
-    /// is an action, and its stop or resume entry's label.
-    recording_rows: Vec<(bool, Option<bool>, &'static str)>,
+    /// Whether each open call has an audio line, whether it has a video line and the settings
+    /// pane that line opens, and its stop or resume entry's label.
+    recording_rows: Vec<(bool, Option<VideoRowKind>, &'static str)>,
     recent_lines: Vec<String>,
     is_huddle_permission_missing: bool,
 }
@@ -169,7 +176,10 @@ impl CallMenuShape {
                     let row = RecordingRow::of(call, states);
                     (
                         row.audio_line.is_some(),
-                        row.video.map(VideoState::is_permission_action),
+                        row.video.map(|state| match state.settings_pane() {
+                            Some(pane) => VideoRowKind::Action(pane),
+                            None => VideoRowKind::Label,
+                        }),
                         row.action_label,
                     )
                 })
@@ -540,13 +550,14 @@ fn append_calls(
             None => None,
         };
         let video_entry = match row.video {
-            Some(state) if state.is_permission_action() => {
-                menu.append(&action_entry(
-                    app,
-                    &MenuAction::OpenPrivacySettings(PermissionService::ScreenRecording),
-                    &state.label(),
-                    true,
-                )?)?;
+            Some(state) if let Some(pane) = state.settings_pane() => {
+                let action = match pane {
+                    VideoSettingsPane::ScreenRecording => {
+                        MenuAction::OpenPrivacySettings(PermissionService::ScreenRecording)
+                    }
+                    VideoSettingsPane::Accessibility => MenuAction::OpenAccessibilitySettings,
+                };
+                menu.append(&action_entry(app, &action, &state.label(), true)?)?;
                 None
             }
             Some(state) => {

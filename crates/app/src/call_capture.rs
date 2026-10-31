@@ -32,6 +32,7 @@
 //! At launch, after repair and finalize, and then once a day, `mc-capture purge-media` deletes
 //! the video of calls that ended more than 90 days ago. The stems stay for transcription.
 
+mod meet_shortcut;
 mod restart_backoff;
 mod tab_video;
 
@@ -167,8 +168,33 @@ pub(crate) enum VideoState {
     StoppedFromSharingControls,
     /// The app wants the Meet tab's video and no fragment came yet.
     TabWaiting,
-    /// Chrome refuses tab capture until the user clicks mc-meet on the Meet tab once.
+    /// Chrome refuses tab capture until mc-meet is invoked on the Meet tab once, and the app
+    /// cannot press mc-meet's shortcut: this OS has no key sender, or its presses did not take.
     TabNeedsClick,
+    /// The app presses mc-meet's shortcut once the Meet tab is the active tab of the Chrome
+    /// window focused last, which a switch to the tab makes it. Until then a click on the
+    /// mc-meet icon also starts it.
+    TabAwaitingFront,
+    /// macOS sends the app's key events only with the Accessibility grant. The row opens System
+    /// Settings; the click still works.
+    TabNeedsAccessibility,
+    /// Chrome has no key bound to mc-meet's shortcut.
+    TabShortcutUnbound,
+    /// mc-meet's bound shortcut names a key the app cannot send.
+    TabShortcutUnmappable,
+    /// mc-meet's bound shortcut holds neither Command nor Control, so a press that lands where
+    /// it is not bound could type a character.
+    TabShortcutTypesText,
+    /// No key on the current keyboard layout types the shortcut's character.
+    TabShortcutNotOnLayout,
+    /// A press reached no mc-meet, so it went to a Chrome window mc-meet cannot see, such as
+    /// another profile. The app presses no more for the call.
+    TabPressUnseen,
+    /// mc-meet did not answer the press notice in time, so the app did not press. It asks again
+    /// after the press interval.
+    TabPressUnanswered,
+    /// mc-meet is too old to say where the Meet tab is, so the app does not press.
+    TabExtensionOutdated,
     /// The tab's stream ended, as when the tab left Meet. mc-meet starts it again when it can.
     TabStopped,
     /// mc-meet could not open the stream or the encoder.
@@ -192,15 +218,76 @@ impl VideoState {
             }
             Self::TabWaiting => "Video: waiting for the Meet tab".to_owned(),
             Self::TabNeedsClick => "Video: click the mc-meet icon on the Meet tab".to_owned(),
+            Self::TabAwaitingFront => {
+                "Video: starts when you switch to the Meet tab, or click the mc-meet icon"
+                    .to_owned()
+            }
+            Self::TabNeedsAccessibility => {
+                "Video: allow Accessibility for automatic Meet video".to_owned()
+            }
+            Self::TabShortcutUnbound => {
+                "Video: click the mc-meet icon; mc-meet has no shortcut in Chrome".to_owned()
+            }
+            Self::TabShortcutUnmappable => {
+                "Video: click the mc-meet icon; mc-meet's shortcut cannot be sent".to_owned()
+            }
+            Self::TabShortcutTypesText => {
+                "Video: click the mc-meet icon; bind mc-meet's shortcut with ⌘ for automatic video"
+                    .to_owned()
+            }
+            Self::TabShortcutNotOnLayout => {
+                "Video: click the mc-meet icon; the keyboard layout has no key for its shortcut"
+                    .to_owned()
+            }
+            Self::TabPressUnseen => {
+                "Video: click the mc-meet icon; the shortcut went to another Chrome window"
+                    .to_owned()
+            }
+            Self::TabPressUnanswered => {
+                "Video: mc-meet did not answer the shortcut press, retrying; or click its icon"
+                    .to_owned()
+            }
+            Self::TabExtensionOutdated => {
+                "Video: click the mc-meet icon; update mc-meet for automatic video".to_owned()
+            }
             Self::TabStopped => "Video: the Meet tab stopped sending video".to_owned(),
             Self::TabFailed => "Video: the Meet tab could not be recorded".to_owned(),
         }
     }
 
-    /// Whether the row is an action that opens the screen recording settings.
-    pub(crate) fn is_permission_action(self) -> bool {
-        matches!(self, Self::ScreenRecordingRefused)
+    /// The privacy pane the row opens, when the row is an action.
+    pub(crate) fn settings_pane(self) -> Option<VideoSettingsPane> {
+        match self {
+            Self::ScreenRecordingRefused => Some(VideoSettingsPane::ScreenRecording),
+            Self::TabNeedsAccessibility => Some(VideoSettingsPane::Accessibility),
+            Self::Starting { .. }
+            | Self::Recording { .. }
+            | Self::WindowMissing { .. }
+            | Self::Restarting
+            | Self::Failing
+            | Self::Sleeping
+            | Self::StoppedFromSharingControls
+            | Self::TabWaiting
+            | Self::TabNeedsClick
+            | Self::TabAwaitingFront
+            | Self::TabShortcutUnbound
+            | Self::TabShortcutUnmappable
+            | Self::TabShortcutTypesText
+            | Self::TabShortcutNotOnLayout
+            | Self::TabPressUnseen
+            | Self::TabPressUnanswered
+            | Self::TabExtensionOutdated
+            | Self::TabStopped
+            | Self::TabFailed => None,
+        }
     }
+}
+
+/// The System Settings pane a video row opens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VideoSettingsPane {
+    ScreenRecording,
+    Accessibility,
 }
 
 /// The supervisor's wake-up for each stop or resume, and each open call's audio and video state.
