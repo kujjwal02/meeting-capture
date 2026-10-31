@@ -1,6 +1,6 @@
-//! The JSON lines the app and the `mc-capture audio` process exchange: commands on the helper's
-//! stdin, reports on its stdout. Each line is one object with a `seq` and a `type`, keys sorted.
-//! Every kind is a closed enum, so a line is validated once, when it is read; an unknown `type`
+//! The JSON lines the app and the `mc-capture audio` and `mc-capture video` processes exchange:
+//! commands on the helper's stdin, reports on its stdout. Each line is one object with a `seq`
+//! and a `type`, keys sorted. Every kind is a closed enum, so a line is validated once, when it is read; an unknown `type`
 //! or a missing field fails there. Both sides build from this crate, so they cannot drift.
 
 use std::fmt;
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 pub use sources::Platform;
 pub use stem_timing::{MicMoment, PermissionService, PermissionState, Stem};
 pub use stem_writer::GapCause;
+pub use video_capture::{VideoCodec, VideoGapCause, WindowChangeCause, WindowHint, WindowRecord};
 
 /// One line on the wire: a message and its sequence number. Each side numbers its own lines
 /// from 1.
@@ -196,6 +197,132 @@ impl fmt::Display for DeviceChangeCause {
             Self::TapRateMismatch => "tap_rate_mismatch",
             Self::TapStaleAfterRouteChange => "tap_stale_after_route_change",
             Self::TapStalled => "tap_stalled",
+        })
+    }
+}
+
+/// App to the video process.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VideoCommand {
+    /// Record segment `segment` of the call's window into `folder`. The app gives audio and
+    /// video the same number at the same moment; a video restart takes video's next free number
+    /// instead, and `audio_segment` names the audio segment open now.
+    Start {
+        call_id: String,
+        folder: PathBuf,
+        segment: u32,
+        audio_segment: u32,
+        platform: Platform,
+        window_hint: WindowHint,
+    },
+    /// The huddle watcher saw the call's window reopen with this id. The open segment records
+    /// it from now on.
+    Window { window_hint: WindowHint },
+    /// Close the segment and wait for the next command. Closing stdin also stops, and then the
+    /// process exits. The app also sends it when the audio process reports a sleep.
+    Stop,
+}
+
+/// The video process to the app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VideoReport {
+    /// The segment's first frame went to the encoder.
+    Recording {
+        segment: u32,
+        window: WindowRecord,
+        width_px: u32,
+        height_px: u32,
+        codec: VideoCodec,
+        first_host_time_ns: u64,
+    },
+    /// A span the writer filled by repeating the last frame, reported when it ends.
+    Gap {
+        segment: u32,
+        start_host_time_ns: u64,
+        length_ms: f64,
+        cause: VideoGapCause,
+    },
+    /// The recorded window resized, closed, or came back. `window` is `None` while none
+    /// matches the hint.
+    WindowChanged {
+        segment: u32,
+        cause: WindowChangeCause,
+        window: Option<WindowRecord>,
+        width_px: Option<u32>,
+        height_px: Option<u32>,
+    },
+    /// Screen recording's state, read at each start with the preflight call, which never prompts.
+    Permission {
+        service: PermissionService,
+        state: PermissionState,
+    },
+    /// Every 5 s while a segment is open, also while the window is missing. The app restarts a
+    /// process whose output, fragments and lookups all stall.
+    Heartbeat {
+        segment: u32,
+        frames_captured: u64,
+        /// Callbacks with nothing new: the window is there and unchanged.
+        frames_idle: u64,
+        /// Frames handed to the encoder, repeats included.
+        frames_encoded: u64,
+        /// Frames VideoToolbox handed back. Unlike `frames_encoded`, it stops when the encoder
+        /// hangs.
+        frames_output: u64,
+        fragments_written: u64,
+        window_lookups: u64,
+    },
+    /// The segment is closed and `video.json` marks it so.
+    Stopped { segment: u32 },
+    Error {
+        kind: VideoErrorKind,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoErrorKind {
+    /// A stdin line that is not a valid command, or a command that does not fit the state.
+    BadCommand,
+    /// Screen recording is not granted. The process waits for the next command.
+    PermissionDenied,
+    /// The segment could not start: its number is taken, or the folder is unwritable.
+    SegmentStartFailed,
+    /// The encoder or the writer could not start or failed. The process closes the segment and
+    /// exits.
+    EncoderFailed,
+    /// A write to the segment failed. The process closes the segment and exits.
+    WriteFailed,
+    /// A store of `video.json` failed. The next checkpoint retries it.
+    CheckpointFailed,
+    /// The segment could not be marked closed. Launch repair finds it open.
+    SegmentCloseFailed,
+    /// The user stopped the capture through the system's sharing controls. The segment closes
+    /// and the process waits for the next command.
+    StoppedByUser,
+    /// The stream needed a fifth rebuild within one episode. The process closes the segment and
+    /// exits, so the app restarts it.
+    StreamRebuildLimit,
+    /// A stream stop took longer than its limit, so the capture may still run. The process
+    /// closes the segment and exits, which ends the capture, and the app restarts it.
+    StreamStopTimedOut,
+}
+
+impl fmt::Display for VideoErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::BadCommand => "bad_command",
+            Self::PermissionDenied => "permission_denied",
+            Self::SegmentStartFailed => "segment_start_failed",
+            Self::EncoderFailed => "encoder_failed",
+            Self::WriteFailed => "write_failed",
+            Self::CheckpointFailed => "checkpoint_failed",
+            Self::SegmentCloseFailed => "segment_close_failed",
+            Self::StoppedByUser => "stopped_by_user",
+            Self::StreamRebuildLimit => "stream_rebuild_limit",
+            Self::StreamStopTimedOut => "stream_stop_timed_out",
         })
     }
 }

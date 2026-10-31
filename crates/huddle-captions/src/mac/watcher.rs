@@ -13,7 +13,7 @@ use super::huddle::Huddle;
 use super::tree;
 use crate::profile::{self, LayoutProfile};
 use crate::tracker::{HealthChange, Moment, WindowTitle};
-use crate::{Notice, WatchPaths, WatchSettings};
+use crate::{HuddleWindow, Notice, WatchPaths, WatchSettings};
 
 // Walking a window costs one IPC call per attribute per node, so windows are walked less often
 // than the cached caption list is read.
@@ -181,6 +181,17 @@ impl<N: FnMut(Notice)> Watcher<N> {
             (None, None) => return None,
         };
         let huddle = &mut self.huddles[index];
+        if profile.is_some() && !huddle.is_window_hinted {
+            huddle.is_window_hinted = true;
+            (self.notify)(Notice::HuddleWindowFound {
+                log_path: huddle.tracker.log_path().to_path_buf(),
+                window: HuddleWindow {
+                    pid: slack.pid,
+                    title: huddle.window_title.clone(),
+                    window_id: window.window_id(),
+                },
+            });
+        }
         huddle.missed_discoveries = 0;
         huddle.last_seen_at = Timestamp::now();
         let checked = profile
@@ -207,9 +218,14 @@ impl<N: FnMut(Notice)> Watcher<N> {
             .position(|huddle| huddle.window.is_none() && huddle.channel == window_title.channel)
         {
             tracing::info!("Slack huddle window reopened");
-            self.huddles[index].window = Some(window.clone());
+            let huddle = &mut self.huddles[index];
+            huddle.window = Some(window.clone());
+            huddle.window_title = window_title.title;
+            // Without huddle content seen, `discover_window` sends the window once it shows.
+            huddle.is_window_hinted = false;
             return Some(index);
         }
+        let window_title_text = window_title.title.clone();
         match Huddle::start(&self.log_dir, slack, window, window_title, profile) {
             Ok(huddle) => {
                 self.has_reported_start_error = false;
@@ -221,6 +237,14 @@ impl<N: FnMut(Notice)> Watcher<N> {
                 (self.notify)(Notice::HuddleStarted {
                     log_path: huddle.tracker.log_path().to_path_buf(),
                     channel: huddle.channel.clone(),
+                    window: HuddleWindow {
+                        pid: slack.pid,
+                        title: window_title_text,
+                        window_id: huddle
+                            .is_window_hinted
+                            .then(|| window.window_id())
+                            .flatten(),
+                    },
                 });
                 self.huddles.push(huddle);
                 Some(self.huddles.len() - 1)

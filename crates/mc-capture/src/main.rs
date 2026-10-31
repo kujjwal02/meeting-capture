@@ -1,9 +1,10 @@
 //! The capture helper. The app spawns it, so a crash or a hung Core Audio call never takes the
-//! tray down. `audio` is the process the app supervises: commands on stdin, reports on stdout.
+//! tray down. `audio` and `video` are the processes the app supervises: commands on stdin,
+//! reports on stdout. `windows` lists the windows `video` can record.
 //! `probe` records the stems at their native rates and reports what the devices did; `record`
 //! writes one segment of a call folder through the stem writer; `devices` lists the Core Audio
 //! devices; `await-device-change` exits on the first device change; `repair` recovers the
-//! segments a dead writer left open in a call folder, as the app does at launch.
+//! segments a dead writer left open in a call folder, audio and video, as the app does at launch.
 
 #[cfg(target_os = "macos")]
 mod audio;
@@ -15,6 +16,8 @@ mod inject;
 mod probe;
 #[cfg(target_os = "macos")]
 mod record;
+#[cfg(target_os = "macos")]
+mod video;
 
 use std::path::PathBuf;
 #[cfg(target_os = "macos")]
@@ -50,6 +53,16 @@ enum Command {
     Audio {
         #[arg(long, value_enum, default_value_t = MicChoice::AvoidBluetooth)]
         mic: MicChoice,
+    },
+    /// Serve the app's video: JSON line commands on stdin (`start` with a window hint, `stop`),
+    /// reports on stdout. Records one window through ScreenCaptureKit. Exits when stdin closes.
+    Video,
+    /// Print every window ScreenCaptureKit lists, on and off screen, as one JSON array, for
+    /// picking a `window_id` by hand.
+    Windows {
+        /// Only windows of this app.
+        #[arg(long)]
+        bundle_id: Option<String>,
     },
     /// Record the stems at native rates and print one status line per second.
     Probe {
@@ -93,9 +106,9 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         seconds: u64,
     },
-    /// Rebuild the headers of the segments a dead writer left open in a call folder and mark
-    /// them recovered. Leaves a folder alone while a helper records there. Prints the outcome
-    /// as one JSON object.
+    /// Rebuild the headers of the audio segments a dead writer left open in a call folder, end
+    /// its open video playlists, and mark both recovered. Leaves each alone while a helper
+    /// records there. Prints both outcomes as one JSON object.
     Repair {
         /// The call folder.
         #[arg(long)]
@@ -175,9 +188,26 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Repair { folder } => {
-            let outcome = stem_writer::repair_folder(&folder)?;
+            let audio = stem_writer::repair_folder(&folder)?;
+            let video = video_capture::repair_folder(&folder)?;
+            let outcome = serde_json::json!({ "audio": audio, "video": video });
             println!("{}", serde_json::to_string(&outcome)?);
             Ok(())
+        }
+        Command::Video => {
+            #[cfg(target_os = "macos")]
+            return video::serve();
+            #[cfg(not(target_os = "macos"))]
+            anyhow::bail!("video records through ScreenCaptureKit, which only macOS has")
+        }
+        Command::Windows { bundle_id } => {
+            #[cfg(target_os = "macos")]
+            return print_windows(bundle_id.as_deref());
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = bundle_id;
+                anyhow::bail!("windows lists ScreenCaptureKit windows on macOS only")
+            }
         }
         Command::Devices { mic } => {
             #[cfg(target_os = "macos")]
@@ -252,5 +282,17 @@ fn await_device_change(limit: Duration) -> anyhow::Result<()> {
         std::thread::sleep(CHECK_INTERVAL);
     };
     println!("{}", serde_json::json!({ "changed": is_changed }));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn print_windows(bundle_id: Option<&str>) -> anyhow::Result<()> {
+    video_capture::mac::window::connect_window_server();
+    let windows = video_capture::mac::window::list_windows().map_err(anyhow::Error::msg)?;
+    let windows: Vec<_> = windows
+        .into_iter()
+        .filter(|window| bundle_id.is_none_or(|wanted| window.bundle_id.as_deref() == Some(wanted)))
+        .collect();
+    println!("{}", serde_json::to_string(&windows)?);
     Ok(())
 }

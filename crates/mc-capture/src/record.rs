@@ -159,7 +159,7 @@ pub(crate) struct LiveSegment<'a> {
 
 /// Checks both permissions and reports them.
 fn check_permissions(observer: &mut impl SegmentObserver) -> Result<(), SegmentError> {
-    for service in PermissionService::ALL {
+    for service in PermissionService::AUDIO {
         observer
             .permission_checked(service, capture::permission_state(service))
             .map_err(SegmentError::Report)?;
@@ -1209,6 +1209,9 @@ fn apply_injected_events(source: &mut CallAudioSource) {
                 }
             }
             DeviceEvent::HalProbe => capture::probe_device_list_listener(),
+            DeviceEvent::VideoStall | DeviceEvent::VideoStill | DeviceEvent::VideoResume => {
+                tracing::warn!(inject.event = %event, "inject.not_for_audio");
+            }
         }
     }
 }

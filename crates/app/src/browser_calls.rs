@@ -666,9 +666,9 @@ impl Port {
             }
         };
         if is_stopped {
-            crate::audio_capture::stop_call(&self.app, &call_id);
+            crate::call_capture::stop_call(&self.app, &call_id);
         } else {
-            crate::audio_capture::resume_call(&self.app, &call_id);
+            crate::call_capture::resume_call(&self.app, &call_id);
         }
     }
 
@@ -1009,6 +1009,7 @@ fn open_on_stream(state: &AppState, opened: &OpenedCall) {
         &opened.log_path,
         CallPlatform::Meet,
         opened.title.clone(),
+        None,
         opened.is_recording_stopped,
     );
     if !opened.logged_caption_keys.is_empty() {

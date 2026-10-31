@@ -622,8 +622,9 @@ impl SegmentRecord {
     }
 }
 
-/// One past the highest segment number in the folder's `audio.json` or in any `NNN-*` file
-/// name. Any extension counts, so audio never takes a number another capture process used.
+/// One past the highest segment number in the folder's `audio.json` or in any stem file name.
+/// Video's files do not count: the app starts audio and video with one shared number, and takes
+/// the call's next number from both processes' files.
 ///
 /// # Errors
 ///
@@ -672,7 +673,13 @@ fn highest_segment_number(folder: &Path, manifest: &AudioManifest) -> Result<u32
         let Some(name) = name.to_str() else {
             continue;
         };
-        if let Some(number) = segment_number_of(name) {
+        // Only stem files count. The video process starts the same number at the same moment, so
+        // its `NNN-video` folder must not make the number look taken.
+        if let Some(number) = segment_number_of(name)
+            && Stem::ALL
+                .into_iter()
+                .any(|stem| stem_file_name(number, stem) == name)
+        {
             highest = highest.max(number);
         }
     }

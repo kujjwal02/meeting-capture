@@ -4,3 +4,7 @@ extend-exclude = ["*.lock"]
 [default.extend-words]
 # India Standard Time.
 IST = "IST"
+
+[default.extend-identifiers]
+# cidre 0.29 spells the VideoToolbox average bit rate key this way.
+avarage_bit_rate = "avarage_bit_rate"

@@ -283,6 +283,34 @@ Done when:
 - [ ] Teams and Zoom each log start and end within 5 s, on the Mac.
 - [ ] The same on the PC.
 
+## Phase 3c: Mac video
+
+- [x] `mc-capture video` records one window through ScreenCaptureKit into 2 s HEVC fragments,
+  `index.m3u8` and `video.json`. A 60 s run on a fully covered window gave 30 fragments that all
+  decode in AVFoundation, at about 1% of one core.
+- [x] A `kill -9` of the video helper leaves fragments that play. Repair adds `#EXT-X-ENDLIST`
+  and lists the fragments `video.json` had not caught up with.
+- [x] 5 s with no callback after a complete frame, while the window is on screen, rebuilds the
+  stream, at most 4 times. Checked by injection. A still window, which sends one idle status, and
+  a hidden one never rebuild.
+- [x] Each part keeps its own size, codec and first frame time, a part shorter than one fragment
+  too.
+- [ ] Video records only the window id the huddle watcher read. A reopened huddle window reaches
+  video as a new hint. Code only; not run on a real huddle.
+- [ ] The audio helper's sleep report stops video, and its wake starts video on the audio's wake
+  segment. Each video segment records the `audio_segment` it pairs with. Code only.
+- [ ] The encoder starts at `call.started`, so its warm-up of about 160 ms drops no frames.
+- [ ] A real Slack huddle records its window while covered, with the tray video row.
+- [ ] Finalize: one MP4 with the video and an AAC mix, track offsets from host time.
+- [ ] 90-day purge of call media.
+- [ ] mc-meet tab capture for Meet video, with no Screen Recording grant.
+
+Done when:
+
+- [ ] Lips match voices within 100 ms on 3 calls.
+- [ ] Revoking Screen Recording shows the warning, and audio still records.
+- [ ] A Meet call records the Meet tab through a tab switch.
+
 ## Phase 4: local speech-to-text
 
 - [ ] `stt`: VAD, Parakeet TDT 0.6B v3, diarization of the remote stem.
@@ -319,7 +347,6 @@ Done when:
 
 ## Phase 7: recording
 
-- [ ] `obs-control` starts and stops OBS video recording with the call.
 - [ ] Audio archive and a Drive folder for media. No media in the vault.
 - [ ] Recording consent: the tray shows recording state; a per-client "never record" list.
 

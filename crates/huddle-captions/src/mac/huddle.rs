@@ -19,6 +19,12 @@ pub(super) struct Huddle {
     pub(super) channel: String,
     /// `None` while the user has closed the huddle window and the huddle goes on.
     pub(super) window: Option<Element>,
+    /// The current window's whole title, for the app's window hint.
+    pub(super) window_title: String,
+    /// The app has the current window's id. It gets the id only once the huddle content class
+    /// shows in the window: a conversation popped out of the main window is a titled child
+    /// window too, and video must never record it.
+    pub(super) is_window_hinted: bool,
     pub(super) tracker: HuddleTracker,
     pub(super) missed_discoveries: u32,
     pub(super) last_seen_at: Timestamp,
@@ -38,6 +44,8 @@ impl Huddle {
     ) -> std::io::Result<Self> {
         let moment = Moment::now();
         let channel = window_title.channel.clone();
+        let title = window_title.title.clone();
+        let is_window_hinted = profile.is_some();
         let tracker = HuddleTracker::start(
             log_dir,
             moment,
@@ -48,6 +56,8 @@ impl Huddle {
         Ok(Self {
             channel,
             window: Some(window.clone()),
+            window_title: title,
+            is_window_hinted,
             tracker,
             missed_discoveries: 0,
             last_seen_at: moment.seen_at,

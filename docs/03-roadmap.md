@@ -10,10 +10,11 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 | 2 | Call detection | One call stream for capture to follow: `call.started`, `call.resumed` and `call.ended`, built from mc-meet's `call_started` and `call_ended` and the huddle watcher | Meet and a Slack huddle each log start within 5 s on the Mac, Meet its end within 5 s and a huddle within 6 s; Meet does the same on the PC | 1 |
 | 3 | Mac capture | Tap and mic stems from a supervised `mc-capture` helper, recovery of orphan WAVs at launch | 3 calls, one with AirPods connected mid-call, no gap over 1 s, app and helper under 5% CPU; a `kill -9` of the app or the helper mid-call leaves stems that play | 6 |
 | 3b | Mic detection | Calls in native apps such as Teams and Zoom, from the app that holds the mic, on both OSes. Also ends a Meet call at once when the browser crashes | Teams and Zoom each log start and end within 5 s, on the Mac and the PC | 2 |
+| 3c | Mac video | A Slack huddle's own window from a supervised `mc-capture video`: ScreenCaptureKit, VideoToolbox HEVC, 2 s HLS fragments, repair at launch. Meet video from mc-meet tab capture. One MP4 per call at finalize | Lips match voices within 100 ms on 3 calls; a `kill -9` of the video helper leaves fragments that play; revoking Screen Recording keeps audio recording | 8.5 |
 | 4 | Local STT | Parakeet, VAD, remote diarization, caption-name merge | A 1 h call transcribes in under 10 min on the M2; names match captions on 3 Meet calls | 4 |
 | 5 | Windows capture | WASAPI loopback, mic | Phase 3 checks pass on the PC | 4 |
 | 6 | Extra sources | Soniox routing, dropped audio files, calendar from a secret iCal address | A Hinglish call gets a Soniox transcript; an iCal address matches a call with no Google sign-in | 3 |
-| 7 | Recording | OBS start and stop, audio archive, Drive folder | Video and audio for 3 calls land in the Drive folder, none in the vault | 2 |
+| 7 | Recording | Audio and video archive, Drive folder | Video and audio for 3 calls land in the Drive folder, none in the vault | 2 |
 | 8 | Hardening | Tests, model download with checksum, commitment review | Two weeks without a lost meeting | 4 |
 
 Phase 1 took Meet captions from TranscripTonic's webhook. Phase 1b replaced it with mc-meet,

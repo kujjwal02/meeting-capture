@@ -14,6 +14,7 @@ serde_json.workspace = true
 stem-writer.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+video-capture.workspace = true
 
 # Only the macOS commands record.
 [target.'cfg(target_os = "macos")'.dependencies]
