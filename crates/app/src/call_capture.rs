@@ -2,8 +2,9 @@
 //! files. The app never links Core Audio or ScreenCaptureKit, so a crash or a hung framework call
 //! in a capture process never takes the tray down. `mc-capture audio` records every call.
 //! `mc-capture video` records a Slack huddle's own window next to it, with the same segment
-//! number; Meet video comes from its tab instead. Each process restarts on its own, so video may
-//! fail while audio carries on. One stop control stops both.
+//! number. Meet video comes from mc-meet's tab capture: a task in the app writes the fragments
+//! mc-meet sends, with no capture process and no Screen Recording grant. Each process restarts
+//! on its own, so video may fail while audio carries on. One stop control stops both.
 //!
 //! A supervisor task follows the call stream: `call.started` and `call.resumed` start a
 //! recording, `call.ended` stops it, with no click. One call records at a time, since the
@@ -32,6 +33,7 @@
 //! the video of calls that ended more than 90 days ago. The stems stay for transcription.
 
 mod restart_backoff;
+mod tab_video;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -139,7 +141,7 @@ impl AudioState {
     }
 }
 
-/// What a huddle's video is doing, as the tray shows it.
+/// What a call's video is doing, as the tray shows it: a huddle's window, or a Meet tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VideoState {
     /// The process runs and no frame went to the encoder yet: it may be looking for the window.
@@ -163,6 +165,14 @@ pub(crate) enum VideoState {
     ScreenRecordingRefused,
     /// The user ended the capture through the system's sharing controls. Audio goes on.
     StoppedFromSharingControls,
+    /// The app wants the Meet tab's video and no fragment came yet.
+    TabWaiting,
+    /// Chrome refuses tab capture until the user clicks mc-meet on the Meet tab once.
+    TabNeedsClick,
+    /// The tab's stream ended, as when the tab left Meet. mc-meet starts it again when it can.
+    TabStopped,
+    /// mc-meet could not open the stream or the encoder.
+    TabFailed,
 }
 
 impl VideoState {
@@ -180,6 +190,10 @@ impl VideoState {
             Self::StoppedFromSharingControls => {
                 "Video: stopped from the sharing controls".to_owned()
             }
+            Self::TabWaiting => "Video: waiting for the Meet tab".to_owned(),
+            Self::TabNeedsClick => "Video: click the mc-meet icon on the Meet tab".to_owned(),
+            Self::TabStopped => "Video: the Meet tab stopped sending video".to_owned(),
+            Self::TabFailed => "Video: the Meet tab could not be recorded".to_owned(),
         }
     }
 
@@ -286,7 +300,9 @@ impl CallCapture {
             || self.lock_video().values().any(|state| {
                 matches!(
                     state,
-                    VideoState::Failing | VideoState::ScreenRecordingRefused
+                    VideoState::Failing
+                        | VideoState::ScreenRecordingRefused
+                        | VideoState::TabFailed
                 )
             })
     }
@@ -419,7 +435,8 @@ pub(crate) fn start(app: &AppHandle) {
             tracing::error!(exception.message = %error, "repair.task_failed");
         }
         // After the repair, so finalize never meets a folder lock the repair holds and skips it.
-        // Only the Mac records video, so only the Mac has any to finalize or purge.
+        // Only the Mac records video, a huddle's window or a Meet tab, so only the Mac has any
+        // to finalize or purge.
         if cfg!(target_os = "macos") {
             finalize_pending(&calls_dir, &log_file).await;
             // After finalize, so a folder that waited for its `call.mp4` has it by now.
@@ -726,6 +743,9 @@ struct AudioPhase {
     /// Sleeps the audio process reported. A follower that saw neither a sleep nor its wake, as
     /// both came between two of its reads, still restarts on the wake segment.
     sleep_count: u64,
+    /// When the audio last started, at the call start or a wake. Video from before it has no
+    /// audio segment to pair with.
+    awake_since: jiff::Timestamp,
 }
 
 /// What one process of a recording shares with the other.
@@ -1002,6 +1022,7 @@ impl Supervisor {
                 segment,
                 is_asleep: false,
                 sleep_count: 0,
+                awake_since: jiff::Timestamp::now(),
             });
             let audio_links = ProcessLinks {
                 audio_phase_out: Some(audio_phase_out),
@@ -1015,9 +1036,24 @@ impl Supervisor {
                 segment,
                 audio_links,
             )];
-            // Meet video is the tab's, from mc-meet. A huddle without a window id has nothing
-            // that tells its window from the Slack main window, which shows private messages.
+            // A huddle without a window id has nothing that tells its window from the Slack
+            // main window, which shows private messages.
             let mut window_hints = None;
+            match call.platform {
+                // Only on the Mac until finalize and the purge run on Windows: video recorded there
+                // would never become a call.mp4 or be deleted.
+                CallPlatform::Meet => {
+                    if cfg!(target_os = "macos") {
+                        processes.push(tab_video::spawn(
+                            &self.app,
+                            &call,
+                            &folder,
+                            audio_phase.clone(),
+                        ));
+                    }
+                }
+                CallPlatform::SlackHuddle => {}
+            }
             if VideoProcess::is_for(&call).is_some() {
                 let (hints, hint_receiver) = mpsc::unbounded_channel();
                 let video_links = ProcessLinks {
@@ -1910,9 +1946,11 @@ impl<P: CaptureProcess> Recording<P> {
         let (child, stdin, stdout) = self.launch(is_sleeping, audio_segment).await?;
         // An audio start opens a segment, after a sleep too: its helper died while the Mac slept.
         let segment = self.segment;
+        let started_at = jiff::Timestamp::now();
         links.publish_audio(|phase| {
             phase.segment = segment;
             phase.is_asleep = false;
+            phase.awake_since = started_at;
         });
         let run = ProcessRun {
             stdin: Some(stdin),
@@ -2107,9 +2145,11 @@ impl<P: CaptureProcess> Recording<P> {
             Some(ReportSign::Woke) if run.open_segment.is_none() => {
                 let segment = self.next_segment_after_sleep();
                 if self.send_start(segment, segment, run).await? {
+                    let woke_at = jiff::Timestamp::now();
                     publish(&|phase| {
                         phase.segment = segment;
                         phase.is_asleep = false;
+                        phase.awake_since = woke_at;
                     });
                 }
             }

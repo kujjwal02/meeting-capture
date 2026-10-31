@@ -2797,6 +2797,7 @@ dependencies = [
 name = "meeting-capture"
 version = "0.7.1"
 dependencies = [
+ "base64 0.22.1",
  "call-folder",
  "capture-protocol",
  "huddle-captions",

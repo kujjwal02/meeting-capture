@@ -14,8 +14,9 @@ use crate::VideoWriterError;
 pub const MANIFEST_FILE_NAME: &str = "video.json";
 
 /// Raised when the layout changes in a way an older reader would misread. Readers accept every
-/// version up to their own; fields added since carry serde defaults.
-pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
+/// version up to their own; fields added since carry serde defaults. Version 2 added Meet tab
+/// segments, whose parts carry a UTC start and no host time.
+pub const MANIFEST_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoManifest {
@@ -58,6 +59,27 @@ impl std::fmt::Display for VideoCodec {
     }
 }
 
+/// What recorded a segment, which decides the clock its frames carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoSource {
+    /// `mc-capture video` through ScreenCaptureKit: frames carry host time.
+    #[default]
+    Window,
+    /// mc-meet's tab capture, written by the app: Chrome stamps frames with UTC.
+    MeetTab,
+}
+
+impl VideoSource {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Window => "window",
+            Self::MeetTab => "meet_tab",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VideoSegmentRecord {
     /// The `NNN` in the segment's folder name. It matches the audio segment of the same span
@@ -71,6 +93,9 @@ pub struct VideoSegmentRecord {
     #[serde(default)]
     pub call_id: Option<String>,
     pub platform: Platform,
+    /// Version 1 files hold only window segments.
+    #[serde(default)]
+    pub source: VideoSource,
     pub state: VideoSegmentState,
     /// The segment's folder in the call folder, such as `001-video`.
     pub folder: String,
@@ -78,8 +103,8 @@ pub struct VideoSegmentRecord {
     pub playlist: String,
     /// The first part's codec. Each part records its own, since a new part may fall back.
     pub codec: VideoCodec,
-    /// The host clock read against UTC when the segment started. `None` only in a segment
-    /// repair rebuilt from its files alone.
+    /// The host clock read against UTC when the segment started. `None` in a Meet tab segment,
+    /// whose frames carry UTC, and in a segment repair rebuilt from its files alone.
     #[serde(default)]
     pub clock: Option<ClockRecord>,
     /// A second reading at close, to show drift between the two clocks.
@@ -90,10 +115,10 @@ pub struct VideoSegmentRecord {
     /// The window the segment started on. Later windows are in `window_changes`.
     #[serde(default)]
     pub window: Option<WindowRecord>,
-    /// Host time of the first frame. `None` until a frame arrives.
+    /// Host time of the first frame. `None` until a frame arrives, and in a Meet tab segment.
     #[serde(default)]
     pub first_host_time_ns: Option<u64>,
-    /// `first_host_time_ns` in UTC, through `clock`.
+    /// UTC of the first frame: `first_host_time_ns` through `clock`, or Chrome's stamp.
     #[serde(default)]
     pub started_at: Option<Timestamp>,
     /// Host time at the end of the last fragment on disk.
@@ -117,6 +142,10 @@ pub struct VideoSegmentRecord {
     /// Why the writer ended the segment early, when it did.
     #[serde(default)]
     pub stopped_by: Option<String>,
+    /// Meet tab only: how long mc-meet's playback of the captured tab audio lags the frames, as
+    /// it last reported. The remote stem hears the tab that much later.
+    #[serde(default)]
+    pub playback_latency_ms: Option<f64>,
     #[serde(default)]
     pub repair: Option<VideoRepair>,
 }
@@ -149,8 +178,12 @@ pub struct PartRecord {
     pub codec: VideoCodec,
     pub width_px: u32,
     pub height_px: u32,
-    /// Host time of the part's first frame.
-    pub first_host_time_ns: u64,
+    /// Host time of the part's first frame. `None` in a Meet tab segment.
+    #[serde(default)]
+    pub first_host_time_ns: Option<u64>,
+    /// Meet tab only: Chrome's UTC at the part's first frame.
+    #[serde(default)]
+    pub first_frame_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,9 +192,13 @@ pub struct FragmentRecord {
     pub file: String,
     /// The part whose init segment decodes it.
     pub part: u32,
-    /// Host time of its first frame. `None` only for a fragment repair found on disk unlisted.
+    /// Host time of its first frame. `None` for a fragment repair found on disk unlisted, and in
+    /// a Meet tab segment.
     #[serde(default)]
     pub first_host_time_ns: Option<u64>,
+    /// Meet tab only: Chrome's UTC at its first frame.
+    #[serde(default)]
+    pub first_frame_at: Option<Timestamp>,
     pub duration_ms: f64,
     pub bytes: u64,
 }

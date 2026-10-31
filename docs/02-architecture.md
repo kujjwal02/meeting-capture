@@ -229,6 +229,42 @@ flowchart LR
   even while other windows cover it. VideoToolbox encodes HEVC in hardware, and AVAssetWriter cuts
   2 s HLS fragments into `NNN-video/`. Each fragment is fsynced, then listed in `index.m3u8` and
   `video.json`. Meet video comes from tab capture instead.
+- mc-meet records Meet video in Chrome, so the app needs no Screen Recording grant for it. Only
+  the Mac records it, since finalize and the purge run only there. While a Meet call records,
+  `call_status` marks it `is_video_wanted` and goes out at least every 5 s. mc-meet then asks
+  `chrome.tabCapture.getMediaStreamId` for the call's tab. Chrome grants it only after an
+  invocation of mc-meet on that tab: a click on its toolbar icon, its context menu entry, or its
+  shortcut (Alt+Shift+V by default). The grant should last while the tab stays on
+  meet.google.com, so one click would cover later calls in that tab; this is untested. With no
+  grant, the icon shows "REC?" and the tray video row asks for the click. One notification asks
+  too, once the call has a caption source or a problem, so it cannot take focus while
+  mc-meet's captions press is due. The click starts capture at once. A call that never
+  got a stream reads "no video" in "Recent calls".
+- An offscreen document opens the stream at a fixed 1280x720, so Chrome letterboxes the tab, and
+  encodes 15 fps with WebCodecs: hardware HEVC, else H.264, with a keyframe every 2 s. It plays
+  the tab's audio back through an AudioContext, since capture mutes the tab. Its own muxer cuts
+  one fMP4 fragment per keyframe and sends it base64 over the native port with the part's init
+  segment, its first frame's UTC and the playback's output and base latency. A part fixes UTC
+  minus the monotonic clock at its first frame and places its frames by monotonic time; when
+  that offset moves by over 1 s, after a sleep or a clock change, a new part starts. Each
+  fragment carries its part's offset and the current one. The app keeps the offset it first
+  saw until the paired audio reports a sleep or opens a new segment, since the audio keeps its
+  own clock reading through a clock change; it logs a step it ignores. Frames
+  keep coming while the tab is in the background or its window is covered.
+- The app writes the fragments itself, with the same segment writer, playlist, `video.json` and
+  repair as huddle video. Its segment records `source: meet_tab` and each part's first frame
+  UTC instead of a host time. A video segment pairs with one audio segment and closes at the
+  audio's sleep report. "Stop recording this call", the popup's stop, and the shortcut on a
+  recording call, whatever its video state, all clear `is_video_wanted`. mc-meet ends the
+  capture and names its last fragment. The app waits up to 2 s for it and drops each fragment
+  that ends after the stop, at the cost of up to 2 s before it. mc-meet also ends a capture
+  after 10 s without a `call_status`. The app drops fragments whose first frame is older than
+  its tab video task. A fragment that would open a segment or take a new offset is dropped
+  when it ends before the audio's last start or its part began before a sleep.
+  "Resume recording" should take a fresh stream id under the grant the tab still holds, with
+  no click; this is untested. When the tab leaves Meet, mc-meet drops the open fragment.
+- Chrome takes at most 1 MB per message from a host but sends one up to 64 MiB, so the native
+  frame limit is 8 MiB from the extension and 1 MiB towards it.
 - Each capture process keeps its own manifest in the call folder: `audio.json` from the audio
   process, `video.json` from the video process. Finalize reads both.
 - Audio repair lives in `stem-writer` and video repair in `video-capture`, each beside the
@@ -305,8 +341,10 @@ flowchart LR
   and ends, and in 10 ms chunks inside it. Where a run ahead starts, the file holds audio twice
   for one span of host time, and the later copy loses its head. A steering hole of up to 1 ms is
   filled from the file. The summed stems pass a soft limiter above 80% of full scale.
-- A browser part (Meet tab capture, code only) starts at its first frame's UTC instead, and its
-  paired remote stem moves earlier by the playback latency the browser logged.
+- A Meet tab part starts at its first frame's UTC instead. Its paired remote stem moves earlier
+  over the part's span by the playback latency the browser logged plus a fixed 60 ms
+  calibration, from the tab capture spike: the stem trailed the frame by about 100 ms there,
+  against 41 to 45 ms of latency. Remote audio outside every Meet part keeps its place.
 - A part whose start falls at or before the previous part's last frame moves whole to one frame
   after it, so video times only rise and its key frame stays. Between segments the video holds
   its last frame and the mix is silent. Open segments and segments with no clock or no samples

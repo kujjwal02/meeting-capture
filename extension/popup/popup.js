@@ -1,9 +1,12 @@
 // Toolbar popup: the active tab's call status as the app last reported it, "Stop recording this
 // call" or "Resume recording", and a button that asks the app for a debug report. It keeps a
 // port to the worker open, which keeps the native port to the app open while the popup shows.
+// Opening it invokes mc-meet on the tab, which lets the worker capture the tab's video.
 (() => {
   const CALL_STATUS_KEY = "call_status";
   const APP_KEY = "app";
+  const VIDEO_CAPTURE_KEY = "video_capture";
+  const NEEDS_CLICK_KEY = "video_needs_click";
   const STATE_WORDS = {
     waiting: "Waiting for captions",
     recording: "Recording",
@@ -20,6 +23,9 @@
   let callStatus;
   let app = { is_reachable: true };
   let sessionId;
+  let videoCapture = null;
+  let needsClick = {};
+  let isOpeningSent = false;
   let port;
   let reportTimer = null;
 
@@ -63,6 +69,10 @@
       show("captions", String(call.caption_count));
       show("last-caption", call.last_caption_at ? secondsAgo(call.last_caption_at) : "none yet");
       show("source", call.caption_source ? SOURCE_WORDS[call.caption_source] : "none yet");
+      let videoLine = "off";
+      if (videoCapture?.tab_id === tabId) videoLine = "recording this tab";
+      else if (tabId in needsClick) videoLine = "click needed";
+      show("video", videoLine);
     }
 
     const recordingButton = byId("recording-control");
@@ -97,9 +107,20 @@
     tabId = tab?.id;
     const local = await chrome.storage.local.get("tabSessions");
     sessionId = tabId === undefined ? undefined : local.tabSessions?.[tabId];
-    const stored = await chrome.storage.session.get([CALL_STATUS_KEY, APP_KEY]);
+    if (!isOpeningSent && tabId !== undefined) {
+      isOpeningSent = true;
+      port.postMessage({ type: "popup_opened", tab_id: tabId });
+    }
+    const stored = await chrome.storage.session.get([
+      CALL_STATUS_KEY,
+      APP_KEY,
+      VIDEO_CAPTURE_KEY,
+      NEEDS_CLICK_KEY,
+    ]);
     callStatus = stored[CALL_STATUS_KEY];
     app = stored[APP_KEY] ?? { is_reachable: true };
+    videoCapture = stored[VIDEO_CAPTURE_KEY] ?? null;
+    needsClick = stored[NEEDS_CLICK_KEY] ?? {};
     render();
   }
 
@@ -143,7 +164,10 @@
   // Queued events change local storage many times a second during a call.
   chrome.storage.onChanged.addListener((changes, area) => {
     const isStatusChange =
-      (area === "session" && (CALL_STATUS_KEY in changes || APP_KEY in changes)) ||
+      (area === "session" &&
+        [CALL_STATUS_KEY, APP_KEY, VIDEO_CAPTURE_KEY, NEEDS_CLICK_KEY].some(
+          (key) => key in changes,
+        )) ||
       (area === "local" && "tabSessions" in changes);
     if (isStatusChange) load();
   });

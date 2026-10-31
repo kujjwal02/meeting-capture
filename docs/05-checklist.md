@@ -321,7 +321,18 @@ Done when:
 - [ ] A Screen Recording grant given mid-call takes effect at the next wake or new huddle window:
   the video process is replaced, so its preflight is not cached. Needs a real revoke and re-grant
   on a Mac; code only.
-- [ ] mc-meet tab capture for Meet video, with no Screen Recording grant.
+- [ ] mc-meet tab capture for Meet video, with no Screen Recording grant. One click on the
+  mc-meet icon, its context menu entry or its shortcut arms the tab. Built; the fMP4 writer,
+  the app's fragment writer and finalize ran on a canvas source only, never on a real call.
+- [ ] The tab capture grant lasts while the tab stays on meet.google.com, so later calls in the
+  tab start with no click. Untested.
+- [ ] "Resume recording" restarts Meet tab video with no click. Untested.
+- [ ] Measure `MEET_TAB_CALIBRATION_MS` (60 ms, from the tab capture spike) on the first real
+  call.
+- [ ] Measure the Meet remote stem trail with Bluetooth output, where the playback latency is
+  largest; finalize shifts by the logged output latency plus the calibration.
+- [ ] Window capture fallback for a Meet tab that never got the click.
+- [ ] Meet video on Windows. It needs finalize and the purge there first.
 
 Done when:
 

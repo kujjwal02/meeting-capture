@@ -1,8 +1,8 @@
 # mc-meet extension
 
 mc-meet is our Chrome extension for Google Meet. It reads captions, chat and the participant
-list in each call you join, and streams them to the tray app as they happen. The app writes one
-note per call.
+list in each call you join, and streams them to the tray app as they happen. On macOS it also
+records the Meet tab's video for the app. The app writes one note per call.
 
 ## Parts
 
@@ -28,7 +28,9 @@ flowchart LR
 | Content script | `extension/content/`, isolated world | Finds call start and end, reads the DOM when the channels give nothing, and owns the call session for its tab. |
 | Session rules | `extension/session-rules.js`, service worker | Decides what each tab message, tab change and alarm does to the worker's sessions. Numbers events. Makes no `chrome.*` calls and reads no clock, so it also runs in Node. |
 | Service worker | `extension/background.js` | Stores the session state and queued events in one write, holds the native port, resends after a reconnect. Shows each Meet tab's call status on the toolbar icon. |
-| Popup | `extension/popup/` | The active tab's call status, a "Stop recording this call" or "Resume recording" button, and a "Save debug report" button. |
+| Tab video | `extension/tab-video.js`, service worker | Picks the Meet tab whose call wants video, asks for its stream id, asks for the click when Chrome refuses, forwards fragments to the app. |
+| Offscreen capture | `extension/offscreen/`, offscreen document | Opens the tab stream, plays its audio back, encodes with WebCodecs and cuts fMP4 fragments (`fmp4.js`, which also runs in Node). |
+| Popup | `extension/popup/` | The active tab's call status and video state, a "Stop recording this call" or "Resume recording" button, and a "Save debug report" button. |
 | Host mode | `crates/native-host`, run by the app binary | Chrome starts `meeting-capture chrome-extension://<id>/`. `main` sees the argument and relays frames between stdio and the app socket before Tauri starts. |
 | Call log | `crates/app/src/browser_calls.rs` | Listens on the socket, appends each event to the session log, acks it, ends calls, hands logs to intake. |
 | Parser | `crates/sources/src/browser_call.rs` | Turns a session log into a `Transcript`. |
@@ -66,7 +68,8 @@ flowchart LR
 - Host to app and app to host: the same frames with a little-endian length. The host passes every
   frame through unchanged, except the first one it sends the app:
   `{"type":"host_hello","origin":"chrome-extension://.../","host_version":"0.2.0"}`.
-- A frame over 1 MB from either side closes the connection.
+- A frame closes the connection when it is over 8 MiB from the extension or over 1 MiB towards
+  it. Chrome sends a host up to 64 MiB but takes at most 1 MB from one.
 - When the socket is absent, host mode starts the app and retries the connection every 250 ms for
   10 s. Then it sends `{"type":"app_unavailable"}` to Chrome and exits.
 
@@ -87,6 +90,8 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `stop_recording` | `session_id` | The popup's "Stop recording this call" button. The app handles it as the tray row of the same name. |
 | `resume_recording` | `session_id` | The popup's "Resume recording" button. |
 | `save_debug_report` | `session_id` (the popup's tab session, or null), `with_text` | The popup's "Save debug report" button. The app answers `debug_report_failed` for a `session_id` that is not 1 to 64 letters, digits or hyphens. |
+| `video_state` | `session_id`, `state` (`needs_click`, `capturing`, `stopped` or `failed`), `detail` (null, or for `stopped` one of `not_wanted`, `track_ended`, `tab_gone`, `app_silent`; for `failed` the error text), and on `stopped` `capture_id` and `last_index` (the last fragment sent, 0 for none) | Each change of the tab capture for a call that wants video. Held with the fragments while the port is down. |
+| `video_fragment` | `session_id`, `capture_id` (16 hex digits, new per stream), `part`, `codec` (`hevc` or `h264`), `width_px`, `height_px`, `init_base64`, `index`, `first_frame_utc_ms`, `duration_ms`, `frame_count`, `part_clock_offset_ms` (UTC minus `performance.now()` at the part's first frame) and `clock_offset_ms` (the same at this fragment), `playback_latency_ms` and `playback_base_latency_ms` (or null), `bytes_base64` | One fMP4 fragment, about every 2 s while capturing. Not queued or acked: the worker holds the last 30 while the port is down. The app drops a repeat of a `capture_id` and `index` it wrote, a late fragment of a capture a newer one replaced, a fragment older than the call's tab video task, and one whose part predates a sleep the audio reported. |
 
 `event.kind` is one of the kinds below. `extension/call-events.js` builds each of them.
 
@@ -154,8 +159,9 @@ unknown fields are ignored on both sides, so either side can be newer.
 Each `call_status` entry has `session_ids`, `title`, `state` (`waiting`, `recording`, `problem`
 or `stopped`), `reason` and `reason_text` (null unless `problem`), `started_at`, `started_at_label`,
 `recording_since_label`, `caption_count`, `last_caption_at`, `caption_source` (`channel`, `dom`,
-`none` or null), and `problems` (the last 3, oldest first, each `{reason, reason_text, at,
-at_label}`). Labels are clock times such as `21:02 IST` in the app's settings time zone.
+`none` or null), `problems` (the last 3, oldest first, each `{reason, reason_text, at,
+at_label}`), and `is_video_wanted` (the app records this call's Meet tab video now). Labels are
+clock times such as `21:02 IST` in the app's settings time zone.
 `reason` is one of `captions_off`, `meet_captions_unavailable`, `caption_parse_failures`,
 `captions_silent`, `no_captions`, `extension_disconnected`, `meet_page_away` and
 `huddle_captions_unreadable`. mc-meet shows `reason_text` and needs no other.
@@ -230,9 +236,46 @@ stored value the content script hides the caption region.
   after 1 s, doubling to 60 s, and an alarm retries every 30 s.
 - Extension update. The worker injects fresh content scripts into open Meet tabs. They resume the
   tab's session. The old page hook keeps running until the tab reloads.
+- Tab video. Chrome lets `chrome.tabCapture.getMediaStreamId` read a tab only after the user
+  invokes mc-meet on it: the toolbar icon (opening the popup counts), the "Record this tab's
+  video" context menu entry, or the `toggle-recording` command, Alt+Shift+V unless the user
+  rebinds it. The grant should last while the tab stays on meet.google.com, so one invocation
+  would cover later calls in that tab; this is untested. When the app marks a call
+  `is_video_wanted`, the worker asks for the stream id. A refusal sends `needs_click` and shows
+  `REC?`. One notification per tab asks for a click on the icon or the context menu entry. It
+  waits until the call has a `caption_source` of `channel` or `dom`, or a problem reason: a
+  notification can take the page's focus, and Meet may then ignore mc-meet's captions press.
+  The content script logs `document.hasFocus()` at that press. The invocation starts capture at
+  once. The icon and the context menu entry also retry video that failed. The command always
+  stops a call that records, waits for captions or has a problem, whatever its video state.
+  Pressed on a tab outside Meet, it stops every such call. It resumes a stopped call, and with
+  no call it arms the tab as the icon does. A stop or resume from the command is held while
+  the native port is down.
+- App silence. The app repeats `call_status` at least every 5 s while a call wants video. Each
+  fragment checks the time since the last one on the monotonic clock; after 10 s the worker
+  stops the capture with `app_silent`.
+- Offscreen capture. One offscreen document (reasons `USER_MEDIA` and `AUDIO_PLAYBACK`) takes the
+  stream id at a fixed 1280x720, so Chrome letterboxes the tab. A VideoEncoder in realtime mode
+  encodes 15 fps as HEVC, or H.264 where HEVC has no encoder, with a keyframe every 2 s. Each
+  fragment runs from one keyframe to the next. A part takes `Date.now() - performance.now()` at
+  its first frame and places its frames by `performance.now()` and frame timestamps. When that
+  offset moves by over 1 s (a sleep stops `performance.now()`), a new part starts with fresh
+  decode times. Each fragment sends its part's offset and the current one. The app keeps the
+  first part's offset for later parts and logs the step, unless the audio reported a sleep or
+  started a new segment since; then the new part's offset holds. A fragment that would take a
+  new offset is dropped when its own offset differs from its part's by over 1 s: it is the
+  pre-sleep part's open fragment, sent after the wake. Such a fragment is also dropped when it
+  ends before the audio's last start, which catches one the reconnect buffer held across the
+  sleep. An AudioContext plays the tab
+  audio, since capture mutes the tab, and each fragment carries its `outputLatency` and
+  `baseLatency`. A stop flushes the last fragment and replies with its index. The app drops
+  the whole fragment that holds the user's stop, so no video after the stop is kept; up to 2 s
+  before the stop are lost with it. A stop because the tab left Meet drops the open fragment
+  and the encoder's queue instead, since those frames may show another page.
 - Permissions: `nativeMessaging`, `storage`, `unlimitedStorage` (a long call queued while the app
   is down), `alarms`, `scripting` (the update injection), `notifications` (the app is not
-  running), host `https://meet.google.com/*`.
+  running, or the tab needs its click), `tabCapture` and `offscreen` (tab video),
+  `contextMenus` (the record entry), host `https://meet.google.com/*`.
 
 ## Call status
 
@@ -245,6 +288,7 @@ app is not reachable.
 | Waiting | grey ring | `…` | `Waiting for captions` |
 | Recording | red dot | `REC` | `Recording since 21:02 IST` |
 | Problem | amber | `!` | `Not recording: <reason>` |
+| Video needs the click | amber | `REC?` | `Click to record this tab's video` |
 | Stopped by the user | grey ring | none | `Recording stopped` |
 | App not reachable | grey ring, crossed out | `OFF` | `Meeting Capture is not running` |
 

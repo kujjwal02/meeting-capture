@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use jiff::Timestamp;
+use jiff::{SignedDuration, Timestamp};
 use serde::Serialize;
 use sources::Platform;
 
@@ -18,7 +18,7 @@ use call_folder::FolderLock;
 
 use crate::manifest::{
     FragmentRecord, FrameCounts, VideoCodec, VideoManifest, VideoRepair, VideoSegmentRecord,
-    VideoSegmentState,
+    VideoSegmentState, VideoSource,
 };
 use crate::playlist::{PLAYLIST_FILE_NAME, Playlist, PlaylistEntry};
 use crate::writer::final_name_of_partial;
@@ -179,6 +179,9 @@ fn unlisted_segment(
         audio_segment: None,
         call_id,
         platform,
+        // Only a window segment can lack its entry: the app lists a Meet tab segment before it
+        // writes any file in it, and both writers list a part before its fragments.
+        source: VideoSource::Window,
         state: VideoSegmentState::Recovered,
         folder,
         playlist: PLAYLIST_FILE_NAME.to_owned(),
@@ -197,6 +200,7 @@ fn unlisted_segment(
         frames: FrameCounts::default(),
         stream_rebuilds: 0,
         stopped_by: None,
+        playback_latency_ms: None,
         repair: None,
     }
 }
@@ -229,6 +233,8 @@ fn repair_segment(
     let mut part = 0_u32;
     let mut fragments_added = 0_u32;
     let mut previous_end_ns: Option<u64> = None;
+    // A Meet tab segment's frames carry UTC instead of host time.
+    let mut previous_end_at: Option<Timestamp> = None;
     for entry in listed.entries {
         match &entry {
             PlaylistEntry::Init { file } => {
@@ -238,11 +244,9 @@ fn repair_segment(
                 part += 1;
                 // A part starts where its first frame is, not where the last part ended: a
                 // window change or a stall lies between them.
-                previous_end_ns = segment
-                    .parts
-                    .iter()
-                    .find(|record| record.init == *file)
-                    .map(|record| record.first_host_time_ns);
+                let part_record = segment.parts.iter().find(|record| record.init == *file);
+                previous_end_ns = part_record.and_then(|record| record.first_host_time_ns);
+                previous_end_at = part_record.and_then(|record| record.first_frame_at);
             }
             PlaylistEntry::Fragment { file, duration_ms } => {
                 let Ok(metadata) = std::fs::metadata(segment_dir.join(file)) else {
@@ -261,6 +265,7 @@ fn repair_segment(
                         // Fragments follow each other with no hole, so one starts where the last
                         // ended.
                         first_host_time_ns: previous_end_ns,
+                        first_frame_at: previous_end_at,
                         duration_ms: *duration_ms,
                         bytes: metadata.len(),
                     }
@@ -268,6 +273,13 @@ fn repair_segment(
                 previous_end_ns = record
                     .first_host_time_ns
                     .map(|first| first.saturating_add(ms_to_ns(record.duration_ms)));
+                previous_end_at = record.first_frame_at.and_then(|first| {
+                    first
+                        .checked_add(SignedDuration::from_nanos(
+                            i64::try_from(ms_to_ns(record.duration_ms)).ok()?,
+                        ))
+                        .ok()
+                });
                 fragments.push(record);
             }
         }

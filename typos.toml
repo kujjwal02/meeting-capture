@@ -4,6 +4,9 @@ extend-exclude = ["*.lock"]
 [default.extend-words]
 # India Standard Time.
 IST = "IST"
+# ISO BMFF box names in the fMP4 writer.
+trak = "trak"
+trun = "trun"
 
 [default.extend-identifiers]
 # cidre 0.29 spells the VideoToolbox average bit rate key this way.
