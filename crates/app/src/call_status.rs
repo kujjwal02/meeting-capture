@@ -699,13 +699,19 @@ impl TrackedCall {
                 // The DOM reader does not need the frames.
                 let is_frames_failing = meet.is_caption_frames_failing
                     && meet.caption_source != Some(HealthSource::Dom);
+                // Meet's button can read "unavailable" while mc-meet's channels keep streaming
+                // captions, so it is a cause only when the channel is not the source.
                 match meet.captions {
-                    MeetCaptions::Unavailable => Some(ProblemReason::MeetCaptionsUnavailable),
-                    MeetCaptions::On | MeetCaptions::Off if is_frames_failing => {
+                    MeetCaptions::Unavailable if is_off_a_cause => {
+                        Some(ProblemReason::MeetCaptionsUnavailable)
+                    }
+                    MeetCaptions::On | MeetCaptions::Off | MeetCaptions::Unavailable
+                        if is_frames_failing =>
+                    {
                         Some(ProblemReason::CaptionParseFailures)
                     }
                     MeetCaptions::Off if is_off_a_cause => Some(ProblemReason::CaptionsOff),
-                    MeetCaptions::On | MeetCaptions::Off => {
+                    MeetCaptions::On | MeetCaptions::Off | MeetCaptions::Unavailable => {
                         (quiet_for >= SILENCE_LIMIT).then_some(ProblemReason::CaptionsSilent)
                     }
                 }

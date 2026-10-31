@@ -502,10 +502,12 @@
     if (!call || !isInCall) return;
     if (nowMs - call.last_seen_ms >= 5000) storeSession();
 
+    const button = globalThis.mcMeetReadCaptionsButton();
     const decision = captionSource.decide({
       kind: "tick",
       atMs: nowMs,
-      isCaptionsOn: globalThis.mcMeetReadCaptionsButton().isOn,
+      isCaptionsOn: button.isOn,
+      isCaptionsUnavailable: button.isUnavailable,
     });
     follow(decision);
     if (decision.isCaptionsRequestDue) requestCaptions(nowMs);
