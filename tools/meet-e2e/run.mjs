@@ -334,11 +334,23 @@ const idleSleepHolds = () =>
 // script cannot click the tray: a Tauri tray menu is not in the accessibility tree.
 // The worker drops a popup port from a tab, so popup.html opened with Target.createTarget is
 // refused. The action popup has no tab, and the worker can open it.
-async function pressRecordingButton(cdp, workerSessionId, extensionId, type) {
+async function pressRecordingButton(cdp, workerSessionId, extensionId, meetingCode, type) {
   const popupUrl = `chrome-extension://${extensionId}/popup/popup.html`;
   const opened = await cdp.send(
     "Runtime.evaluate",
-    { expression: "chrome.action.openPopup()", awaitPromise: true, userGesture: true },
+    {
+      // openPopup refuses an inactive window, and the guest browser or another app may be in front.
+      // The profile can hold other Meet tabs in other windows. The host's URL is
+      // /meet/<code> or /<code>, so match the test's meeting code.
+      expression: `(async () => {
+        const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
+        const meet = tabs.find((tab) => new URL(tab.url).pathname.endsWith("/${meetingCode}"));
+        await chrome.windows.update(meet.windowId, { focused: true });
+        await chrome.action.openPopup({ windowId: meet.windowId });
+      })()`,
+      awaitPromise: true,
+      userGesture: true,
+    },
     workerSessionId,
   );
   if (opened.result?.exceptionDetails)
@@ -567,7 +579,7 @@ try {
     readLog(meetingCode)?.events.find((event) => event.kind === "chat" && event.text === chatText),
   );
 
-  await pressRecordingButton(cdp, workerSessionId, loaded.result.id, "stop_recording");
+  await pressRecordingButton(cdp, workerSessionId, loaded.result.id, meetingCode, "stop_recording");
   step("pressed Stop recording this call in mc-meet's popup");
   const afterStop = await until("the helper exits with every segment closed", 15000, () => {
     const audio = readAudio(callDir);
@@ -581,7 +593,13 @@ try {
   );
   expect(idleSleepHolds().length === 0, "macOS may idle sleep once recording stops");
   await sleep(10000);
-  await pressRecordingButton(cdp, workerSessionId, loaded.result.id, "resume_recording");
+  await pressRecordingButton(
+    cdp,
+    workerSessionId,
+    loaded.result.id,
+    meetingCode,
+    "resume_recording",
+  );
   step("pressed Resume recording in mc-meet's popup");
   await until("the helper records the next segment", 30000, () => {
     const audio = readAudio(callDir);
@@ -634,18 +652,13 @@ try {
     Math.abs(Date.parse(chat.at) - sentMs) < 15000,
     `chat time within 15 s of sending (${chat.at})`,
   );
-  // Captions read as off until mc-meet first turns them on.
-  const shownIndex = healths.findIndex((health) => health.captions_on === true);
-  const hiddenAt =
-    shownIndex === -1
-      ? undefined
-      : healths.slice(shownIndex).find((health) => health.captions_on === false)?.at;
-  expect(hiddenAt !== undefined, "mc-meet turned captions off");
+  // Meet's captions button may read on: its state does not matter, only what is on screen.
   expect(
-    captions.filter((caption) => caption.at > hiddenAt).length >= 3,
-    "3 captions arrived after captions went off",
+    healths.length > 0 && healths.every((health) => health.caption_box_shown === false),
+    "Meet's caption box never showed",
   );
-  expect(healths.at(-1)?.captions_on === false, "the last health event has captions off");
+  const resumedCaptions = captions.filter((caption) => caption.at > resumedEvent.at).length;
+  expect(resumedCaptions >= 3, `${resumedCaptions} captions after recording_resumed`);
   expect(note.includes(chatText), "the note has the chat message");
   expect(
     audio.segments.length >= 2,
@@ -692,9 +705,10 @@ try {
     } catch {}
   }
 } finally {
+  // Each session has more than one tab, such as the host's first about:blank. Close them all.
   for (const who of ["host", "guest"]) {
     try {
-      patchrome(who, "close");
+      patchrome(who, "session", "close");
     } catch {}
   }
   // A worker with queued events starts the app through host mode, and that app points the host

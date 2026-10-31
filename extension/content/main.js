@@ -215,6 +215,8 @@
     lastHealthKey = "";
     if (channelRoster) sendRoster(channelRoster);
     follow(captionSource.decide({ kind: "call_began", atMs: call.page_started_ms }));
+    // The hook may have opened its channels before the page showed the call controls.
+    askHookToTalk();
   }
 
   function endCall(reason) {
@@ -246,6 +248,7 @@
     const health = {
       source,
       captionsOn: button.isOn,
+      captionBoxShown: globalThis.mcMeetIsCaptionBoxShown(),
       captionsUnavailable: button.isUnavailable,
       captionFramesFailing: isCaptionFramesFailing,
       parseFailures,
@@ -264,42 +267,22 @@
     if (decision.reportsHealth) reportHealth();
   }
 
-  // Meet sends nothing on the caption channels until its captions are on, and the DOM reader
-  // needs them visible. Never touches the caption language.
-  function clickCaptionsOn(nowMs) {
+  // Meet streams nothing on the caption channels until something asks for captions. Pressing
+  // Meet's captions control asks. Meet's captions button reads on about 30 s later, but Meet
+  // renders no caption box, since the captions go to the hook's channels. A second press stops
+  // the stream, so the policy asks for one press per call. Never touches the caption language.
+  function requestCaptions(nowMs) {
     const button = findIconButton(selectors.captionsOffIcon);
     if (button) {
-      captionSource.decide({ kind: "captions_clicked", atMs: nowMs });
+      captionSource.decide({ kind: "captions_requested", atMs: nowMs });
       button.click();
       return;
     }
-    if (captionsMenuPressed() !== "false") return;
-    captionSource.decide({ kind: "captions_clicked", atMs: nowMs });
-    pressCaptionsShortcut();
-  }
-
-  // The caption box covers a shared screen. Meet keeps streaming to channels mc-meet opened.
-  function clickCaptionsOff(nowMs) {
-    const button = findIconButton(selectors.captionsOnIcon);
-    if (button) {
-      captionSource.decide({ kind: "captions_hidden", atMs: nowMs });
-      button.click();
-      return;
-    }
-    if (captionsMenuPressed() !== "true") return;
-    captionSource.decide({ kind: "captions_hidden", atMs: nowMs });
-    pressCaptionsShortcut();
-  }
-
-  // The "Captions and translation" button's aria-pressed, or null where Meet has no such button.
-  function captionsMenuPressed() {
-    return findIconButton(selectors.captionsMenuIcon)?.getAttribute("aria-pressed") ?? null;
-  }
-
-  // Behind the "Captions and translation" button the captions toggle sits in a popup, and its
-  // "on" icon is a plain check mark. Meet's C shortcut toggles captions without the popup, so
-  // callers check aria-pressed first.
-  function pressCaptionsShortcut() {
+    // Behind the "Captions and translation" button the toggle sits in a popup. Meet's C
+    // shortcut presses it without the popup.
+    const menuButton = findIconButton(selectors.captionsMenuIcon);
+    if (menuButton?.getAttribute("aria-pressed") !== "false") return;
+    captionSource.decide({ kind: "captions_requested", atMs: nowMs });
     for (const type of ["keydown", "keyup"]) {
       document.body.dispatchEvent(
         new KeyboardEvent(type, {
@@ -329,13 +312,12 @@
       if (cutUtterances.has(key)) return;
       liveUtterances.add(key);
     }
-    if (isRecordingStopped && (event.kind === "caption" || event.kind === "chat")) return;
-    if (event.kind === "caption") {
-      if (origin === "channel") {
-        follow(captionSource.decide({ kind: "channel_caption", atMs: Date.now() }));
-      }
-      if (captionSource.health().source !== origin) return;
+    // The policy hears of channel captions during a stop too, or it would start the DOM reader.
+    if (event.kind === "caption" && origin === "channel") {
+      follow(captionSource.decide({ kind: "channel_caption", atMs: Date.now() }));
     }
+    if (isRecordingStopped && (event.kind === "caption" || event.kind === "chat")) return;
+    if (event.kind === "caption" && captionSource.health().source !== origin) return;
     send(event);
   }
 
@@ -504,8 +486,7 @@
 
     const decision = captionSource.decide({ kind: "tick", atMs: nowMs });
     follow(decision);
-    if (decision.isCaptionsClickDue) clickCaptionsOn(nowMs);
-    if (decision.isCaptionsHideDue && isHidingCaptions) clickCaptionsOff(nowMs);
+    if (decision.isCaptionsRequestDue) requestCaptions(nowMs);
 
     const isRosterLate = nowMs - call.page_started_ms >= ROSTER_WAIT_MS;
     if (!isRosterFromChannel && isRosterLate && nowMs - lastDomRosterMs >= DOM_ROSTER_EVERY_MS) {

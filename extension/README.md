@@ -47,8 +47,9 @@ was not running when the tab opened.
    - one `call_started` line;
    - a `health` line with `"source":"channel"` once someone speaks. `"source":"dom"` means the
      channels gave no caption in 20 s, and `detail` says why;
-   - with `[meet] hide_captions` on, a `health` line with `"captions_on":false` a few seconds
-     after the first caption, and `caption` lines after it;
+   - every `health` line has `"caption_box_shown":false`: Meet's caption box never shows.
+     `"captions_on"` turns true about 30 s in: mc-meet pressed Meet's captions button once to
+     start the stream, and the button reads on with no box;
    - `roster` lines with your name and `"is_self":true`;
    - `caption` lines whose `version` grows for one `utterance_id`.
 4. Leave the call. A `call_ended` line with `"reason":"left"` follows within about 4 s.
@@ -61,9 +62,8 @@ failing frames; `just replay-frames <report folder>` runs them through `page/wir
 
 - No network requests, telemetry, remote config or downloads. The popup shows what the app
   reports and talks only to the service worker.
-- The extension never changes the caption language. It turns Meet's captions on when the call
-  starts, because Meet streams no captions until they are on. With the app's `[meet]
-  hide_captions` on, it turns them off after the first channel caption and keeps recording.
+- The extension never changes the caption language, and presses Meet's captions
+  button at most once per call: a second press would stop the caption stream.
 - Plain JavaScript, no build step, no npm packages. `biome check extension/` must pass.
 
 ## Licences

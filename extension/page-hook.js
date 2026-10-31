@@ -83,8 +83,9 @@
         .then(async () => {
           const bytes = await frameBytes(data);
           if (!bytes) return;
-          const { ack } = await reader.frame(label, bytes);
-          if (ack && ownChannels.has(channel) && channel.readyState === "open") channel.send(ack);
+          const { acks = [] } = await reader.frame(label, bytes);
+          if (!ownChannels.has(channel)) return;
+          for (const ack of acks) if (channel.readyState === "open") channel.send(ack);
         })
         .catch(() => {});
     });
@@ -163,6 +164,9 @@
           const state = connection.connectionState;
           if ((state === "closed" || state === "failed") && meetingConnection === connection) {
             meetingConnection = undefined;
+            // A rejoin in this tab must wait for the new connection's channels.
+            captionChannelsOpenedAt = undefined;
+            postHookState();
           }
         });
       } catch {}

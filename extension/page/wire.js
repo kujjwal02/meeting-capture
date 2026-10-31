@@ -199,17 +199,35 @@
   // ---- Meet messages. Each decoder returns { ok: true, ... } or { ok: false, reason }.
 
   // captions_v2: CaptionsV2Packet { 1: utterance { 1: id, 2: version, 3: caption { 3: text,
-  // 4: language, 6: device id } } }. Meet also sends the utterance one level deeper, at 1.1.
-  // An utterance's field 1 is a varint id, a wrapper's is a message, so field 3 tells them apart.
+  // 4: language, 6: device id } } }. Meet also wraps utterances one level deeper, at 1.1, next to
+  // status entries that hold no caption. An utterance's field 1 is a varint id, a wrapper's is a
+  // message, so field 3 tells them apart. A wrapper with fields but no utterance is a control
+  // frame: Meet sends one each second while the channel is open.
   function decodeCaptionV2(bytes) {
-    let utterance;
+    let utterances;
     try {
       const first = messageField(parseFields(bytes), 1);
-      utterance = first && !first.has(3) ? messageField(first, 1) : first;
+      if (!first) return { ok: false, reason: "no-utterance" };
+      if (first.has(3)) {
+        utterances = [first];
+      } else {
+        utterances = repeatedMessages(first, 1).filter((entry) => entry.has(3));
+        if (utterances.length === 0 && first.size > 0) {
+          return { ok: false, control: true, reason: "control" };
+        }
+      }
     } catch {
       return { ok: false, reason: "decode-threw" };
     }
-    if (!utterance) return { ok: false, reason: "no-utterance" };
+    if (utterances.length === 0) return { ok: false, reason: "no-utterance" };
+    // One bad utterance must not drop the good ones next to it. The frame fails only when none
+    // decode, and then with the first reason.
+    const decoded = utterances.map(decodeUtteranceV2);
+    const captions = decoded.filter((caption) => caption.ok);
+    return captions.length > 0 ? { ok: true, captions } : decoded[0];
+  }
+
+  function decodeUtteranceV2(utterance) {
     try {
       const caption = messageField(utterance, 3);
       const deviceId = caption ? stringField(caption, 6) : undefined;
@@ -553,7 +571,7 @@
       });
     }
 
-    // Decodes one data channel frame. Returns { ack } for a captions_v2 caption, so the
+    // Decodes one data channel frame. Returns { acks }, one per captions_v2 utterance, so the
     // hook can ack frames on channels it opened itself.
     async function frame(label, data) {
       if (!counters[label]) return {};
@@ -568,8 +586,12 @@
         const result = decodeCaptionV2(bytes);
         noteResult(label, result, bytes, data);
         if (!result.ok) return {};
-        emitCaption(label, result);
-        return { ack: encodeCaptionV2Ack(result.utteranceId, result.version) };
+        for (const caption of result.captions) emitCaption(label, caption);
+        return {
+          acks: result.captions.map((caption) =>
+            encodeCaptionV2Ack(caption.utteranceId, caption.version),
+          ),
+        };
       }
       if (label === "captions") {
         const result = decodeCaptionV1(bytes);

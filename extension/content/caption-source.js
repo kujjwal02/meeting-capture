@@ -4,23 +4,26 @@
 //
 // Facts, by kind:
 //   call_began           { atMs } the page joined a call
-//   call_ended           the call ended; the captions click budget starts again
+//   call_ended           the call ended
 //   session_dropped      the worker ended the session while the page was away
 //   hook_state           { channelsOpenedAtMs } when the page hook opened the caption channels
 //   channel_open_failed  { label, error } the page hook could not open a caption channel
 //   channel_caption      { atMs } a caption arrived on a channel, in a call
 //   parse_gap            { atMs, channel, parseFailures, detail, isInCall } frames failed to decode
 //   tick                 { atMs } the content script's once-a-second check, in a call
-//   captions_clicked     { atMs } main.js clicked Meet's captions button
-//   captions_hidden      { atMs } main.js turned Meet's captions off; the channel keeps streaming
+//   captions_requested   { atMs } main.js clicked Meet's control that turns captions on
 //
-// decide returns { source, health, reportsHealth, isCaptionsClickDue, isCaptionsHideDue }. source is "none",
+// decide returns { source, health, reportsHealth, isCaptionsRequestDue }. source is "none",
 // "channel" or "dom". health holds the health event fields this policy owns.
+//
+// Meet streams nothing on the hook's caption channels until something asks for captions. A click
+// on Meet's captions control asks the server, and the stream goes to the hook's channels. While
+// the hook's captions_v2 is open, Meet renders no caption box. About 30 s later Meet's captions
+// button reads on, still with no box. A second press stops the stream, so the policy asks for
+// exactly one press per call.
 
 // The DOM reader starts when no caption arrives this long after the caption channels open.
 const MC_MEET_CAPTION_WAIT_MS = 20000;
-const MC_MEET_CAPTIONS_CLICK_ATTEMPTS = 3;
-const MC_MEET_CAPTIONS_CLICK_GAP_MS = 2000;
 
 globalThis.mcMeetCreateCaptionSourcePolicy = () => {
   let source = "none";
@@ -31,12 +34,8 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
   let pageStartedMs = 0;
   let channelsOpenedAtMs = null;
   let lastChannelCaptionMs = null;
-  let captionsClicks = 0;
-  let lastCaptionsClickMs = 0;
-  // Once hidden, mc-meet never turns captions back on itself, so a user who wants them can.
-  let isCaptionsHidden = false;
-  // Hiding before the current channels carry a caption would stop them from ever starting.
-  let hasCaptionOnOpenChannels = false;
+  // main.js pressed Meet's captions control in this call.
+  let isCaptionsRequested = false;
 
   const health = () => ({ source, parseFailures, detail, isCaptionFramesFailing });
 
@@ -45,9 +44,6 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
     if (source === "dom") return false;
     source = "dom";
     detail = reason;
-    captionsClicks = 0;
-    // The DOM reader needs Meet's captions on.
-    isCaptionsHidden = false;
     return true;
   }
 
@@ -58,48 +54,31 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
     return true;
   }
 
-  function isCaptionsClickDue(atMs) {
-    return (
-      !isCaptionsHidden &&
-      captionsClicks < MC_MEET_CAPTIONS_CLICK_ATTEMPTS &&
-      atMs - lastCaptionsClickMs >= MC_MEET_CAPTIONS_CLICK_GAP_MS
-    );
-  }
-
   // Returns whether health is due.
   function apply(fact) {
     switch (fact.kind) {
       case "call_began":
         source = "none";
         pageStartedMs = fact.atMs;
+        channelsOpenedAtMs = null;
         lastChannelCaptionMs = null;
-        isCaptionsHidden = false;
-        hasCaptionOnOpenChannels = false;
+        isCaptionsRequested = false;
         isCaptionFramesFailing = false;
         return true;
       case "call_ended":
         source = "none";
-        captionsClicks = 0;
         return false;
       case "session_dropped":
         source = "none";
         return false;
       case "hook_state":
         channelsOpenedAtMs = fact.channelsOpenedAtMs;
-        // New channels on a new peer connection need Meet's captions on to start streaming.
-        isCaptionsHidden = false;
-        hasCaptionOnOpenChannels = false;
-        isCaptionFramesFailing = false;
-        // "channel" says a caption arrived on the open channels. The new ones have to show it
-        // again, or the DOM reader takes over after the wait.
-        if (source === "channel") source = "none";
         return true;
       case "channel_open_failed":
         detail = `opening ${fact.label} failed: ${fact.error}`;
         return true;
       case "channel_caption": {
         lastChannelCaptionMs = fact.atMs;
-        hasCaptionOnOpenChannels = true;
         const wasFailing = isCaptionFramesFailing;
         isCaptionFramesFailing = false;
         return useChannel() || wasFailing;
@@ -116,6 +95,9 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         if (fact.isInCall && isCaptionChannel && isChannelQuiet) return useDom(fact.detail);
         return true;
       }
+      case "captions_requested":
+        isCaptionsRequested = true;
+        return false;
       case "tick": {
         const waitStartMs = Math.max(pageStartedMs, channelsOpenedAtMs ?? 0);
         if (source !== "none" || fact.atMs - waitStartMs < MC_MEET_CAPTION_WAIT_MS) return false;
@@ -125,13 +107,6 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
             : "page hook did not open the caption channels",
         );
       }
-      case "captions_clicked":
-        captionsClicks += 1;
-        lastCaptionsClickMs = fact.atMs;
-        return false;
-      case "captions_hidden":
-        isCaptionsHidden = true;
-        return false;
     }
   }
 
@@ -142,12 +117,12 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         source,
         health: health(),
         reportsHealth,
-        isCaptionsClickDue: fact.kind === "tick" && isCaptionsClickDue(fact.atMs),
-        isCaptionsHideDue:
+        isCaptionsRequestDue:
+          // Before the hook's channels open, a request would turn Meet's caption box on.
           fact.kind === "tick" &&
-          source === "channel" &&
-          hasCaptionOnOpenChannels &&
-          !isCaptionsHidden,
+          channelsOpenedAtMs !== null &&
+          source !== "channel" &&
+          !isCaptionsRequested,
       };
     },
     health,

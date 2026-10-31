@@ -96,7 +96,7 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `caption` | `at`, `device_id`, `utterance_id`, `version`, `speaker`, `text`, `source` (`channel` or `dom`) |
 | `chat` | `at`, `message_id`, `device_id` (channel only), `sender`, `text`, `source` |
 | `roster` | `at`, `participants`: list of `{device_id, name, is_self}`, the whole list each time it changes |
-| `health` | `at`, `source` (`channel`, `dom` or `none`), `captions_on` (Meet's captions button is on, and Meet does not refuse captions), `captions_unavailable` (Meet refuses captions), `caption_frames_failing` (caption frames fail to decode, with no caption decoded since), `parse_failures`, `detail` |
+| `health` | `at`, `source` (`channel`, `dom` or `none`), `captions_on` (Meet's captions button is on, and Meet does not refuse captions), `caption_box_shown` (Meet's caption box is on screen), `captions_unavailable` (Meet refuses captions), `caption_frames_failing` (caption frames fail to decode, with no caption decoded since), `parse_failures`, `detail` |
 | `recording_stopped` | `at`; the app writes it, with no `seq` |
 | `recording_resumed` | `at`; the app writes it, with no `seq` |
 | `call_ended` | `at`, `reason` (`left`, `tab_closed`, `kicked`, `page_unload`; the app writes `idle` and `app_restarted`) |
@@ -168,7 +168,7 @@ could not write gets no `ack`.
 
 `settings` holds `hide_captions`, the app's `[meet] hide_captions`. The worker stores it in
 `chrome.storage.local`, and the content script reads it at load and on each change. Without a
-stored value the content script hides captions.
+stored value the content script hides the caption region.
 
 ## Sessions
 
@@ -191,25 +191,24 @@ stored value the content script hides captions.
 ## Extension internals
 
 - Caption source. The hook opens `captions` and `captions_v2` on the peer connection that carries
-  `collections`. Meet sends nothing on them until its captions are on, so the content script
-  clicks the captions button when the call starts if captions are off, at most 3 times per caption
-  source. Some accounts' Meet has a "Captions and translation" button (icon `translate_cc`) in
-  place of the captions button. It opens a popup that holds the captions toggle, and its
-  `aria-pressed` says whether captions are on. There the content script presses Meet's C shortcut
-  instead, and only when `aria-pressed` shows the opposite state, since C toggles. When no caption
-  arrives within 20 s of opening the channels, or 10 caption frames in a row fail to decode with
-  no good caption in the last 20 s, the content script reads the caption region in the DOM.
-  The first channel caption after that switches back to the channel and stops the DOM reader.
-  `extension/content/caption-source.js` holds these rules. It reads no DOM and no clock, so it
-  also runs in Node. `content/main.js` feeds it timestamped facts and runs the reader it picks.
+  `collections`. Meet streams nothing to them until something asks for captions, so the content
+  script presses Meet's captions button once, or Meet's C shortcut where the account has the
+  "Captions and translation" button. The stream then goes to the hook's channels, and Meet's
+  caption box never shows. About 30 s later Meet's captions button may read on, still with no
+  box. A second press would stop the stream, so mc-meet presses only once. Some Meet builds also
+  open their own negotiated `captions_v2` channel at call start. The hook reads it too. When no
+  caption arrives within 20 s of opening the channels, or 10 caption frames in a row fail to
+  decode with no good caption in the last 20 s, the content
+  script reads the caption region in the DOM. That region exists only while the user has Meet's
+  captions on. The first channel caption after that switches back to the channel and stops the
+  DOM reader. Channel captions count while recording is stopped, so a stop does not start the
+  DOM reader. `extension/content/caption-source.js` holds these rules. It reads no DOM and no
+  clock, so it also runs in Node. `content/main.js` feeds it timestamped facts and runs the
+  reader it picks.
 - Hidden captions. Meet's caption box covers a shared screen. With `hide_captions` on, the
-  content script turns Meet's captions off after the first channel caption, so the box shows for
-  a few seconds at call start. Turning captions off makes Meet close its own caption channel and
-  stop streaming captions. The page hook blocks `close()` on caption channels it did not open,
-  and Meet keeps streaming to the hook's channels. Once hidden, the content script never turns
-  captions back on in that call, so a user who wants them can. A new peer connection turns them on
-  again until its channels carry a caption. While the DOM reader runs, captions stay on and the
-  caption region gets `display: none`. Meet keeps writing captions into the hidden region.
+  caption region gets `display: none` while the DOM reader runs. Meet keeps writing captions
+  into the hidden region. Turning captions off makes Meet close its own caption channel, and the
+  page hook blocks `close()` on caption channels it did not open.
 - The DOM reader makes one utterance of each speaker turn. Meet did not trim a 1200-character
   monologue in the caption region, so one speaker talking alone gives one caption line, and a call
   with fewer than 3 lines writes no note.
