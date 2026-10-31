@@ -481,6 +481,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-shortcut"
+version = "0.7.1"
+dependencies = [
+ "dispatch2",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-application-services",
+ "objc2-core-graphics",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "bs58"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2798,6 +2810,7 @@ name = "meeting-capture"
 version = "0.7.1"
 dependencies = [
  "base64 0.22.1",
+ "browser-shortcut",
  "call-folder",
  "capture-protocol",
  "huddle-captions",
@@ -3236,6 +3249,7 @@ checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
 dependencies = [
  "bitflags 2.13.2",
  "dispatch2",
+ "libc",
  "objc2",
  "objc2-core-foundation",
  "objc2-io-surface",

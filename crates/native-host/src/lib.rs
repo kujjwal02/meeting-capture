@@ -79,6 +79,7 @@ async fn relay(origin: &str, socket: &Path) -> io::Result<()> {
         "type": "host_hello",
         "origin": origin,
         "host_version": env!("CARGO_PKG_VERSION"),
+        "browser_pid": browser_pid(),
     });
     // It travels with the extension's frames, so it takes their limit.
     send_json(
@@ -129,6 +130,22 @@ async fn relay(origin: &str, socket: &Path) -> io::Result<()> {
         relayed = chrome_to_app => relayed,
         relayed = app_to_chrome => relayed,
     }
+}
+
+/// The browser that started this host, so the app can press a key into that browser alone.
+/// On macOS Chrome starts the host itself, so it is the parent; the dev wrapper script `exec`s
+/// the host and keeps that parent. The app trusts this pid only as far as its bundle id: any
+/// process of the user can connect to the socket and claim a pid, so the app posts a key only
+/// to a pid whose app is a Chromium browser.
+#[cfg(unix)]
+fn browser_pid() -> serde_json::Value {
+    std::os::unix::process::parent_id().into()
+}
+
+/// On Windows Chrome starts the host through `cmd.exe`, so the parent is not the browser.
+#[cfg(windows)]
+fn browser_pid() -> serde_json::Value {
+    serde_json::Value::Null
 }
 
 async fn send_json<W: AsyncWrite + Unpin>(

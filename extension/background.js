@@ -15,7 +15,7 @@
 // tab-video.js owns the Meet tab video capture and its own chrome.storage.session keys.
 
 import { decide, hasOpenSessions, restoreState, STATE_KEYS } from "./session-rules.js";
-import { createTabVideo, NEEDS_CLICK_KEY } from "./tab-video.js";
+import { createTabVideo, NEEDS_CLICK_KEY, VIDEO_CAPTURE_KEY } from "./tab-video.js";
 
 const HOST_NAME = "com.meetingcapture.app";
 const PROTOCOL = 1;
@@ -220,8 +220,26 @@ async function noteAppReachable(isReachable, appVersion) {
   await showStatusOnTabs();
 }
 
+// What a call problem keeps from the record, by the app's problem reason code.
+function notRecordedOf(reason) {
+  switch (reason) {
+    case "captions_off":
+    case "meet_captions_unavailable":
+    case "caption_parse_failures":
+    case "captions_silent":
+    case "no_captions":
+    case "huddle_captions_unreadable":
+      return "captions";
+    case "extension_disconnected":
+    case "meet_page_away":
+      return "the call's events";
+  }
+  // A code from a newer app.
+  return "the call's events";
+}
+
 // The look of one tab: { icon, badge, title }.
-function lookOf(callStatus, isAppReachable, isVideoClickNeeded) {
+function lookOf(callStatus, isAppReachable, isVideoClickNeeded, isVideoRecording) {
   if (!isAppReachable) {
     return { icon: "off", badge: "OFF", title: "Meeting Capture is not running" };
   }
@@ -241,8 +259,18 @@ function lookOf(callStatus, isAppReachable, isVideoClickNeeded) {
         badge: "REC",
         title: `Recording since ${callStatus.recording_since_label ?? callStatus.started_at_label}`,
       };
-    case "problem":
+    case "problem": {
+      // A bare "!" would hide that the tab's video still records.
+      if (isVideoRecording) {
+        const what = notRecordedOf(callStatus.reason);
+        return {
+          icon: "problem",
+          badge: "REC!",
+          title: `Recording video; not recording ${what}: ${callStatus.reason_text}`,
+        };
+      }
       return { icon: "problem", badge: "!", title: `Not recording: ${callStatus.reason_text}` };
+    }
     case "waiting":
       return { icon: "idle", badge: "…", title: "Waiting for captions" };
     case "stopped":
@@ -259,6 +287,7 @@ async function showStatusOnTabs() {
   const callStatus = (await chrome.storage.session.get(CALL_STATUS_KEY))[CALL_STATUS_KEY];
   const { is_reachable: isAppReachable } = await readAppReachability();
   const needsClick = (await chrome.storage.session.get(NEEDS_CLICK_KEY))[NEEDS_CLICK_KEY] ?? {};
+  const videoCapture = (await chrome.storage.session.get(VIDEO_CAPTURE_KEY))[VIDEO_CAPTURE_KEY];
   const tabs = await chrome.tabs.query({ url: MEET_TABS });
   for (const tab of tabs) {
     const sessionId = tabSessions[tab.id];
@@ -274,7 +303,12 @@ async function showStatusOnTabs() {
         is_stopped: status.state === "stopped",
       });
     }
-    const look = lookOf(status, isAppReachable, tab.id in needsClick);
+    const look = lookOf(
+      status,
+      isAppReachable,
+      tab.id in needsClick,
+      videoCapture?.tab_id === tab.id,
+    );
     const tabId = tab.id;
     await chrome.action
       .setIcon({
@@ -381,6 +415,9 @@ async function closeNativeIfIdle() {
     nativePort.disconnect();
     nativePort = null;
     isWelcomed = false;
+    // The status names calls of other profiles too. Kept past the port, a press here would
+    // read them as this profile's.
+    await chrome.storage.session.remove(CALL_STATUS_KEY);
     await reloadIfPending();
   }
 }
@@ -453,6 +490,8 @@ function connectNative(sessions) {
       serially(() => onAck(message.seq));
     } else if (message?.type === "call_status") {
       serially(() => storeCallStatus({ calls: message.calls ?? [] }));
+    } else if (message?.type === "shortcut_press_expected") {
+      tabVideo.onPressExpected(message.session_id);
     } else if (message?.type === "snapshot_request") {
       serially(() => requestSnapshots(message.session_ids ?? []));
     } else if (message?.type === "debug_report_saved" || message?.type === "debug_report_failed") {
@@ -503,6 +542,7 @@ function sendToApp(message) {
 // Its listeners must register in the worker's first run, as this file's do.
 const tabVideo = createTabVideo({
   sendToApp,
+  isAppWelcomed: () => nativePort !== null && isWelcomed,
   refreshLook: () => serially(showStatusOnTabs),
   readTabSessions: async () => restoreState(await store.readState(), Date.now()).tabSessions,
 });

@@ -326,11 +326,22 @@ Done when:
   the app's fragment writer and finalize ran on a canvas source only, never on a real call.
 - [ ] The tab capture grant lasts while the tab stays on meet.google.com, so later calls in the
   tab start with no click. Untested.
-- [ ] "Resume recording" restarts Meet tab video with no click. Untested.
+- [x] "Resume recording" restarts Meet tab video with no click. `just meet-e2e` stops and
+  resumes through the native messaging protocol, with no popup, and tab capture reopened with no
+  app press.
 - [ ] Measure `MEET_TAB_CALIBRATION_MS` (60 ms, from the tab capture spike) on the first real
   call.
 - [ ] Measure the Meet remote stem trail with Bluetooth output, where the playback latency is
   largest; finalize shifts by the logged output latency plus the calibration.
+- [x] The app presses mc-meet's shortcut into the Chrome that hosts it, so Meet video starts with
+  no click. The press needs Accessibility, read without a prompt; the click stays the fallback.
+  A live `just meet-e2e` run in a fresh test tab with no grant pressed the shortcut while the
+  user's own Chrome, a second Chrome process, was the front app; it recorded tab video and kept
+  the call recording.
+- [ ] The app's shortcut press with a non-US keyboard layout. The app finds the key with
+  `UCKeyTranslate` on the current layout; only the US layout has run.
+- [ ] Windows: press mc-meet's shortcut with `SendInput`. Chrome starts the host through
+  `cmd.exe` there, so the browser process must be found another way first.
 - [ ] Window capture fallback for a Meet tab that never got the click.
 - [ ] Meet video on Windows. It needs finalize and the purge there first.
 

@@ -223,6 +223,11 @@ impl CallBook {
             .collect()
     }
 
+    /// The ports that said `hello` and are still open.
+    pub(super) fn greeted_port_ids(&self) -> HashSet<u64> {
+        self.greeted_ports.keys().copied().collect()
+    }
+
     /// Whether any port said `hello` and is still open.
     pub(super) fn is_extension_connected(&self) -> bool {
         !self.greeted_ports.is_empty()

@@ -28,7 +28,7 @@ flowchart LR
 | Content script | `extension/content/`, isolated world | Finds call start and end, reads the DOM when the channels give nothing, and owns the call session for its tab. |
 | Session rules | `extension/session-rules.js`, service worker | Decides what each tab message, tab change and alarm does to the worker's sessions. Numbers events. Makes no `chrome.*` calls and reads no clock, so it also runs in Node. |
 | Service worker | `extension/background.js` | Stores the session state and queued events in one write, holds the native port, resends after a reconnect. Shows each Meet tab's call status on the toolbar icon. |
-| Tab video | `extension/tab-video.js`, service worker | Picks the Meet tab whose call wants video, asks for its stream id, asks for the click when Chrome refuses, forwards fragments to the app. |
+| Tab video | `extension/tab-video.js`, service worker | Picks the Meet tab whose call wants video, asks for its stream id, tells the app when Chrome refuses so the app can press the shortcut, asks for the click as the fallback, forwards fragments to the app. |
 | Offscreen capture | `extension/offscreen/`, offscreen document | Opens the tab stream, plays its audio back, encodes with WebCodecs and cuts fMP4 fragments (`fmp4.js`, which also runs in Node). |
 | Popup | `extension/popup/` | The active tab's call status and video state, a "Stop recording this call" or "Resume recording" button, and a "Save debug report" button. |
 | Host mode | `crates/native-host`, run by the app binary | Chrome starts `meeting-capture chrome-extension://<id>/`. `main` sees the argument and relays frames between stdio and the app socket before Tauri starts. |
@@ -67,7 +67,9 @@ flowchart LR
   byte order, then UTF-8 JSON. A message to Chrome is at most 1 MB.
 - Host to app and app to host: the same frames with a little-endian length. The host passes every
   frame through unchanged, except the first one it sends the app:
-  `{"type":"host_hello","origin":"chrome-extension://.../","host_version":"0.2.0"}`.
+  `{"type":"host_hello","origin":"chrome-extension://.../","host_version":"0.2.0","browser_pid":123}`.
+  `browser_pid` is the host's parent process, which on macOS is the Chrome that started it. It is
+  null on Windows, where Chrome starts the host through `cmd.exe`.
 - A frame closes the connection when it is over 8 MiB from the extension or over 1 MiB towards
   it. Chrome sends a host up to 64 MiB but takes at most 1 MB from one.
 - When the socket is absent, host mode starts the app and retries the connection every 250 ms for
@@ -90,7 +92,12 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `stop_recording` | `session_id` | The popup's "Stop recording this call" button. The app handles it as the tray row of the same name. |
 | `resume_recording` | `session_id` | The popup's "Resume recording" button. |
 | `save_debug_report` | `session_id` (the popup's tab session, or null), `with_text` | The popup's "Save debug report" button. The app answers `debug_report_failed` for a `session_id` that is not 1 to 64 letters, digits or hyphens. |
-| `video_state` | `session_id`, `state` (`needs_click`, `capturing`, `stopped` or `failed`), `detail` (null, or for `stopped` one of `not_wanted`, `track_ended`, `tab_gone`, `app_silent`; for `failed` the error text), and on `stopped` `capture_id` and `last_index` (the last fragment sent, 0 for none) | Each change of the tab capture for a call that wants video. Held with the fragments while the port is down. |
+| `video_state` | `session_id`, `state` (`needs_click`, `capturing`, `stopped` or `failed`), `detail` (null, or for `stopped` one of `not_wanted`, `track_ended`, `tab_gone`, `app_silent`; for `failed` the error text), on `stopped` `capture_id` and `last_index` (the last fragment sent, 0 for none), and on `needs_click` `meet_tab` (`is_tab_active`, `is_window_last_focused`) and `shortcut` (the bound key from `chrome.commands.getAll()`, such as `⌘⇧U`, or empty) | Each change of the tab capture for a call that wants video. A `needs_click` goes again when the tab is activated or a Chrome window takes focus. Held with the fragments while the port is down. |
+| `shortcut_press_ready` | `session_id` | Reply to `shortcut_press_expected`, sent only by the worker that holds the session, after it read the tab's facts again and they hold. The app presses into the `browser_pid` of the port that sent it. |
+| `shortcut_press_refused` | `session_id` | Reply to `shortcut_press_expected` when the tab no longer waits for the invocation or no longer sits where the press lands. A `needs_click` with the new facts goes first. |
+| `shortcut_press_unseen` | `session_id`, `reason` (`no_command` or `other_tab`) | No command reached the worker within 2 s of its `shortcut_press_ready` (`no_command`), or it reached another tab (`other_tab`). The key went to a window the worker cannot see. |
+| `shortcut_press_noted` | `session_id` (the target's, held by another worker) | Reply to `shortcut_press_expected` from every worker that does not hold the session. It ignores a command for the next 2 s. |
+| `shortcut_press_landed` | `session_id` (the target's, held by another worker) | A command came within 2 s of a `shortcut_press_expected` for a session this worker does not hold. The worker ignores the command, and the app counts the press as missed. |
 | `video_fragment` | `session_id`, `capture_id` (16 hex digits, new per stream), `part`, `codec` (`hevc` or `h264`), `width_px`, `height_px`, `init_base64`, `index`, `first_frame_utc_ms`, `duration_ms`, `frame_count`, `part_clock_offset_ms` (UTC minus `performance.now()` at the part's first frame) and `clock_offset_ms` (the same at this fragment), `playback_latency_ms` and `playback_base_latency_ms` (or null), `bytes_base64` | One fMP4 fragment, about every 2 s while capturing. Not queued or acked: the worker holds the last 30 while the port is down. The app drops a repeat of a `capture_id` and `index` it wrote, a late fragment of a capture a newer one replaced, a fragment older than the call's tab video task, and one whose part predates a sleep the audio reported. |
 
 `event.kind` is one of the kinds below. `extension/call-events.js` builds each of them.
@@ -153,6 +160,7 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `app_unavailable` | none | From host mode when the app did not start in 10 s. |
 | `call_status` | `calls`: one entry per open Meet call, below | After `welcome`, and whenever a call's status changes. |
 | `snapshot_request` | `session_ids` | When a call gets a problem, at most 5 times per call. |
+| `shortcut_press_expected` | `session_id` | Before the app presses mc-meet's shortcut for that session's tab. To every welcomed port: the one that holds the session answers ready or refused, and every other one answers noted. The app presses only after every port welcomed at the notice answered, within 1 s. |
 | `debug_report_saved` | `path` | Reply to `save_debug_report`. |
 | `debug_report_failed` | `error` | Reply to `save_debug_report`. |
 
@@ -242,16 +250,61 @@ stored value the content script hides the caption region.
   tab's session. The old page hook keeps running until the tab reloads.
 - Tab video. Chrome lets `chrome.tabCapture.getMediaStreamId` read a tab only after the user
   invokes mc-meet on it: the toolbar icon (opening the popup counts), the "Record this tab's
-  video" context menu entry, or the `toggle-recording` command, Alt+Shift+V unless the user
-  rebinds it. The grant should last while the tab stays on meet.google.com, so one invocation
-  would cover later calls in that tab; this is untested. When the app marks a call
+  video" context menu entry, or the `toggle-recording` command, Command+Shift+U on the Mac and
+  Alt+Shift+V elsewhere unless the user rebinds it. The grant should last while the tab stays on
+  meet.google.com, so one invocation would cover later calls in that tab; this is untested.
+  When the app marks a call
   `is_video_wanted`, the worker asks for the stream id. A refusal sends `needs_click` and shows
-  `REC?`. One notification per tab asks for a click on the icon or the context menu entry. It
+  `REC?`.
+- Automatic start. On the Mac the app answers `needs_click` by pressing mc-meet's shortcut into
+  the Chrome that started the host, as a real key event posted to that Chrome's pid
+  (`browser_pid`). Chrome counts it as a `commands` invocation, so capture starts with no
+  click. A key posted to the pid reaches Chrome while another app is in front, and Chrome runs
+  the command on the active tab of its last focused window. Measured: with the user's own
+  Chrome in front, the press armed the test Chrome's Meet tab and capture opened 98 ms later.
+  So the app presses only when the Meet tab is the active tab of Chrome's last focused window,
+  and never moves focus. It also needs the Accessibility grant, read with `AXIsProcessTrusted`
+  only; the app never raises the prompt. It maps the bound key from `shortcut` and finds it
+  on the current keyboard layout with `UCKeyTranslate`; an empty or unknown key, or a letter
+  no key types, leaves the click. Before the press the app sends `shortcut_press_expected`.
+  The worker reads the tab's facts again and answers `shortcut_press_ready`, or
+  `shortcut_press_refused` after a `needs_click` with the new facts.
+- Where the press lands. Every Chrome profile runs in one process, and the worker cannot see
+  another profile's windows, an installed app's window or incognito. A press can land in one
+  of them, where no command is bound and the key reaches the page. So the app presses only a
+  shortcut that holds Command or Control, which types no text there; Option+Shift+V would
+  type "◊". The app presses within 1 s of its notice or not at all, so each worker's press
+  window opens at the notice and lasts 2 s, which leaves the key 1 s to arrive. The worker
+  reports `shortcut_press_unseen` when no command arrives within 2 s of its ready reply, or
+  when the command reaches another tab, which it leaves alone. A worker in another profile
+  that also runs mc-meet hears the same `shortcut_press_expected`, since the notice goes to
+  every welcomed port. It answers `shortcut_press_noted`, ignores a command for the next 2 s,
+  and reports `shortcut_press_landed`, so the press cannot stop a call in that profile. The
+  app presses only after every port welcomed at the notice answered, so no worker can get the
+  key before its window opens; a port that does not answer within 1 s, such as an older
+  mc-meet, costs that press. After one missed press the app stops pressing for the call. A
+  worker with no welcomed port does not hear the notice. Its stored `call_status` names the
+  calls of every profile, so the worker drops it when it closes an idle port, and its command
+  stops nothing until a `call_status` comes on a welcomed port. Without that, the app's press
+  for profile A, landing in profile B, would reconnect B and stop A's call. The target then
+  reports the press unseen, and the app does not press again for that call. The app presses
+  only into a pid whose bundle id is Chrome, Chrome Beta, Dev or Canary, or Chromium: the host
+  reports the pid, and any process of the user can reach the app's socket.
+- Retries. When a condition fails, the app tries again on the next `needs_click`, which the
+  worker sends on each tab activation and each Chrome window focus change, and 3 s after a
+  press that opened no stream or a notice that a port did not answer in time. It presses at
+  most once per 3 s, and stops after 3 presses with no stream, after an unseen press, after the
+  stream opens, or when the call ends. Each press and each skip is logged as
+  `video.shortcut_sent` or `video.shortcut_skipped` with `video.press_skip_reason`; the 3-press
+  limit and the unseen press are logged once.
+- The click stays the fallback. One notification per tab asks for a click on the icon or the
+  context menu entry. It
   waits until the call has a `caption_source` of `channel` or `dom`, or a problem reason: a
   notification can take the page's focus, and Meet may then ignore mc-meet's captions press.
   The page snapshot records `document.hasFocus()` at that press. The invocation starts capture at
-  once. The icon and the context menu entry also retry video that failed. The command always
-  stops a call that records, waits for captions or has a problem, whatever its video state.
+  once. The icon and the context menu entry also retry video that failed. On a tab that waits
+  for the invocation, the command only arms it, whoever pressed it. On any other tab it stops
+  a call that records, waits for captions or has a problem, whatever its video state.
   Pressed on a tab outside Meet, it stops every such call. It resumes a stopped call, and with
   no call it arms the tab as the icon does. A stop or resume from the command is held while
   the native port is down.
@@ -292,6 +345,7 @@ app is not reachable.
 | Waiting | grey ring | `…` | `Waiting for captions` |
 | Recording | red dot | `REC` | `Recording since 21:02 IST` |
 | Problem | amber | `!` | `Not recording: <reason>` |
+| Problem while tab video records | amber | `REC!` | `Recording video; not recording captions: <reason>` |
 | Video needs the click | amber | `REC?` | `Click to record this tab's video` |
 | Stopped by the user | grey ring | none | `Recording stopped` |
 | App not reachable | grey ring, crossed out | `OFF` | `Meeting Capture is not running` |

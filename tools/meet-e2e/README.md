@@ -37,7 +37,8 @@ set `MEET_E2E_SIGNING_IDENTITY` to use another.
 4. The host opens a new meeting. The guest asks to join, muted, and the host admits it from the
    toast or the People panel. The guest sends a chat message. Both pages keep their media
    elements muted, so no call audio plays out loud.
-5. The run sends `stop_recording` and then `resume_recording` the way mc-meet's popup does. A
+5. The run sends `stop_recording` and then `resume_recording` through a native host of its own,
+   as mc-meet's worker would. No popup opens, so mc-meet is not invoked on the tab again. A
    script cannot click the tray menu, since it is not in the accessibility tree.
 6. Both leave. The run waits for `call_ended` in the call log and for the note in the vault.
 
