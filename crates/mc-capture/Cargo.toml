@@ -8,6 +8,8 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+call-finalize.workspace = true
+call-folder.workspace = true
 capture.workspace = true
 clap.workspace = true
 serde_json.workspace = true

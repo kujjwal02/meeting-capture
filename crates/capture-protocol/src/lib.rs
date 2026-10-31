@@ -8,6 +8,9 @@ use std::path::PathBuf;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+
+pub mod finalize;
+
 pub use sources::Platform;
 pub use stem_timing::{MicMoment, PermissionService, PermissionState, Stem};
 pub use stem_writer::GapCause;

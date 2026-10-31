@@ -4,7 +4,9 @@
 //! `probe` records the stems at their native rates and reports what the devices did; `record`
 //! writes one segment of a call folder through the stem writer; `devices` lists the Core Audio
 //! devices; `await-device-change` exits on the first device change; `repair` recovers the
-//! segments a dead writer left open in a call folder, audio and video, as the app does at launch.
+//! segments a dead writer left open in a call folder, audio and video, as the app does at launch;
+//! `finalize` writes a call folder's `call.mp4`, as the app does when a call ends and at launch
+//! for each folder `pending-finalize` lists.
 
 #[cfg(target_os = "macos")]
 mod audio;
@@ -114,6 +116,22 @@ enum Command {
         #[arg(long)]
         folder: PathBuf,
     },
+    /// Repair the call folder, then write `call.mp4` in it: the video segments as one track and
+    /// the stems mixed into one AAC track, each at its host time. Prints the outcome as one JSON
+    /// object.
+    Finalize {
+        /// The call folder.
+        #[arg(long)]
+        folder: PathBuf,
+    },
+    /// List the call folders whose `call.mp4` is missing or older than their manifests, and whose
+    /// last finalize did not fail on the same manifests: the ones the app finalizes at launch.
+    /// Prints one JSON object.
+    PendingFinalize {
+        /// The folder that holds the call folders.
+        #[arg(long)]
+        calls_dir: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -194,6 +212,8 @@ fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&outcome)?);
             Ok(())
         }
+        Command::Finalize { folder } => finalize(&folder),
+        Command::PendingFinalize { calls_dir } => pending_finalize(&calls_dir),
         Command::Video => {
             #[cfg(target_os = "macos")]
             return video::serve();
@@ -219,6 +239,28 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Prints the outcome. A failure to lock the folder or write its record is a failed outcome
+/// too, so the app always reads one line.
+fn finalize(folder: &std::path::Path) -> anyhow::Result<()> {
+    let outcome = call_finalize::finalize_folder(folder).unwrap_or_else(|error| {
+        call_finalize::FinalizeOutcome::Failed {
+            message: error.to_string(),
+        }
+    });
+    println!("{}", serde_json::to_string(&outcome)?);
+    Ok(())
+}
+
+fn pending_finalize(calls_dir: &std::path::Path) -> anyhow::Result<()> {
+    let folders = call_folder::call_folders(calls_dir)?
+        .into_iter()
+        .filter(|folder| call_finalize::needs_finalize(folder))
+        .collect();
+    let pending = call_finalize::PendingFinalize { folders };
+    println!("{}", serde_json::to_string(&pending)?);
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]

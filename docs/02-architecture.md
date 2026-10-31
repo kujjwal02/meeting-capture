@@ -174,6 +174,11 @@ flowchart LR
     CAP -->|PCM frames| HELPER
     HELPER --> STEM["stem-writer"]
     STEM --> MEDIA[("NNN-mic.wav, NNN-remote.wav,<br/>audio.json")]
+    APP -->|call ended, launch| FIN["mc-capture finalize"]
+    FIN --> CF["call-finalize"]
+    VMEDIA --> CF
+    MEDIA --> CF
+    CF --> MP4[("call.mp4")]
 ```
 
 - The app's `calls` module turns each source's reports into one call stream: `call.started`,
@@ -225,6 +230,43 @@ flowchart LR
   both by hand.
 - `call-folder` holds what every capture process shares about a call folder: the OS file lock
   that marks a live writer (`audio.lock`, `video.lock`) and the walk over `calls/`.
+- Finalize writes `call.mp4` in the call folder: the video segments as one track, and the mic
+  and remote stems mixed into one 16 kHz mono AAC track at 48 kbps. The file has no faststart:
+  its index sits at the end, so it plays from disk but not progressively over a network. The
+  stems and fragments stay.
+- When a call that recorded ends, `call_capture` runs `mc-capture finalize --folder` once the
+  call's processes have stopped. At launch, after repair, it runs `mc-capture pending-finalize
+  --calls-dir` for the list of folders to finalize, then one `finalize --folder` per folder,
+  killed after 20 minutes. A folder a capture process still holds gets one more try 30 s later.
+  The app links no AVFoundation.
+- Finalize first sweeps what a killed run left, then repairs the folder, and skips it while a
+  capture process holds a lock. Its own `finalize.lock` keeps two runs apart; a second run waits
+  up to 5 minutes for it. It writes `.call.partial.mp4`, then renames it.
+- `finalize.json` in the call folder records the size and modified time of both manifests a run
+  read, and how the run ended: written, no video, failed, or started and never finished. A
+  folder is pending when a manifest changed since, or `call.mp4` is gone. A failed or killed run
+  is retried once at the next launch on the same manifests, then left. Any error after the lock
+  that leaves a manifest readable is recorded as failed.
+- Offsets come from the call timeline, in UTC nanoseconds. A video part starts at its first
+  frame's host time, read through the clock reading of the audio segment it pairs with, or its
+  own when no audio pairs. Segments whose readings agree on UTC minus host time within 500 ms
+  share the first one, so their host time spacing stays exact; a sleep or a reboot starts a new
+  run. The earliest part or stem sample is 0 s.
+- Each stem is placed in 1 s chunks, each at its own host time, cut where a run ahead starts
+  and ends, and in 10 ms chunks inside it. Where a run ahead starts, the file holds audio twice
+  for one span of host time, and the later copy loses its head. A steering hole of up to 1 ms is
+  filled from the file. The summed stems pass a soft limiter above 80% of full scale.
+- A browser part (Meet tab capture, code only) starts at its first frame's UTC instead, and its
+  paired remote stem moves earlier by the playback latency the browser logged.
+- A part whose start falls at or before the previous part's last frame moves whole to one frame
+  after it, so video times only rise and its key frame stays. Between segments the video holds
+  its last frame and the mix is silent. Open segments and segments with no clock or no samples
+  are skipped and listed in the outcome.
+- All parts go into one video track in the first part's codec and size. A part that matches is
+  copied as it is. A part with another codec or size is decoded, letterboxed into that size with
+  black bars, and encoded again in hardware with the capture's settings: 700 kbps and a keyframe
+  every 2 s. AVFoundation shows a resized part stretched in a shared passthrough track, and
+  refuses an H.264 part after HEVC.
 
 ## 2. Transcribe (phases 4, 6)
 
@@ -284,7 +326,8 @@ flowchart TB
 ```
 
 Later crates attach in their phase: the app depends on `detect`, `capture-protocol`,
-`stem-writer` and `video-capture`; `mc-capture` on `capture`, `stem-writer` and `video-capture`;
+`stem-writer` and `video-capture`; `mc-capture` on `capture`, `stem-writer`, `video-capture` and
+`call-finalize`;
 `sources` depends on `stt`.
 
 - The two binaries own the wiring. Library crates never depend on `meeting-capture` or `cli`.
@@ -306,12 +349,13 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 | stem-timing | 3 | The types `capture` and `stem-writer` share: stem, buffer stamp, ring losses, clock reading. Portable, no audio API | `serde` |
 | call-folder | 3 | The per-process lock on a call folder and the walk over `calls/`, shared by every capture process and repair | std file locks |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV placed by host time, fsynced every 4.5 s, and `audio.json` | `rubato` |
+| call-finalize | 3c | Place a call's video parts and stems on one timeline, mix the stems, write `call.mp4`. The planning and mixing are portable | Mac: AVFoundation via `cidre` |
 | stt | 4 | VAD, Parakeet TDT 0.6B v3 int8, diarization of the remote stem | `sherpa-onnx` |
 | video-capture | 3c | Record one window through ScreenCaptureKit, encode it with VideoToolbox, cut 2 s HLS fragments with AVAssetWriter, write `video.json`, repair dead segments. The writer and repair are portable | Mac: `cidre` |
 
 ## Design rules
 
-- OS code lives only in the capture adapters, `video-capture`, the detector and
+- OS code lives only in the capture adapters, `video-capture`, `call-finalize`, the detector and
   `huddle-captions`. Each of them may use unsafe code for its FFI; the workspace forbids it
   everywhere else.
 - The pipeline has no Tauri dependency. A CLI can rerun any meeting from its stored inputs.

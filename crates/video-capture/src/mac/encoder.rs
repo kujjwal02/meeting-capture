@@ -27,7 +27,8 @@ pub struct EncodedFrame {
 unsafe impl Send for EncodedFrame {}
 
 impl EncodedFrame {
-    pub(crate) fn sample(&self) -> &cm::SampleBuf {
+    #[must_use]
+    pub fn sample(&self) -> &cm::SampleBuf {
         &self.sample
     }
 }
@@ -69,6 +70,15 @@ struct FlushedSession(arc::R<vt::CompressionSession>);
 // SAFETY: VideoToolbox lets any thread call a compression session's functions.
 unsafe impl Send for FlushedSession {}
 
+/// How frames reach the encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderPace {
+    /// Live capture: VideoToolbox drops a frame rather than fall behind.
+    RealTime,
+    /// From a file: the encode call waits instead, so no frame is lost.
+    Offline,
+}
+
 /// What the session reports about itself after setup.
 #[derive(Debug, Clone)]
 pub struct EncoderReadback {
@@ -93,7 +103,12 @@ impl Encoder {
     ///
     /// Fails when neither codec gives a session.
     pub fn new(size: OutputSize, sink: EncoderSink) -> Result<Self, EncoderError> {
-        match Self::with_codec(VideoCodec::Hevc, size, Arc::clone(&sink)) {
+        match Self::with_codec(
+            VideoCodec::Hevc,
+            size,
+            EncoderPace::RealTime,
+            Arc::clone(&sink),
+        ) {
             Ok(encoder)
                 if encoder.readback.is_hardware != Some(false)
                     && encoder.readback.is_open_gop_allowed != Some(true) =>
@@ -109,12 +124,18 @@ impl Encoder {
                 tracing::warn!(exception.message = %error, "video.hevc_unavailable");
             }
         }
-        Self::with_codec(VideoCodec::H264, size, sink)
+        Self::with_codec(VideoCodec::H264, size, EncoderPace::RealTime, sink)
     }
 
-    fn with_codec(
+    /// A session for `codec` alone, with the same settings as the capture's.
+    ///
+    /// # Errors
+    ///
+    /// Fails when VideoToolbox gives no hardware session for the codec, or refuses a setting.
+    pub fn with_codec(
         codec: VideoCodec,
         size: OutputSize,
+        pace: EncoderPace,
         sink: EncoderSink,
     ) -> Result<Self, EncoderError> {
         let spec = cf::Dictionary::with_keys_values(
@@ -153,7 +174,7 @@ impl Encoder {
             height: size.height_px,
             status: status.0.into(),
         })?;
-        set_properties(&mut session, codec)?;
+        set_properties(&mut session, codec, pace)?;
         let readback = read_back(&session, codec);
         prepare(&mut session)?;
         let force_keyframe = cf::Dictionary::with_keys_values(
@@ -197,6 +218,26 @@ impl Encoder {
         let Some(image) = frame.image() else {
             return Err(EncoderError::NoPicture);
         };
+        self.encode_image(image, host_time_ns, is_keyframe_forced)
+    }
+
+    /// The session's own buffers, already in the layout the encoder reads without a copy.
+    #[must_use]
+    pub fn pixel_buf_pool(&self) -> Option<&cv::PixelBufPool> {
+        self.session.pixel_buf_pool()
+    }
+
+    /// Encodes one picture at `host_time_ns`. The output goes to the sink.
+    ///
+    /// # Errors
+    ///
+    /// Fails when VideoToolbox refuses the frame.
+    pub fn encode_image(
+        &mut self,
+        image: &cv::ImageBuf,
+        host_time_ns: u64,
+        is_keyframe_forced: bool,
+    ) -> Result<(), EncoderError> {
         let sink = Arc::clone(&self.sink);
         let properties = is_keyframe_forced.then_some(self.force_keyframe.as_ref());
         self.session
@@ -271,6 +312,7 @@ impl Drop for Encoder {
 fn set_properties(
     session: &mut vt::CompressionSession,
     codec: VideoCodec,
+    pace: EncoderPace,
 ) -> Result<(), EncoderError> {
     use vt::compression::properties::{keys, profile_level};
     let frames_per_second = crate::mac::FRAMES_PER_SECOND;
@@ -287,7 +329,14 @@ fn set_properties(
                 status: -1,
             })?;
     let properties: [(&'static str, &cf::String, &cf::Type); 12] = [
-        ("RealTime", keys::real_time(), cf::Boolean::value_true()),
+        (
+            "RealTime",
+            keys::real_time(),
+            match pace {
+                EncoderPace::RealTime => cf::Boolean::value_true(),
+                EncoderPace::Offline => cf::Boolean::value_false(),
+            },
+        ),
         (
             "AllowFrameReordering",
             keys::allow_frame_reordering(),
