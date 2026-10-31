@@ -302,7 +302,13 @@ Done when:
   segment. Each video segment records the `audio_segment` it pairs with. Code only.
 - [ ] The encoder starts at `call.started`, so its warm-up of about 160 ms drops no frames.
 - [ ] A real Slack huddle records its window while covered, with the tray video row.
-- [ ] Finalize: one MP4 with the video and an AAC mix, track offsets from host time.
+- [x] Finalize: one MP4 with the video and an AAC mix, track offsets from host time. Run on a
+  covered test window with a gap, two segments and a repaired segment; not run on a real huddle.
+  The mix is AAC at 48 kbps, since the stems are 16 kHz mono. The file has no faststart. Meet
+  placement by browser UTC is code only.
+- [x] One video track for parts of different sizes or codecs: a differing part is encoded again in
+  the first part's codec and size, letterboxed.
+- [ ] Delete fragments after a good finalize.
 - [ ] 90-day purge of call media.
 - [ ] mc-meet tab capture for Meet video, with no Screen Recording grant.
 

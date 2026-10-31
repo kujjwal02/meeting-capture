@@ -542,6 +542,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "call-finalize"
+version = "0.7.1"
+dependencies = [
+ "call-folder",
+ "capture-protocol",
+ "cidre",
+ "jiff",
+ "serde",
+ "serde_json",
+ "stem-timing",
+ "stem-writer",
+ "thiserror 2.0.21",
+ "tracing",
+ "video-capture",
+]
+
+[[package]]
 name = "call-folder"
 version = "0.7.1"
 dependencies = [
@@ -574,6 +591,7 @@ dependencies = [
 name = "capture-protocol"
 version = "0.7.1"
 dependencies = [
+ "jiff",
  "serde",
  "serde_json",
  "sources",
@@ -2759,6 +2777,8 @@ name = "mc-capture"
 version = "0.7.1"
 dependencies = [
  "anyhow",
+ "call-finalize",
+ "call-folder",
  "capture",
  "capture-protocol",
  "clap",

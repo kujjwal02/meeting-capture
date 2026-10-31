@@ -8,3 +8,5 @@ IST = "IST"
 [default.extend-identifiers]
 # cidre 0.29 spells the VideoToolbox average bit rate key this way.
 avarage_bit_rate = "avarage_bit_rate"
+# cidre 0.29 spells its AVFoundation encoder property keys module this way.
+encoder_propery_keys = "encoder_propery_keys"

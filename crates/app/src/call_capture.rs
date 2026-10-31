@@ -34,6 +34,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use capture_protocol::finalize::{FinalizeOutcome, PendingFinalize};
 use capture_protocol::{
     AudioCommand, AudioErrorKind, AudioReport, DeviceChangeCause, MicMoment, PermissionService,
     PermissionState, Platform, Stem, VideoCommand, VideoErrorKind, VideoReport, WindowChangeCause,
@@ -60,6 +61,14 @@ const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// segment within 1 s. Past this it is killed.
 const STOP_LIMIT: Duration = Duration::from_secs(12);
 const SIDECAR_LOG_FILE_NAME: &str = "mc-capture.log";
+/// A finalize that runs this long hangs: a two-hour call takes about two minutes, plus up to
+/// five waiting for another run on the same folder. Killed, it is retried once at the next
+/// launch, then left.
+const FINALIZE_LIMIT: Duration = Duration::from_mins(20);
+/// Listing reads two small manifests per folder.
+const PENDING_LIST_LIMIT: Duration = Duration::from_secs(60);
+/// A capture process that outlived its call closes its segment within seconds of its stop.
+const RECORDING_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// The helper log moves to `mc-capture.log.1` at a start once it is this big.
 const SIDECAR_LOG_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(windows)]
@@ -380,10 +389,25 @@ fn set_recording_stopped(app: &AppHandle, call_id: &Path, is_stopped: bool) {
 }
 
 /// Starts the supervisor. Call before any call source starts, so it hears every call. Also
-/// repairs, in the background, the segments a dead helper left open in any call folder.
+/// repairs, in the background, the segments a dead helper left open in any call folder, then
+/// writes the `call.mp4` a crash or a quit left unwritten.
 pub(crate) fn start(app: &AppHandle) {
     let state = app.state::<AppState>();
-    repair_call_folders(state.settings.app_dirs().calls_dir());
+    let app_dirs = state.settings.app_dirs();
+    let calls_dir = app_dirs.calls_dir();
+    let log_file = app_dirs.log_dir().join(SIDECAR_LOG_FILE_NAME);
+    tauri::async_runtime::spawn(async move {
+        let repair_dir = calls_dir.clone();
+        if let Err(error) =
+            tauri::async_runtime::spawn_blocking(move || repair_call_folders(&repair_dir)).await
+        {
+            tracing::error!(exception.message = %error, "repair.task_failed");
+        }
+        // After the repair, so finalize never meets a folder lock the repair holds and skips it.
+        if cfg!(target_os = "macos") {
+            finalize_pending(&calls_dir, &log_file).await;
+        }
+    });
     let stop_changes = state
         .call_capture
         .stop_change_receiver
@@ -401,12 +425,12 @@ pub(crate) fn start(app: &AppHandle) {
         return;
     };
     let events = state.calls.subscribe();
-    let app_dirs = state.settings.app_dirs();
     let supervisor = Supervisor {
         app: app.clone(),
         calls_dir: app_dirs.calls_dir(),
         log_file: app_dirs.log_dir().join(SIDECAR_LOG_FILE_NAME),
         open_calls: Vec::new(),
+        recorded_calls: Vec::new(),
         active: None,
     };
     tauri::async_runtime::spawn(supervisor.run(events, stop_changes));
@@ -417,59 +441,190 @@ pub(crate) fn start(app: &AppHandle) {
 /// outlived a killed app, is skipped, and that helper closes its own segment. Each segment start
 /// repairs its folder again under the lock, so a call that starts at once loses nothing to the
 /// race. stem-writer logs each repaired stem, and video-capture each video segment it ended.
-fn repair_call_folders(calls_dir: PathBuf) {
-    tauri::async_runtime::spawn_blocking(move || {
-        let folders = match call_folder::call_folders(&calls_dir) {
-            Ok(folders) => folders,
-            Err(error) => {
-                tracing::error!(
-                    file.directory = %calls_dir.display(),
-                    exception.message = %error,
-                    "repair.calls_unreadable"
-                );
-                return;
-            }
+fn repair_call_folders(calls_dir: &Path) {
+    let folders = match call_folder::call_folders(calls_dir) {
+        Ok(folders) => folders,
+        Err(error) => {
+            tracing::error!(
+                file.directory = %calls_dir.display(),
+                exception.message = %error,
+                "repair.calls_unreadable"
+            );
+            return;
+        }
+    };
+    let mut repaired_count = 0_usize;
+    let mut failed_count = 0_usize;
+    for folder in &folders {
+        let audio = match stem_writer::repair_folder(folder) {
+            Ok(stem_writer::FolderRepair::Repaired { .. }) => Ok(true),
+            Ok(stem_writer::FolderRepair::Busy | stem_writer::FolderRepair::Clean) => Ok(false),
+            Err(error) => Err(error.to_string()),
         };
-        let mut repaired_count = 0_usize;
-        let mut failed_count = 0_usize;
-        for folder in &folders {
-            let audio = match stem_writer::repair_folder(folder) {
-                Ok(stem_writer::FolderRepair::Repaired { .. }) => Ok(true),
-                Ok(stem_writer::FolderRepair::Busy | stem_writer::FolderRepair::Clean) => Ok(false),
-                Err(error) => Err(error.to_string()),
-            };
-            let video = match video_capture::repair_folder(folder) {
-                Ok(video_capture::VideoFolderRepair::Repaired { .. }) => Ok(true),
-                Ok(
-                    video_capture::VideoFolderRepair::Busy
-                    | video_capture::VideoFolderRepair::Clean,
-                ) => Ok(false),
-                Err(error) => Err(error.to_string()),
-            };
-            for (process, outcome) in [("audio", &audio), ("video", &video)] {
-                if let Err(message) = outcome {
-                    tracing::error!(
-                        file.directory = %folder.display(),
-                        process.command = process,
-                        exception.message = message,
-                        "repair.failed"
-                    );
-                }
-            }
-            if audio.is_err() || video.is_err() {
-                failed_count += 1;
-            } else if audio == Ok(true) || video == Ok(true) {
-                repaired_count += 1;
+        let video = match video_capture::repair_folder(folder) {
+            Ok(video_capture::VideoFolderRepair::Repaired { .. }) => Ok(true),
+            Ok(
+                video_capture::VideoFolderRepair::Busy | video_capture::VideoFolderRepair::Clean,
+            ) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        };
+        for (process, outcome) in [("audio", &audio), ("video", &video)] {
+            if let Err(message) = outcome {
+                tracing::error!(
+                    file.directory = %folder.display(),
+                    process.command = process,
+                    exception.message = message,
+                    "repair.failed"
+                );
             }
         }
-        tracing::info!(
-            file.directory = %calls_dir.display(),
-            repair.folder_count = folders.len(),
-            repair.repaired_folder_count = repaired_count,
-            repair.failed_folder_count = failed_count,
-            "repair.finished"
-        );
-    });
+        if audio.is_err() || video.is_err() {
+            failed_count += 1;
+        } else if audio == Ok(true) || video == Ok(true) {
+            repaired_count += 1;
+        }
+    }
+    tracing::info!(
+        file.directory = %calls_dir.display(),
+        repair.folder_count = folders.len(),
+        repair.repaired_folder_count = repaired_count,
+        repair.failed_folder_count = failed_count,
+        "repair.finished"
+    );
+}
+
+/// Writes `call.mp4` for each call folder that lacks a current one, one helper run per folder,
+/// so a folder that hangs or fails holds up none of the others. The helper lists the folders,
+/// so the app links no AVFoundation.
+async fn finalize_pending(calls_dir: &Path, log_file: &Path) {
+    let listing = run_helper(
+        &[
+            "pending-finalize".as_ref(),
+            "--calls-dir".as_ref(),
+            calls_dir.as_os_str(),
+        ],
+        log_file,
+        PENDING_LIST_LIMIT,
+    )
+    .await;
+    let pending = match listing.map(|stdout| serde_json::from_str::<PendingFinalize>(&stdout)) {
+        Ok(Ok(pending)) => pending,
+        Ok(Err(error)) => {
+            tracing::error!(exception.message = %error, "finalize.list_unreadable");
+            return;
+        }
+        Err(reason) => {
+            tracing::error!(exception.message = reason, "finalize.helper_failed");
+            return;
+        }
+    };
+    for folder in pending.folders {
+        finalize_call(folder, log_file.to_owned()).await;
+    }
+}
+
+/// Writes one call folder's `call.mp4` through the helper's `finalize`. A folder some capture
+/// process still records in gets one more try once that process has had time to close.
+async fn finalize_call(folder: PathBuf, log_file: PathBuf) {
+    for is_retry in [false, true] {
+        let outcome = finalize_once(&folder, &log_file).await;
+        if !matches!(outcome, Some(FinalizeOutcome::Recording)) || is_retry {
+            return;
+        }
+        tokio::time::sleep(RECORDING_RETRY_DELAY).await;
+    }
+}
+
+async fn finalize_once(folder: &Path, log_file: &Path) -> Option<FinalizeOutcome> {
+    let run = run_helper(
+        &["finalize".as_ref(), "--folder".as_ref(), folder.as_os_str()],
+        log_file,
+        FINALIZE_LIMIT,
+    )
+    .await;
+    let outcome = match run.map(|stdout| serde_json::from_str::<FinalizeOutcome>(stdout.trim())) {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(error)) => {
+            tracing::error!(
+                file.directory = %folder.display(),
+                exception.message = %error,
+                "finalize.unreadable"
+            );
+            return None;
+        }
+        Err(reason) => {
+            tracing::error!(
+                file.directory = %folder.display(),
+                exception.message = reason,
+                "finalize.helper_failed"
+            );
+            return None;
+        }
+    };
+    match &outcome {
+        FinalizeOutcome::Written(summary) => tracing::info!(
+            file.directory = %folder.display(),
+            finalize.outcome = outcome.as_str(),
+            finalize.length_ms = summary.length_ms,
+            finalize.video_part_count = summary.video_part_count,
+            finalize.stem_count = summary.stem_count,
+            finalize.parts_shifted = summary.parts_shifted,
+            finalize.skipped_count = summary.skipped.len(),
+            "finalize.finished"
+        ),
+        FinalizeOutcome::Failed { message } => tracing::error!(
+            file.directory = %folder.display(),
+            finalize.outcome = outcome.as_str(),
+            exception.message = message,
+            "finalize.finished"
+        ),
+        FinalizeOutcome::NoVideo { skipped } => tracing::info!(
+            file.directory = %folder.display(),
+            finalize.outcome = outcome.as_str(),
+            finalize.skipped_count = skipped.len(),
+            "finalize.finished"
+        ),
+        FinalizeOutcome::Busy | FinalizeOutcome::Recording => tracing::warn!(
+            file.directory = %folder.display(),
+            finalize.outcome = outcome.as_str(),
+            "finalize.finished"
+        ),
+    }
+    Some(outcome)
+}
+
+/// Runs the helper to its end, or kills it at `limit`, with its log lines in the helper log.
+/// Its stdout, or why there is none.
+async fn run_helper(
+    args: &[&std::ffi::OsStr],
+    log_file: &Path,
+    limit: Duration,
+) -> Result<String, String> {
+    let helper = sidecar_path()?;
+    rotate_log_if_full(log_file);
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+        .map_err(|error| format!("could not open {}: {error}", log_file.display()))?;
+    let child = Command::new(&helper)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::from(log))
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| format!("could not start {}: {error}", helper.display()))?;
+    // Dropping the timed-out future drops the child, which kills it.
+    let output = tokio::time::timeout(limit, child.wait_with_output())
+        .await
+        .map_err(|_| format!("killed after {} s", limit.as_secs()))?
+        .map_err(|error| format!("could not wait for the helper: {error}"))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(format!("exited with {}", output.status))
+    }
 }
 
 /// One capture process of the active recording.
@@ -565,6 +720,8 @@ struct Supervisor {
     /// Open calls, oldest first.
     open_calls: Vec<Call>,
     active: Option<ActiveRecording>,
+    /// Open calls that recorded in this app run, so their end needs a `call.mp4`.
+    recorded_calls: Vec<PathBuf>,
 }
 
 impl Supervisor {
@@ -679,6 +836,17 @@ impl Supervisor {
         self.stop_active_if(call_id).await;
         self.capture().set_state(&self.app, call_id, None);
         self.capture().set_video_state(&self.app, call_id, None);
+        let was_recorded = self
+            .recorded_calls
+            .iter()
+            .any(|recorded| recorded == call_id);
+        self.recorded_calls.retain(|recorded| recorded != call_id);
+        if was_recorded {
+            // Its processes have stopped, so their segments are closed. Its own task, because a
+            // long call takes minutes to write and the next call must not wait for it.
+            let folder = self.calls_dir.join(call_folder_name(call_id));
+            tauri::async_runtime::spawn(finalize_call(folder, self.log_file.clone()));
+        }
     }
 
     /// The board took a stop or a resume of `call_id`.
@@ -788,6 +956,9 @@ impl Supervisor {
                     video_links,
                 ));
                 window_hints = Some(hints);
+            }
+            if !self.recorded_calls.contains(&call.id) {
+                self.recorded_calls.push(call.id.clone());
             }
             self.active = Some(ActiveRecording {
                 call_id: call.id,
