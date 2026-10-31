@@ -10,8 +10,9 @@
 //   channel_open_failed  { label, error } the page hook could not open a caption channel
 //   channel_caption      { atMs } a caption arrived on a channel, in a call
 //   parse_gap            { atMs, channel, parseFailures, detail, isInCall } frames failed to decode
-//   tick                 { atMs } the content script's once-a-second check, in a call
-//   captions_requested   { atMs } main.js clicked Meet's control that turns captions on
+//   tick                 { atMs, isCaptionsOn } the content script's once-a-second check, in a
+//                        call, with whether Meet's captions control reads on
+//   captions_requested   { atMs } main.js pressed Meet's control that turns captions on
 //
 // decide returns { source, health, reportsHealth, isCaptionsRequestDue }. source is "none",
 // "channel" or "dom". health holds the health event fields this policy owns.
@@ -19,11 +20,20 @@
 // Meet streams nothing on the hook's caption channels until something asks for captions. A click
 // on Meet's captions control asks the server, and the stream goes to the hook's channels. While
 // the hook's captions_v2 is open, Meet renders no caption box. About 30 s later Meet's captions
-// button reads on, still with no box. A second press stops the stream, so the policy asks for
-// exactly one press per call.
+// button reads on, still with no box. A second press stops the stream, so the policy presses
+// again only while Meet has not read on since the last press.
+//
+// Meet sometimes ignores the press: its captions control never reads on and the channels get no
+// stream for the rest of the call. A call nobody speaks in also gets no caption, so only the
+// control tells the two apart.
 
 // The DOM reader starts when no caption arrives this long after the caption channels open.
 const MC_MEET_CAPTION_WAIT_MS = 20000;
+// Meet's control read on 30 s after every press it took. A press still unanswered this long
+// after is treated as ignored.
+const MC_MEET_CAPTION_PRESS_ANSWER_MS = 45000;
+// Presses per call, the first included.
+const MC_MEET_CAPTION_PRESSES = 3;
 
 globalThis.mcMeetCreateCaptionSourcePolicy = () => {
   let source = "none";
@@ -34,8 +44,12 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
   let pageStartedMs = 0;
   let channelsOpenedAtMs = null;
   let lastChannelCaptionMs = null;
-  // main.js pressed Meet's captions control in this call.
-  let isCaptionsRequested = false;
+  // main.js pressed Meet's captions control this many times in this call, the last at
+  // lastCaptionsRequestMs.
+  let captionsRequests = 0;
+  let lastCaptionsRequestMs = null;
+  // Meet's captions control read on in this call: a press took, or the user turned captions on.
+  let isCaptionsOnSeen = false;
 
   const health = () => ({ source, parseFailures, detail, isCaptionFramesFailing });
 
@@ -62,7 +76,9 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         pageStartedMs = fact.atMs;
         channelsOpenedAtMs = null;
         lastChannelCaptionMs = null;
-        isCaptionsRequested = false;
+        captionsRequests = 0;
+        lastCaptionsRequestMs = null;
+        isCaptionsOnSeen = false;
         isCaptionFramesFailing = false;
         return true;
       case "call_ended":
@@ -96,9 +112,11 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         return true;
       }
       case "captions_requested":
-        isCaptionsRequested = true;
+        captionsRequests += 1;
+        lastCaptionsRequestMs = fact.atMs;
         return false;
       case "tick": {
+        if (fact.isCaptionsOn) isCaptionsOnSeen = true;
         const waitStartMs = Math.max(pageStartedMs, channelsOpenedAtMs ?? 0);
         if (source !== "none" || fact.atMs - waitStartMs < MC_MEET_CAPTION_WAIT_MS) return false;
         return useDom(
@@ -110,6 +128,17 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
     }
   }
 
+  function isCaptionsRequestDue(fact) {
+    // Before the hook's channels open, a request would turn Meet's caption box on.
+    if (fact.kind !== "tick" || channelsOpenedAtMs === null) return false;
+    if (source === "channel" || isCaptionsOnSeen) return false;
+    if (captionsRequests === 0) return true;
+    return (
+      captionsRequests < MC_MEET_CAPTION_PRESSES &&
+      fact.atMs - lastCaptionsRequestMs >= MC_MEET_CAPTION_PRESS_ANSWER_MS
+    );
+  }
+
   return {
     decide(fact) {
       const reportsHealth = apply(fact);
@@ -117,12 +146,7 @@ globalThis.mcMeetCreateCaptionSourcePolicy = () => {
         source,
         health: health(),
         reportsHealth,
-        isCaptionsRequestDue:
-          // Before the hook's channels open, a request would turn Meet's caption box on.
-          fact.kind === "tick" &&
-          channelsOpenedAtMs !== null &&
-          source !== "channel" &&
-          !isCaptionsRequested,
+        isCaptionsRequestDue: isCaptionsRequestDue(fact),
       };
     },
     health,
