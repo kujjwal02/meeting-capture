@@ -8,6 +8,10 @@ before you write a new driver or spike.
 - Meet removes guests without a Google account. It sends them to the Workspace product page, in
   both patchrome and plain Chrome, for meetings that a personal account hosts. Join every guest
   signed in.
+- A Workspace host does not fix this for every domain. A signed-out patchrome guest filled its name,
+  pressed "Ask to join", and got "You can't join this video call" with no request on the host. With
+  the meeting's access type set to Open in Host controls, it got "Join now" and the same refusal.
+  The domain's policy decides. Try one signed-out join by hand before you build on it.
 - Two browsers on the same account join, but Meet sends no audio between them. Any audio or echo
   test needs two different accounts.
 - With the same account, "Switch here" is the primary button. Never click it: it moves the host
@@ -19,12 +23,18 @@ before you write a new driver or spike.
 - A disabled button has no ref in a patchrome snapshot. A guest's "Ask to join" stays disabled
   until the name box has text. Wait for the name box, fill it, then look for the button.
 - The guest sees "Continue without microphone and camera" when it has no permission. Call
-  `Browser.grantPermissions` with `audioCapture` and `videoCapture` before you navigate.
+  `Browser.grantPermissions` with `audioCapture` and `videoCapture` before you navigate. A stealth
+  profile has no devtools port, so press "Continue without microphone and camera" instead. Until
+  then the dialog strips the names from every control behind it.
 - After the join, the modal "Others may see your video differently" hides "Leave call". Dismiss
   "Got it" before you check that the browser is in the call.
 - The host sees "Your meeting's ready" and a Gemini prompt. Both hide the admit toast. Dismiss
   them before you admit.
+- The lobby has "Leave call" too, so check for the captions button to tell the call apart. Its
+  name is "Turn on captions" or "Captions and translation", depending on the account.
 - A signed-in host on `meet.new` lands on `/meet/<code>`. Guests need `/<code>`.
+- A Workspace host on `meet.new` can join straight into the call and keep the URL
+  `/meet/new?authuser=0`. Read the code from the page text, which shows it at the top left.
 
 ## Browsers
 
@@ -61,6 +71,10 @@ before you write a new driver or spike.
     keystroke "r" using {option down, shift down}
   end tell
   ```
+
+- mc-meet's worker drops a `mc-meet-popup` port whose sender has a tab. `popup.html` opened with
+  `Target.createTarget` is a tab, so its stop and resume never reach the app. Call
+  `chrome.action.openPopup()` in the worker, then attach to the popup target and send from there.
 
 ## Audio test signals
 

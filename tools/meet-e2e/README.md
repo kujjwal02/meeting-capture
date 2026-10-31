@@ -14,6 +14,9 @@ checks the call log and the note. It runs on macOS only.
 - The host account must not be in a call on another device.
 
 Set `MEET_E2E_HOST_PROFILE` or `MEET_E2E_GUEST_PROFILE` to use other profiles. Set
+`MEET_E2E_GUEST_ANONYMOUS=1` for a guest profile that is not signed in: it types a name before
+it asks to join. Only some Workspace domains let a signed-out guest in, so try one join by hand
+first. Set
 `MEET_E2E_DIR` to move the work folder from `~/.cache/meeting-capture-e2e`.
 
 The run puts the dev binary in `Meeting Capture Dev.app` (bundle id

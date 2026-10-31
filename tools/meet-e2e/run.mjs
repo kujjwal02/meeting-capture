@@ -1,6 +1,6 @@
 // Runs one real Meet call through mc-meet and a dev app, then checks the call log and the note.
 // Two patchrome browsers join the call: the host, with mc-meet loaded and a fake microphone that
-// speaks, and a guest on a second Google account, who sends a chat message.
+// speaks, and a guest on a second Google account or signed out, who sends a chat message.
 // Usage: node tools/meet-e2e/run.mjs [path to the meeting-capture binary]
 import { execFileSync, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -25,6 +25,8 @@ const helperBinary = join(dirname(appBinary), "mc-capture");
 const workDir = process.env.MEET_E2E_DIR ?? join(homedir(), ".cache", "meeting-capture-e2e");
 const hostProfile = process.env.MEET_E2E_HOST_PROFILE ?? "mcdev";
 const guestProfile = process.env.MEET_E2E_GUEST_PROFILE ?? "default";
+// A Workspace host can admit a signed-out guest, who types a name before asking to join.
+const isGuestAnonymous = process.env.MEET_E2E_GUEST_ANONYMOUS === "1";
 // Its own name and bundle id, so macOS lists the test build apart from the installed app.
 const devAppName = "Meeting Capture Dev";
 const devBundleId = "com.ujjwalkumar.meetingcapture.dev";
@@ -330,12 +332,23 @@ const idleSleepHolds = () =>
 // Sends what mc-meet's popup button sends: `stop_recording` or `resume_recording` for the Meet
 // tab. The app handles it as the tray's "Stop recording this call" and "Resume recording". A
 // script cannot click the tray: a Tauri tray menu is not in the accessibility tree.
-async function pressRecordingButton(cdp, extensionId, type) {
-  const { result: created } = await cdp.send("Target.createTarget", {
-    url: `chrome-extension://${extensionId}/popup/popup.html`,
+// The worker drops a popup port from a tab, so popup.html opened with Target.createTarget is
+// refused. The action popup has no tab, and the worker can open it.
+async function pressRecordingButton(cdp, workerSessionId, extensionId, type) {
+  const popupUrl = `chrome-extension://${extensionId}/popup/popup.html`;
+  const opened = await cdp.send(
+    "Runtime.evaluate",
+    { expression: "chrome.action.openPopup()", awaitPromise: true, userGesture: true },
+    workerSessionId,
+  );
+  if (opened.result?.exceptionDetails)
+    throw new Error(`could not open mc-meet's popup: ${opened.result.exceptionDetails.text}`);
+  const popup = await until("mc-meet's popup opens", 10000, async () => {
+    const { result } = await cdp.send("Target.getTargets");
+    return result.targetInfos.find((info) => info.url === popupUrl);
   });
   const { result: attached } = await cdp.send("Target.attachToTarget", {
-    targetId: created.targetId,
+    targetId: popup.targetId,
     flatten: true,
   });
   const { result } = await cdp.send(
@@ -353,7 +366,7 @@ async function pressRecordingButton(cdp, extensionId, type) {
     },
     attached.sessionId,
   );
-  await cdp.send("Target.closeTarget", { targetId: created.targetId });
+  await cdp.send("Target.closeTarget", { targetId: popup.targetId });
   if (result?.exceptionDetails) throw new Error(`${type} failed in the popup page`);
 }
 
@@ -456,16 +469,17 @@ try {
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: fakeMicScript() }, tab);
   await cdp.send("Page.addScriptToEvaluateOnNewDocument", { source: muteMediaScript }, tab);
   await cdp.send("Page.navigate", { url: "https://meet.new" }, tab);
-  const meetingUrl = await until("the host gets a meeting code", 30000, async () => {
+  // A Workspace host joins at /meet/new and keeps that URL, so the code is read off the page too.
+  const meetingCode = await until("the host gets a meeting code", 30000, async () => {
     const { result } = await cdp.send(
       "Runtime.evaluate",
-      { expression: "location.href", returnByValue: true },
+      { expression: "location.pathname + ' ' + document.body.innerText", returnByValue: true },
       tab,
     );
-    const url = result?.result?.value ?? "";
-    return /meet\.google\.com\/[a-z]{3}-[a-z]{4}-[a-z]{3}/.test(url) ? url.split("?")[0] : null;
+    return (result?.result?.value ?? "").match(/\b[a-z]{3}-[a-z]{4}-[a-z]{3}\b/)?.[0];
   });
-  const meetingCode = meetingUrl.split("/").at(-1);
+  // Guests need /<code>, not the host's /meet/<code>.
+  const meetingUrl = `https://meet.google.com/${meetingCode}`;
   step(`meeting ${meetingCode}`);
 
   if (findButton("host", /^Switch here$/))
@@ -485,9 +499,21 @@ try {
 
   patchrome("guest", "session", "label", "meet-e2e guest");
   patchrome("guest", "open", meetingUrl);
-  await until("the guest sees the join screen", 60000, () =>
-    findButton("guest", /^(Ask to join|Join now)$/),
-  );
+  // A guest without a devtools port cannot be granted the microphone, so Meet asks first. The
+  // dialog strips the names from the join screen behind it. The guest joins muted anyway.
+  const skipMediaPrompt = () => pressIfShown("guest", /^Continue without microphone and camera$/);
+  if (isGuestAnonymous) {
+    // "Ask to join" has no ref while it is disabled, and it stays disabled until the name is in.
+    const nameBox = await until("the guest sees the name box", 60000, () => {
+      skipMediaPrompt();
+      return nodes("guest", "textbox").find((node) => /name/i.test(node.name));
+    });
+    patchrome("guest", "fill", `@${nameBox.ref}`, "meet-e2e guest");
+  }
+  await until("the guest sees the join screen", 60000, () => {
+    skipMediaPrompt();
+    return findButton("guest", /^(Ask to join|Join now)$/);
+  });
   patchrome("guest", "eval", muteMediaScript, "--main-world");
   pressIfShown("guest", /^Not now$/);
   pressIfShown("guest", /^Turn off microphone$/);
@@ -506,7 +532,7 @@ try {
   patchrome("host", "click", `@${admit.ref}`);
   // The lobby has a Leave call button too. Only the call has the captions button.
   await until("the guest is in the call", 30000, () =>
-    findButton("guest", /^Turn (on|off) captions$/),
+    findButton("guest", /^(Turn (on|off) captions|Captions and translation)$/),
   );
   step("both browsers are in the call");
 
@@ -541,7 +567,7 @@ try {
     readLog(meetingCode)?.events.find((event) => event.kind === "chat" && event.text === chatText),
   );
 
-  await pressRecordingButton(cdp, loaded.result.id, "stop_recording");
+  await pressRecordingButton(cdp, workerSessionId, loaded.result.id, "stop_recording");
   step("pressed Stop recording this call in mc-meet's popup");
   const afterStop = await until("the helper exits with every segment closed", 15000, () => {
     const audio = readAudio(callDir);
@@ -555,7 +581,7 @@ try {
   );
   expect(idleSleepHolds().length === 0, "macOS may idle sleep once recording stops");
   await sleep(10000);
-  await pressRecordingButton(cdp, loaded.result.id, "resume_recording");
+  await pressRecordingButton(cdp, workerSessionId, loaded.result.id, "resume_recording");
   step("pressed Resume recording in mc-meet's popup");
   await until("the helper records the next segment", 30000, () => {
     const audio = readAudio(callDir);
