@@ -32,8 +32,8 @@ impl Default for SlackSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MeetSettings {
-    /// Turn Meet's captions off once captions stream, so the caption box covers no shared
-    /// screen. mc-meet keeps recording them.
+    /// Hide Meet's caption box while mc-meet reads captions from it, so it covers no shared
+    /// screen.
     pub hide_captions: bool,
 }
 
@@ -235,8 +235,8 @@ const SETTINGS_HEADER: &str = "\
 # [slack] read_captions: read Slack huddle captions from the Slack desktop app (macOS).
 # [slack] auto_start_captions: press the huddle's Captions tab when its caption panel is hidden.
 # [slack] min_huddle_seconds: a shorter huddle writes no note. Default 120.
-# [meet] hide_captions: turn Meet's captions off once mc-meet reads them, so the caption box
-#   covers no shared screen. mc-meet keeps recording them. Default true.
+# [meet] hide_captions: hide Meet's caption box while mc-meet reads captions from it, so it
+#   covers no shared screen. With the data channel, the box never shows. Default true.
 
 ";
 

@@ -201,6 +201,15 @@ globalThis.mcMeetReadCaptionsButton = () => {
 const MC_MEET_REGION_DEPTH = 5;
 const MC_MEET_REGION_NODES = 60;
 
+// Whether Meet's caption box takes up space on screen. Meet's captions button can read on with
+// no box, and mc-meet's hide_captions sets the box to display none.
+globalThis.mcMeetIsCaptionBoxShown = () => {
+  const region = document.querySelector(globalThis.mcMeetSelectors.captionRegion);
+  if (!region) return false;
+  const box = region.getBoundingClientRect();
+  return box.width > 0 && box.height > 0;
+};
+
 // The caption region's element tree without its text: tags, roles and the length of each text
 // node. Shows how Meet laid out the region when the DOM reader reads nothing.
 globalThis.mcMeetDescribeCaptionRegion = () => {

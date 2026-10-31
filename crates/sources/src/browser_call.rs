@@ -67,6 +67,10 @@ pub enum CallEvent {
         source: HealthSource,
         /// Meet's captions button is on, and Meet does not refuse captions.
         captions_on: bool,
+        /// Meet's caption box is on screen. The button can read on with no box, while the
+        /// captions go to mc-meet's channels. Older extensions leave it out.
+        #[serde(default)]
+        caption_box_shown: bool,
         /// Meet refuses captions: its captions button is disabled, or says live captions are
         /// unavailable. Older extensions leave it out.
         #[serde(default)]

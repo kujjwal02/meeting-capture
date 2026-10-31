@@ -23,6 +23,7 @@ offset 3 (legacy captions). Source: T:10409-10413.
 | --- | --- | --- | --- |
 | `captions_v2` frame | `1` | utterance | T:9038 (`CaptionsV2Packet`), A:1724 |
 | `captions_v2` frame | `1.1` | utterance, in frames seen from October 2026; `1` then has no field `3` | live frame skeleton |
+| `captions_v2` frame | `1.1` without field `3`, `1.2` | status entries next to utterances, or alone in a control frame Meet sends each second | live frame skeleton |
 | utterance | `1` varint | utterance ID (int64, may exceed 2^53) | T:9109, A:1734 |
 | utterance | `2` varint | version, grows as Meet revises the text | T:9109, A:1735 |
 | utterance | `3` | caption | T:9109, A:1736 |
@@ -67,6 +68,13 @@ are on. Turning captions off makes Meet call `close()` on its own `captions` cha
 later, and the stream to every caption channel stops. When the hook blocks that `close()`, Meet
 keeps streaming to the hook's channels with captions off, through silences of 5 minutes. Bluedot
 blocks the same `close()`.
+
+Measured on 2026-10-31, the hook's channels stay silent until something asks for captions. One
+press of Meet's C shortcut starts the stream to the hook's channels. While the hook's
+`captions_v2` is open, Meet renders no caption box. About 30 s after the press, Meet's captions
+button reads on (`aria-pressed` true), still with no box. A second press stops the stream at once,
+and the button reads off about 30 s later. Meet also opens its own negotiated `captions_v2`
+(id 125) at call start.
 
 ## Not used
 

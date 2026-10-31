@@ -82,7 +82,7 @@ Open Settings from the tray menu. It writes `settings.toml` in
 | `vault_dir` | `~/knowledge` | Where notes are written. |
 | `my_name` | none | Replaces "You" in transcripts saved from TranscripTonic, which earlier versions used. |
 | `time_zone` | device zone | IANA name such as `Asia/Kolkata`, used in note names, dates and times. |
-| `[meet] hide_captions` | on | mc-meet turns Meet's captions off once it reads them, so the caption box covers no shared screen. Applies to open calls when you save. |
+| `[meet] hide_captions` | on | mc-meet reads captions with Meet's caption box never on screen. If you turn captions on yourself, mc-meet hides the caption box while it reads from it, so the box covers no shared screen. Applies to open calls when you save. |
 
 To replace the built-in note template, add `note.md.j2` to the same folder. Quit and reopen the app
 after a change.

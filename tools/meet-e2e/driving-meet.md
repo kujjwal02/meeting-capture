@@ -75,6 +75,15 @@ before you write a new driver or spike.
 - mc-meet's worker drops a `mc-meet-popup` port whose sender has a tab. `popup.html` opened with
   `Target.createTarget` is a tab, so its stop and resume never reach the app. Call
   `chrome.action.openPopup()` in the worker, then attach to the popup target and send from there.
+- Meet's caption channels stay silent until something asks for captions. One C press, sent as a
+  synthetic `KeyboardEvent` from the page, starts the stream. With mc-meet's `captions_v2` open,
+  Meet shows no caption box, but its captions button reads on about 30 s later. A second press
+  stops the stream at once. Read `caption_box_shown`, not `captions_on`, to tell what is on screen.
+- The profile may hold a `meet.google.com/home` tab in another window. Pick the call tab by its
+  meeting code, not by the first `meet.google.com` match.
+- `chrome.action.openPopup()` fails with "Could not find an active browser window" when another
+  app or browser is in front. Call `chrome.windows.update(windowId, { focused: true })` on the
+  Meet tab's window first, then `openPopup({ windowId })`.
 
 ## Audio test signals
 
