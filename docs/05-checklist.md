@@ -258,8 +258,16 @@ Done when:
 - [x] A `kill -9` of the app and of the helper mid-call each leave stems that play. Checked on
   fake mc-meet calls with the built-in mic and the tap. Each segment lost at most 0.33 s of its
   wall time. Each played in `afinfo`. The call's next segment took the next number.
-- [ ] Still for a person: 3 real calls, one with AirPods connected mid-call. A sleep mid-call.
-  A live `just meet-e2e` run. The CPU check above.
+
+Unresolved live tests. The code for each is committed and passed injected-event or fake mc-meet
+runs. None has run on a real call yet.
+
+- [ ] A live `just meet-e2e` run records a Meet call with no click. It needs a patchrome debug
+  profile signed in to Google.
+- [ ] AirPods connected and removed mid-call while Meet holds the AirPods mic.
+- [ ] A sleep mid-call, through the dev app.
+- [ ] 3 real calls, and the CPU check above.
+- [ ] A Windows clippy run of the phase 3 code.
 
 ## Phase 3b: mic detection
 
