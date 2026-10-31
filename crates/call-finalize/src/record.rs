@@ -8,13 +8,18 @@ use std::path::Path;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
-use crate::{FinalizeError, FinalizeOutcome, OUTPUT_FILE_NAME};
+use crate::{
+    FinalizeError, FinalizeOutcome, InputTrack, OUTPUT_FILE_NAME, SkipReason, SkippedInput,
+};
 
 pub const FINALIZE_RECORD_FILE_NAME: &str = "finalize.json";
 
-/// Raised when the layout changes in a way an older reader would misread. A reader that meets a
-/// newer version finalizes the folder again and writes its own.
-const RECORD_SCHEMA_VERSION: u32 = 1;
+/// Raised when the layout changes in a way an older reader would misread. A reader that meets
+/// another version finalizes the folder again and writes its own. Version 1 had no skip list.
+const RECORD_SCHEMA_VERSION: u32 = 2;
+
+/// The first version whose finished runs list the video they skipped.
+const SKIP_LIST_SCHEMA_VERSION: u32 = 2;
 
 /// A run that failed or never finished, killed by the app's time limit or a quit, gets one more
 /// try on the same manifests, at the next launch.
@@ -48,11 +53,23 @@ struct FinalizeRecord {
 enum RecordedRun {
     /// Planning or writing. Still there after the run means it was killed.
     Started,
-    Written,
-    NoVideo,
+    Written {
+        skipped_video: Vec<SkippedVideo>,
+    },
+    NoVideo {
+        skipped_video: Vec<SkippedVideo>,
+    },
     Failed {
         message: String,
     },
+}
+
+/// A video segment, or a part of one, that the run left out of `call.mp4`, and why. The purge
+/// keeps the segment's folder unless the reason is `Empty`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SkippedVideo {
+    pub(crate) segment: u32,
+    pub(crate) reason: SkipReason,
 }
 
 impl InputStamp {
@@ -83,27 +100,71 @@ fn file_stamp(path: &Path) -> Result<Option<FileStamp>, FinalizeError> {
     }))
 }
 
-/// Whether the folder has video that `call.mp4` does not hold yet, and no finished or failed
-/// run on the same manifests.
-#[must_use]
-pub fn needs_finalize(folder: &Path) -> bool {
+/// Where the folder's finalize stands against its manifests now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FinalizeStanding {
+    /// `call.mp4` is written from the current manifests, or they hold no video to place.
+    Succeeded,
+    /// A run is due: none yet, a manifest changed since, `call.mp4` is gone, or a failed or
+    /// killed run has a retry left.
+    Pending,
+    /// Runs on the current manifests failed or were killed with no retry left, or there is no
+    /// `video.json` to finalize from.
+    Failed,
+}
+
+pub(crate) fn finalize_standing(folder: &Path) -> FinalizeStanding {
     if !folder.join(video_capture::MANIFEST_FILE_NAME).exists() {
-        return false;
+        return FinalizeStanding::Failed;
     }
     let Ok(inputs) = InputStamp::read(folder) else {
-        return true;
+        return FinalizeStanding::Pending;
     };
     let Some(record) = read_record(folder) else {
-        return true;
+        return FinalizeStanding::Pending;
     };
     if record.inputs != inputs {
-        return true;
+        return FinalizeStanding::Pending;
     }
     match record.run {
-        RecordedRun::Written => !folder.join(OUTPUT_FILE_NAME).exists(),
-        RecordedRun::NoVideo => false,
-        RecordedRun::Started | RecordedRun::Failed { .. } => record.attempt_count < MAX_ATTEMPTS,
+        RecordedRun::Written { .. } if folder.join(OUTPUT_FILE_NAME).exists() => {
+            FinalizeStanding::Succeeded
+        }
+        RecordedRun::Written { .. } => FinalizeStanding::Pending,
+        RecordedRun::NoVideo { .. } => FinalizeStanding::Succeeded,
+        RecordedRun::Started | RecordedRun::Failed { .. }
+            if record.attempt_count < MAX_ATTEMPTS =>
+        {
+            FinalizeStanding::Pending
+        }
+        RecordedRun::Started | RecordedRun::Failed { .. } => FinalizeStanding::Failed,
     }
+}
+
+/// The video segments the last finished run left out of `call.mp4`. `None` when the record is
+/// missing, unreadable, of another schema version, or not of a finished run. Version 1 had no
+/// skip list, so its finalize state counts as unknown.
+pub(crate) fn recorded_skipped_video(folder: &Path) -> Option<Vec<SkippedVideo>> {
+    let record =
+        read_record(folder).filter(|record| record.schema_version == SKIP_LIST_SCHEMA_VERSION)?;
+    match record.run {
+        RecordedRun::Written { skipped_video } | RecordedRun::NoVideo { skipped_video } => {
+            Some(skipped_video)
+        }
+        RecordedRun::Started | RecordedRun::Failed { .. } => None,
+    }
+}
+
+/// Whether the folder has video that `call.mp4` does not hold yet, and no finished or failed
+/// run on the same manifests. A folder whose video the purge deleted has none to finalize.
+#[must_use]
+pub fn needs_finalize(folder: &Path) -> bool {
+    if !folder.join(video_capture::MANIFEST_FILE_NAME).exists()
+        || crate::purge::has_purge_record(folder)
+    {
+        return false;
+    }
+    finalize_standing(folder) == FinalizeStanding::Pending
 }
 
 /// Marks the run begun before any media is read, so a run killed in the middle still counts.
@@ -114,16 +175,22 @@ pub(crate) fn write_started(folder: &Path, inputs: &InputStamp) -> Result<(), Fi
     write_record(folder, *inputs, attempt_count, RecordedRun::Started)
 }
 
-/// Busy and Recording never reach here: those runs read no media.
+/// Busy, Recording and Purged never reach here: those runs read no media.
 pub(crate) fn write_finished(
     folder: &Path,
     inputs: &InputStamp,
     outcome: &FinalizeOutcome,
 ) -> Result<(), FinalizeError> {
     let run = match outcome {
-        FinalizeOutcome::Busy | FinalizeOutcome::Recording => return Ok(()),
-        FinalizeOutcome::NoVideo { .. } => RecordedRun::NoVideo,
-        FinalizeOutcome::Written(_) => RecordedRun::Written,
+        FinalizeOutcome::Busy | FinalizeOutcome::Recording | FinalizeOutcome::Purged => {
+            return Ok(());
+        }
+        FinalizeOutcome::NoVideo { skipped } => RecordedRun::NoVideo {
+            skipped_video: skipped_video(skipped),
+        },
+        FinalizeOutcome::Written(summary) => RecordedRun::Written {
+            skipped_video: skipped_video(&summary.skipped),
+        },
         FinalizeOutcome::Failed { message } => RecordedRun::Failed {
             message: message.clone(),
         },
@@ -137,11 +204,22 @@ pub(crate) fn write_finished(
     write_record(folder, *inputs, attempt_count, run)
 }
 
+fn skipped_video(skipped: &[SkippedInput]) -> Vec<SkippedVideo> {
+    skipped
+        .iter()
+        .filter(|input| input.track == InputTrack::Video)
+        .map(|input| SkippedVideo {
+            segment: input.segment,
+            reason: input.reason,
+        })
+        .collect()
+}
+
 fn read_record(folder: &Path) -> Option<FinalizeRecord> {
     let text = std::fs::read_to_string(folder.join(FINALIZE_RECORD_FILE_NAME)).ok()?;
     serde_json::from_str::<FinalizeRecord>(&text)
         .ok()
-        .filter(|record| record.schema_version <= RECORD_SCHEMA_VERSION)
+        .filter(|record| record.schema_version == RECORD_SCHEMA_VERSION)
 }
 
 /// Written beside, then renamed, so a reader never sees half a record.

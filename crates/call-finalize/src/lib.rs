@@ -2,6 +2,8 @@
 //! track and the mic and remote stems mixed into one AAC track, each at its place in time. The
 //! WAV stems and the video fragments stay as they are.
 //!
+//! `purge` deletes `call.mp4` and the fragments 90 days after the call. It is portable.
+//!
 //! Placing and mixing are portable, in `plan` and `mix`, so the Windows capture can reuse them.
 //! Writing the MP4 is macOS only, in `mac`, through AVFoundation: the video passes through as it
 //! was encoded, and only the mix is encoded.
@@ -12,17 +14,22 @@ use std::time::Duration;
 use jiff::Timestamp;
 
 use call_folder::FolderLock;
-pub use capture_protocol::finalize::{FinalizeOutcome, Mp4Summary, PendingFinalize};
+pub use capture_protocol::finalize::{FinalizeOutcome, MediaPurge, Mp4Summary, PendingFinalize};
 
 #[cfg(target_os = "macos")]
 mod mac;
 pub mod mix;
 pub mod plan;
+mod purge;
 mod record;
 
 pub use plan::{
     CallTimeline, InputTrack, PartStart, PlacedPart, PlacedStem, SkipReason, SkippedInput,
     StemChunk, VideoPartInput, plan, plan_folder,
+};
+pub use purge::{
+    FIRST_SEEN_FILE_NAME, MEDIA_RETENTION_DAYS, PURGE_RECORD_FILE_NAME, PURGE_RUN_FILE_NAME,
+    purge_expired_media,
 };
 pub use record::{FINALIZE_RECORD_FILE_NAME, needs_finalize};
 
@@ -110,6 +117,11 @@ pub fn finalize_folder(folder: &Path) -> Result<FinalizeOutcome, FinalizeError> 
 
 /// The run under the folder lock. An error is the outcome `Failed`, recorded by the caller.
 fn finalize_locked(folder: &Path) -> Result<FinalizeOutcome, FinalizeError> {
+    // The fragments are gone or going, so a run would only record a failure.
+    if purge::has_purge_record(folder) {
+        tracing::warn!(file.directory = %folder.display(), "finalize.refused_purged_folder");
+        return Ok(FinalizeOutcome::Purged);
+    }
     remove_stray_files(folder)?;
     if !repair(folder)? {
         return Ok(FinalizeOutcome::Recording);
@@ -150,13 +162,20 @@ fn remove_stray_files(folder: &Path) -> Result<(), FinalizeError> {
         let entry = entry.map_err(io_error)?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let is_stray = name == PARTIAL_FILE_NAME
-            || (name.starts_with(JOINED_PART_PREFIX) && name.ends_with(".mp4"));
-        if is_stray {
+        if is_stray_name(&name) {
             remove_if_present(&entry.path())?;
         }
     }
     Ok(())
+}
+
+/// The partial file and the joined parts a killed run leaves.
+pub(crate) fn is_stray_name(name: &str) -> bool {
+    name == PARTIAL_FILE_NAME
+        || (name.starts_with(JOINED_PART_PREFIX)
+            && Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension == "mp4"))
 }
 
 pub(crate) fn remove_if_present(path: &Path) -> Result<(), FinalizeError> {

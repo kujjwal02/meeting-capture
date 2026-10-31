@@ -141,13 +141,13 @@ The app tracks each open Meet call and huddle in one status board
 - The tray icon is a grey dot when idle, red while recording and amber at a problem or a missing
   huddle permission. Audio that records turns an idle dot red. Audio that keeps failing, a call
   recording without the user's mic, or a refused microphone or system audio permission, turns
-  it amber.
-- On macOS only, each open call has an audio row. Each open call has "Stop recording this call".
-  A stopped call shows "Resume recording" instead. The tooltip and the menu hold one status line
-  per call, with times in the settings time zone. "Recent calls" lists the last 5 calls that
-  ended in this run. The menu is rebuilt only when a call opens or ends; the status tick changes
-  the text of its call lines in place, so an open menu stays open. On Windows the tooltip is cut
-  to 127 UTF-16 units.
+  it amber. So does a huddle's video that keeps failing or has no Screen Recording grant.
+- On macOS only, each open call has an audio row, and a huddle that records video has a video
+  row. Each open call has "Stop recording this call". A stopped call shows "Resume recording"
+  instead. The tooltip and the menu hold one status line per call, with times in the settings
+  time zone. "Recent calls" lists the last 5 calls that ended in this run. The menu is rebuilt
+  only when a call opens or ends; the status tick changes the text of its call lines in place,
+  so an open menu stays open. On Windows the tooltip is cut to 127 UTF-16 units.
 - Notifications: "Recording" once per call at its first caption. "Not recording" after a problem
   lasts 30 s, once per reason in one outage. "Recording again" at the first caption after it,
   which ends the outage, so a later outage is announced again. "No transcript captured" when a
@@ -214,6 +214,14 @@ flowchart LR
   window changes; rebuilding every quiet idle stream would cut still recordings instead.
 - A stream stop that times out leaves a capture that may still run, so the video process closes
   the segment and exits, and `call_capture` restarts it.
+- The video process checks `CGPreflightScreenCaptureAccess` at each segment start and at each
+  stream start inside a segment, after a closed window or a rebuild: macOS 15 and later expire
+  the grant every month. A refusal opens no segment, or ends the open one, and nothing prompts.
+  The call's video row then reads "Video off: allow Screen Recording" and opens the Screen
+  Recording pane of System Settings. The audio process records on untouched. macOS may cache the
+  check's answer per process, so the next wake or window hint ends that video process and starts
+  a new one, whose check runs again. Two such restarts of one call are at least 5 s apart. A
+  debug build's `MC_CAPTURE_INJECT` entry `screen-recording-refused` makes the check read denied.
 - Video follows the audio helper across a sleep: the audio's sleep report stops the video segment,
   and its wake starts the next on the audio's wake segment. A video restart takes video's next
   free number, so each video segment records the `audio_segment` it pairs with.
@@ -247,6 +255,47 @@ flowchart LR
   folder is pending when a manifest changed since, or `call.mp4` is gone. A failed or killed run
   is retried once at the next launch on the same manifests, then left. Any error after the lock
   that leaves a manifest readable is recorded as failed.
+- `mc-capture purge-media --calls-dir` deletes `call.mp4` and the `NNN-video` folders of each
+  call older than 90 days (`MEDIA_RETENTION_DAYS`). The app runs it after finalize at launch,
+  then once a day by the wall clock. The WAV stems, both manifests and every other file stay:
+  phase 4 transcribes the stems. A call ended at the newest change to its capture files: the
+  stems, both manifests and the fragments. Lock files, finalize output and the purge's own
+  files do not count.
+- Fragments stay until a finalize succeeds. The purge deletes only where the finalize record on
+  the current manifests says written, with `call.mp4` still there, or no video. A failed or
+  killed finalize with no retry left, or fragments with no `video.json`, keep everything as
+  `finalize_failed`. A folder still waiting for its `call.mp4` keeps everything, however old.
+- `finalize.json` lists each video segment the run left out of `call.mp4` and why. The purge
+  keeps the folder of a segment skipped for any reason but `empty`, such as one with no clock
+  to place it or a fragment whose part has no record, and of a segment `video.json` does not
+  list. A `finalize.json` of version 1 has no such list, so it counts as no record: the folder
+  waits as `finalize_pending` and the next launch finalizes it again. A folder with only such segments
+  left is kept as `unplaced_video`, and logged at every run.
+- The purge holds `audio.lock`, `video.lock` and `finalize.lock` while it works, and keeps a
+  folder where any is taken. It writes and syncs `media-purge.json` before it deletes. Finalize
+  refuses a folder with that record, and the next purge finishes a half-purged one. It deletes
+  only inside the calls folder: call folders that are links are not listed, each folder must
+  resolve to a child of the calls folder, and a `call.mp4` or segment folder that is a link is
+  left and counted. Each `call.mp4` and segment folder deleted is a log event with its path and
+  size.
+- The purge ages calls against its own clock, stored in UTC in `media-purge-run.json` in the
+  calls folder with the wall clock of the last run. Each run moves it forward by the wall time
+  since the last run, at most 48 h and never past the wall clock. A clock set back pulls it back
+  at once. A call must be 90 days and 48 h old on it, so a single forward jump, which puts the
+  purge clock at most 48 h ahead of real time, deletes nothing early. Forward jumps repeated
+  without the clock set right in between are not bounded: each adds up to 48 h. Each run logs
+  `purge.clock_lagging` while the purge clock is more than 1 h behind the wall clock.
+- The first run, or a run that finds the record lost or unreadable, starts the purge clock at
+  the newest capture file, or at the wall clock when that is earlier or there is none. Those
+  capture times may come from a wrong clock, so that run also moves every first-seen stamp up
+  to the new purge clock. A lost record so delays deletion and never deletes early.
+- The cost is a lasting lag: a run that finds the wall clock more than 48 h ahead of the last
+  run leaves the purge clock behind by the excess, and it never catches up. A clock a week off,
+  or a Mac off for a week, delays every later deletion by about 5 days. Each such gap adds more.
+- A clock set back gives the calls recorded meanwhile old file times. So the first run that sees
+  a call folder with video writes `media-first-seen.json` in it, at the purge clock. A call ages
+  from the later of its end and that stamp. The first run of the purge stamps every existing
+  folder, so it deletes nothing, and those calls go 90 days later.
 - Offsets come from the call timeline, in UTC nanoseconds. A video part starts at its first
   frame's host time, read through the clock reading of the audio segment it pairs with, or its
   own when no audio pairs. Segments whose readings agree on UTC minus host time within 500 ms
@@ -349,7 +398,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 | stem-timing | 3 | The types `capture` and `stem-writer` share: stem, buffer stamp, ring losses, clock reading. Portable, no audio API | `serde` |
 | call-folder | 3 | The per-process lock on a call folder and the walk over `calls/`, shared by every capture process and repair | std file locks |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV placed by host time, fsynced every 4.5 s, and `audio.json` | `rubato` |
-| call-finalize | 3c | Place a call's video parts and stems on one timeline, mix the stems, write `call.mp4`. The planning and mixing are portable | Mac: AVFoundation via `cidre` |
+| call-finalize | 3c | Place a call's video parts and stems on one timeline, mix the stems, write `call.mp4`. Purge call video after 90 days. The planning, mixing and purge are portable | Mac: AVFoundation via `cidre` |
 | stt | 4 | VAD, Parakeet TDT 0.6B v3 int8, diarization of the remote stem | `sherpa-onnx` |
 | video-capture | 3c | Record one window through ScreenCaptureKit, encode it with VideoToolbox, cut 2 s HLS fragments with AVAssetWriter, write `video.json`, repair dead segments. The writer and repair are portable | Mac: `cidre` |
 
@@ -397,7 +446,8 @@ chat_messages:
 ## Platform notes
 
 - **macOS:** needs the Microphone and System Audio Recording permissions, which Core Audio taps
-  require (macOS 14.4 or later). Sign builds with a self-signed certificate. An ad-hoc signature
-  changes every build and macOS then drops the permissions.
+  require (macOS 14.4 or later). Huddle video needs Screen Recording; audio records without it.
+  Sign builds with a self-signed certificate. An ad-hoc signature changes every build and macOS
+  then drops the permissions.
 - **Windows:** WASAPI process loopback with the process-tree mode covers Chrome's separate audio
   process. An unsigned installer is fine for personal use.

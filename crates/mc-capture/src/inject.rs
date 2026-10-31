@@ -1,14 +1,17 @@
 //! Device, power and video events a debug build injects on a timetable, so the device rules and the
 //! sleep path run without touching the user's devices or sleeping the Mac. Set
 //! `MC_CAPTURE_INJECT` to a list such as `5:mic-lost,12:tap-stall,30:sleep,32:wake`: seconds
-//! since the process started, then the event. Release builds do not contain this module.
+//! since the process started, then the event. `0:screen-recording-refused` makes the video
+//! preflight read Screen Recording as denied from then on, and `screen-recording-restored` lets
+//! the real state count again, so the warning runs without revoking the grant. Release builds do
+//! not contain this module.
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use capture::{PowerEvent, SleepAck};
+use capture::{PermissionState, PowerEvent, SleepAck};
 use video_capture::mac::stream::StreamEvent;
 
 const SCHEDULE_VARIABLE: &str = "MC_CAPTURE_INJECT";
@@ -123,12 +126,36 @@ impl fmt::Display for PowerInjection {
     }
 }
 
+/// What the video preflight reads for Screen Recording, from the event's time on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionInjection {
+    ScreenRecordingRefused,
+    /// The real state counts again.
+    ScreenRecordingRestored,
+}
+
+const PERMISSION_INJECTIONS_ALL: [PermissionInjection; 2] = [
+    PermissionInjection::ScreenRecordingRefused,
+    PermissionInjection::ScreenRecordingRestored,
+];
+
+impl fmt::Display for PermissionInjection {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::ScreenRecordingRefused => "screen-recording-refused",
+            Self::ScreenRecordingRestored => "screen-recording-restored",
+        })
+    }
+}
+
 enum ScheduledEvent {
     Device(DeviceEvent),
     Power(PowerInjection),
+    Permission(PermissionInjection),
 }
 
 static DEVICE_EVENTS: Mutex<Vec<(Instant, DeviceEvent)>> = Mutex::new(Vec::new());
+static PERMISSION_EVENTS: Mutex<Vec<(Instant, PermissionInjection)>> = Mutex::new(Vec::new());
 static IS_MIC_ZEROED: AtomicBool = AtomicBool::new(false);
 static IS_CANDIDATE_SILENCED: AtomicBool = AtomicBool::new(false);
 static IS_TAP_SILENCED: AtomicBool = AtomicBool::new(false);
@@ -145,6 +172,7 @@ pub(crate) fn start(on_power: impl Fn(PowerEvent) + Send + 'static) {
     let started = Instant::now();
     let mut power = Vec::new();
     let mut device = Vec::new();
+    let mut permission = Vec::new();
     for entry in schedule
         .split(',')
         .map(str::trim)
@@ -169,10 +197,14 @@ pub(crate) fn start(on_power: impl Fn(PowerEvent) + Send + 'static) {
             }
             ScheduledEvent::Device(event) => device.push((at, event)),
             ScheduledEvent::Power(event) => power.push((at, event)),
+            ScheduledEvent::Permission(event) => permission.push((at, event)),
         }
     }
     tracing::info!(inject.schedule = schedule, "inject.scheduled");
     *DEVICE_EVENTS.lock().unwrap_or_else(PoisonError::into_inner) = device;
+    *PERMISSION_EVENTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = permission;
     if power.is_empty() {
         return;
     }
@@ -204,6 +236,22 @@ pub(crate) fn take_due_device_events() -> Vec<DeviceEvent> {
     let (due, later): (Vec<_>, Vec<_>) = events.drain(..).partition(|(at, _)| *at <= now);
     *events = later;
     due.into_iter().map(|(_, event)| event).collect()
+}
+
+/// The Screen Recording state the latest due injection sets, or `None` while the real one counts.
+pub(crate) fn screen_recording_state() -> Option<PermissionState> {
+    let events = PERMISSION_EVENTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let now = Instant::now();
+    let latest = events
+        .iter()
+        .filter(|(at, _)| *at <= now)
+        .max_by_key(|(at, _)| *at)?;
+    match latest.1 {
+        PermissionInjection::ScreenRecordingRefused => Some(PermissionState::Denied),
+        PermissionInjection::ScreenRecordingRestored => None,
+    }
 }
 
 pub(crate) fn set_mic_zeroed(is_zeroed: bool) {
@@ -291,7 +339,12 @@ pub(crate) fn lid_closed() -> Option<bool> {
 fn valid_names() -> String {
     let device = DEVICE_EVENTS_ALL.iter().map(ToString::to_string);
     let power = POWER_INJECTIONS_ALL.iter().map(ToString::to_string);
-    device.chain(power).collect::<Vec<_>>().join(", ")
+    let permission = PERMISSION_INJECTIONS_ALL.iter().map(ToString::to_string);
+    device
+        .chain(power)
+        .chain(permission)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn parse_event(name: &str) -> Option<ScheduledEvent> {
@@ -301,8 +354,14 @@ fn parse_event(name: &str) -> Option<ScheduledEvent> {
     {
         return Some(ScheduledEvent::Device(event));
     }
-    POWER_INJECTIONS_ALL
+    if let Some(&event) = POWER_INJECTIONS_ALL
         .iter()
         .find(|event| event.to_string() == name)
-        .map(|&event| ScheduledEvent::Power(event))
+    {
+        return Some(ScheduledEvent::Power(event));
+    }
+    PERMISSION_INJECTIONS_ALL
+        .iter()
+        .find(|event| event.to_string() == name)
+        .map(|&event| ScheduledEvent::Permission(event))
 }

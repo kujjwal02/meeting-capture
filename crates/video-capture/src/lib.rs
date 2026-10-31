@@ -80,7 +80,8 @@ pub fn segment_folder_name(number: u32) -> String {
 }
 
 /// The number of a folder named `NNN-video`.
-fn segment_number_of_folder(name: &str) -> Option<u32> {
+#[must_use]
+pub fn segment_number_of_folder(name: &str) -> Option<u32> {
     let digits = name.strip_suffix(SEGMENT_FOLDER_SUFFIX)?;
     let is_number = digits.len() >= 3 && digits.bytes().all(|byte| byte.is_ascii_digit());
     is_number.then(|| digits.parse().ok()).flatten()

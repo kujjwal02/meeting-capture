@@ -6,7 +6,8 @@
 //! devices; `await-device-change` exits on the first device change; `repair` recovers the
 //! segments a dead writer left open in a call folder, audio and video, as the app does at launch;
 //! `finalize` writes a call folder's `call.mp4`, as the app does when a call ends and at launch
-//! for each folder `pending-finalize` lists.
+//! for each folder `pending-finalize` lists; `purge-media` deletes the video of calls older than
+//! 90 days, as the app does at launch and once a day.
 
 #[cfg(target_os = "macos")]
 mod audio;
@@ -132,6 +133,13 @@ enum Command {
         #[arg(long)]
         calls_dir: PathBuf,
     },
+    /// Delete `call.mp4` and the video fragments of each call that ended more than 90 days ago
+    /// and has nothing left to finalize. The stems stay. Prints one JSON object.
+    PurgeMedia {
+        /// The folder that holds the call folders. Nothing outside it is deleted.
+        #[arg(long)]
+        calls_dir: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -214,6 +222,12 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Finalize { folder } => finalize(&folder),
         Command::PendingFinalize { calls_dir } => pending_finalize(&calls_dir),
+        Command::PurgeMedia { calls_dir } => {
+            let purge =
+                call_finalize::purge_expired_media(&calls_dir, std::time::SystemTime::now())?;
+            println!("{}", serde_json::to_string(&purge)?);
+            Ok(())
+        }
         Command::Video => {
             #[cfg(target_os = "macos")]
             return video::serve();
