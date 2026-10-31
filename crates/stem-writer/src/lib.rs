@@ -41,7 +41,7 @@ pub const SEGMENT_SAMPLE_LIMIT: u64 = 24 * 3_600 * OUTPUT_RATE_HZ as u64;
 
 /// The audio process's lock file in a call folder. A segment holds it for its whole life, and
 /// repair takes it before it reads anything.
-pub(crate) const LOCK_FILE_NAME: &str = "audio.lock";
+pub const LOCK_FILE_NAME: &str = "audio.lock";
 
 /// How long a segment start waits for the folder's lock. A helper whose app died holds it until
 /// its segment closes: 102 ms after its stdin closed, as measured. A repair holds it for

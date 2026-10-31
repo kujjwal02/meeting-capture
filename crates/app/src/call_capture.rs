@@ -23,8 +23,13 @@
 //! with the audio's new segment number. A video segment records the audio segment it pairs with,
 //! since a video restart takes video's next free number. The helper's permission reports
 //! feed the tray: a refused microphone or system audio permission shows as a problem. A refused
-//! screen recording permission turns the call's video row into "Video off: allow Screen
-//! Recording", which opens System Settings.
+//! screen recording permission, at a segment start or at any stream start inside one, turns the
+//! call's video row into "Video off: allow Screen Recording", which opens System Settings. The
+//! audio process records on untouched. The next wake or window hint starts a new video process,
+//! whose preflight checks again: macOS may cache the answer per process.
+//!
+//! At launch, after repair and finalize, and then once a day, `mc-capture purge-media` deletes
+//! the video of calls that ended more than 90 days ago. The stems stay for transcription.
 
 mod restart_backoff;
 
@@ -32,9 +37,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use capture_protocol::finalize::{FinalizeOutcome, PendingFinalize};
+use capture_protocol::finalize::{
+    FinalizeOutcome, MEDIA_PURGE_INTERVAL, MediaPurge, PendingFinalize,
+};
 use capture_protocol::{
     AudioCommand, AudioErrorKind, AudioReport, DeviceChangeCause, MicMoment, PermissionService,
     PermissionState, Platform, Stem, VideoCommand, VideoErrorKind, VideoReport, WindowChangeCause,
@@ -61,6 +68,9 @@ const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// segment within 1 s. Past this it is killed.
 const STOP_LIMIT: Duration = Duration::from_secs(12);
 const SIDECAR_LOG_FILE_NAME: &str = "mc-capture.log";
+/// The shortest time between two respawns of one call's process for a new Screen Recording
+/// check, so a refusal that comes back at once cannot spin the helper.
+const RESPAWN_GAP: Duration = Duration::from_secs(5);
 /// A finalize that runs this long hangs: a two-hour call takes about two minutes, plus up to
 /// five waiting for another run on the same folder. Killed, it is retried once at the next
 /// launch, then left.
@@ -69,6 +79,11 @@ const FINALIZE_LIMIT: Duration = Duration::from_mins(20);
 const PENDING_LIST_LIMIT: Duration = Duration::from_secs(60);
 /// A capture process that outlived its call closes its segment within seconds of its stop.
 const RECORDING_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// The purge reads a few file times per folder and unlinks at most a few thousand fragments.
+const PURGE_LIMIT: Duration = Duration::from_mins(10);
+/// The purge interval is time on the wall clock, not the monotonic one, which stops while the
+/// Mac sleeps: a laptop asleep every night would otherwise purge every few days.
+const PURGE_CHECK_INTERVAL: Duration = Duration::from_hours(1);
 /// The helper log moves to `mc-capture.log.1` at a start once it is this big.
 const SIDECAR_LOG_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(windows)]
@@ -390,7 +405,7 @@ fn set_recording_stopped(app: &AppHandle, call_id: &Path, is_stopped: bool) {
 
 /// Starts the supervisor. Call before any call source starts, so it hears every call. Also
 /// repairs, in the background, the segments a dead helper left open in any call folder, then
-/// writes the `call.mp4` a crash or a quit left unwritten.
+/// writes the `call.mp4` a crash or a quit left unwritten, then purges old video now and daily.
 pub(crate) fn start(app: &AppHandle) {
     let state = app.state::<AppState>();
     let app_dirs = state.settings.app_dirs();
@@ -404,8 +419,11 @@ pub(crate) fn start(app: &AppHandle) {
             tracing::error!(exception.message = %error, "repair.task_failed");
         }
         // After the repair, so finalize never meets a folder lock the repair holds and skips it.
+        // Only the Mac records video, so only the Mac has any to finalize or purge.
         if cfg!(target_os = "macos") {
             finalize_pending(&calls_dir, &log_file).await;
+            // After finalize, so a folder that waited for its `call.mp4` has it by now.
+            purge_media_daily(&calls_dir, &log_file).await;
         }
     });
     let stop_changes = state
@@ -523,6 +541,59 @@ async fn finalize_pending(calls_dir: &Path, log_file: &Path) {
     }
 }
 
+/// Runs the purge now, then whenever a day has passed on the wall clock. Never returns.
+async fn purge_media_daily(calls_dir: &Path, log_file: &Path) {
+    loop {
+        purge_media(calls_dir, log_file).await;
+        let last_run = SystemTime::now();
+        loop {
+            tokio::time::sleep(PURGE_CHECK_INTERVAL).await;
+            // A clock set back waits until it passes the last run again.
+            let is_due = SystemTime::now()
+                .duration_since(last_run)
+                .is_ok_and(|elapsed| elapsed >= MEDIA_PURGE_INTERVAL);
+            if is_due {
+                break;
+            }
+        }
+    }
+}
+
+/// Deletes the video of calls past the retention through the helper's `purge-media`. The helper
+/// logs each deletion in the helper log; the app logs the totals.
+async fn purge_media(calls_dir: &Path, log_file: &Path) {
+    let run = run_helper(
+        &[
+            "purge-media".as_ref(),
+            "--calls-dir".as_ref(),
+            calls_dir.as_os_str(),
+        ],
+        log_file,
+        PURGE_LIMIT,
+    )
+    .await;
+    match run.map(|stdout| serde_json::from_str::<MediaPurge>(stdout.trim())) {
+        Ok(Ok(purge)) => tracing::info!(
+            file.directory = %calls_dir.display(),
+            purge.trusted_now = purge.trusted_now.map(|at| at.to_string()),
+            purge.first_seen_count = purge.first_seen_count,
+            purge.purged_folder_count = purge.purged.len(),
+            purge.kept_folder_count = purge.kept.len(),
+            purge.deleted_file_count = purge
+                .purged
+                .iter()
+                .map(|call| call.deleted_file_count)
+                .sum::<u64>(),
+            purge.deleted_bytes = purge.purged.iter().map(|call| call.deleted_bytes).sum::<u64>(),
+            "purge.finished"
+        ),
+        Ok(Err(error)) => {
+            tracing::error!(exception.message = %error, "purge.unreadable");
+        }
+        Err(reason) => tracing::error!(exception.message = reason, "purge.helper_failed"),
+    }
+}
+
 /// Writes one call folder's `call.mp4` through the helper's `finalize`. A folder some capture
 /// process still records in gets one more try once that process has had time to close.
 async fn finalize_call(folder: PathBuf, log_file: PathBuf) {
@@ -584,11 +655,13 @@ async fn finalize_once(folder: &Path, log_file: &Path) -> Option<FinalizeOutcome
             finalize.skipped_count = skipped.len(),
             "finalize.finished"
         ),
-        FinalizeOutcome::Busy | FinalizeOutcome::Recording => tracing::warn!(
-            file.directory = %folder.display(),
-            finalize.outcome = outcome.as_str(),
-            "finalize.finished"
-        ),
+        FinalizeOutcome::Busy | FinalizeOutcome::Recording | FinalizeOutcome::Purged => {
+            tracing::warn!(
+                file.directory = %folder.display(),
+                finalize.outcome = outcome.as_str(),
+                "finalize.finished"
+            );
+        }
     }
     Some(outcome)
 }
@@ -678,6 +751,11 @@ impl ProcessLinks {
         self.audio_phase_in
             .as_mut()
             .map(|phase| *phase.borrow_and_update())
+    }
+
+    /// The audio phase now, left unseen, so `next_audio_phase` still wakes for it.
+    fn audio_phase_now(&self) -> Option<AudioPhase> {
+        self.audio_phase_in.as_ref().map(|phase| *phase.borrow())
     }
 
     /// The next audio phase change. Never ends once the audio process is gone.
@@ -993,6 +1071,7 @@ fn spawn_process<P: CaptureProcess>(
         log_file: log_file.to_path_buf(),
         segment,
         backoff: RestartBackoff::default(),
+        last_respawn_at: None,
         process: std::marker::PhantomData,
     };
     let span = tracing::info_span!(
@@ -1041,7 +1120,8 @@ enum ReportSign {
     Closed {
         segment: u32,
     },
-    /// The process opened no segment for its last `start`, and waits for the next command.
+    /// The process found Screen Recording refused at a segment or stream start. It holds no
+    /// segment and waits for the next command.
     Refused,
     /// The user stopped video through the system's sharing controls. The process closes the
     /// segment and waits for the next command.
@@ -1582,6 +1662,8 @@ struct Recording<P: CaptureProcess> {
     /// The segment the next start uses, or the last one started or rotated to.
     segment: u32,
     backoff: RestartBackoff,
+    /// When the last respawn for a Screen Recording check started its new process.
+    last_respawn_at: Option<Instant>,
     process: std::marker::PhantomData<P>,
 }
 
@@ -1594,6 +1676,17 @@ enum ProcessEnd {
         reason: String,
         is_device_open_failed: bool,
     },
+    /// The supervisor closed it to retry after a Screen Recording refusal. macOS may cache the
+    /// preflight's answer per process, so only a new process sees a grant given since.
+    Respawn,
+}
+
+/// What a run does after it took an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunNext {
+    Continue,
+    /// End this process and start a new one, at least `RESPAWN_GAP` after the last respawn.
+    Respawn,
 }
 
 impl<P: CaptureProcess> Recording<P> {
@@ -1608,6 +1701,28 @@ impl<P: CaptureProcess> Recording<P> {
                 ProcessEnd::Stopped => {
                     tracing::info!(call.id = %self.call.id.display(), "capture process stopped");
                     return;
+                }
+                ProcessEnd::Respawn => {
+                    // A stop sent while the old process wound down ends the call here.
+                    if !matches!(stop.try_recv(), Err(oneshot::error::TryRecvError::Empty)) {
+                        tracing::info!(call.id = %self.call.id.display(), "capture process stopped");
+                        return;
+                    }
+                    let gap = self.last_respawn_at.map_or(Duration::ZERO, |at| {
+                        RESPAWN_GAP.saturating_sub(at.elapsed())
+                    });
+                    tracing::info!(
+                        call.id = %self.call.id.display(),
+                        segment.number = self.segment,
+                        capture.restart_delay_ms = u64::try_from(gap.as_millis()).unwrap_or(u64::MAX),
+                        "restarting the capture process for a new Screen Recording check"
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(gap) => {}
+                        _ = &mut stop => return,
+                    }
+                    self.last_respawn_at = Some(Instant::now());
+                    continue;
                 }
                 ProcessEnd::Failed {
                     reason,
@@ -1740,17 +1855,24 @@ impl<P: CaptureProcess> Recording<P> {
                 phase = ProcessLinks::next_audio_phase(&mut links.audio_phase_in),
                     if stop_deadline.is_none() =>
                 {
-                    if let Err(error) = self.follow_audio(phase, &mut run).await {
-                        kill(&mut child).await;
-                        return failed(format!("could not follow the audio's sleep: {error}"));
+                    let followed = self.follow_audio(phase, &mut run).await;
+                    let failure = "could not follow the audio's sleep";
+                    if let Some(end) =
+                        Self::end_after(self.segment, followed, failure, &mut child, &mut run).await
+                    {
+                        return end;
                     }
                 }
                 hint = ProcessLinks::next_hint(&mut links.window_hints),
                     if stop_deadline.is_none() =>
                 {
-                    if let Err(error) = self.follow_hint(hint, &mut run).await {
-                        kill(&mut child).await;
-                        return failed(format!("could not send the new window: {error}"));
+                    let audio_phase = links.audio_phase_now();
+                    let followed = self.follow_hint(hint, &mut run, audio_phase).await;
+                    let failure = "could not send the new window";
+                    if let Some(end) =
+                        Self::end_after(self.segment, followed, failure, &mut child, &mut run).await
+                    {
+                        return end;
                     }
                 }
                 () = stop_limit => {
@@ -1805,6 +1927,7 @@ impl<P: CaptureProcess> Recording<P> {
                 RunHold::Free
             },
             seen_sleep_count: audio_phase.map_or(0, |phase| phase.sleep_count),
+            has_refusal: false,
         };
         Ok((child, stdout, run))
     }
@@ -1961,6 +2084,11 @@ impl<P: CaptureProcess> Recording<P> {
             Some(ReportSign::Refused) => {
                 run.has_closed_segment = true;
                 run.open_segment = None;
+                run.has_refusal = true;
+                // A sleep that came after the start keeps its hold, so the wake still starts.
+                if run.hold == RunHold::Free {
+                    run.hold = RunHold::Refused;
+                }
             }
             Some(ReportSign::StoppedByUser) => run.hold = RunHold::StoppedByUser,
             Some(ReportSign::DeviceOpenFailed) => run.is_device_open_failed = true,
@@ -2011,10 +2139,7 @@ impl<P: CaptureProcess> Recording<P> {
             return Ok(false);
         };
         send_command(stdin, run.next_command_seq, &start).await?;
-        tracing::info!(
-            segment.number = segment,
-            "started the next segment after a wake"
-        );
+        tracing::info!(segment.number = segment, "started the next segment");
         run.next_command_seq += 1;
         run.open_segment = Some(segment);
         run.has_closed_segment = false;
@@ -2030,11 +2155,12 @@ impl<P: CaptureProcess> Recording<P> {
         &mut self,
         phase: AudioPhase,
         run: &mut ProcessRun,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<RunNext> {
         let is_new_sleep = phase.sleep_count != run.seen_sleep_count;
         run.seen_sleep_count = phase.sleep_count;
-        // After the user's stop no segment is open, and the tray keeps saying who stopped it.
-        if is_new_sleep && run.hold == RunHold::Free {
+        // After the user's stop no segment is open, and the tray keeps saying who stopped it. A
+        // refused run sleeps too, so its wake tries again.
+        if is_new_sleep && matches!(run.hold, RunHold::Free | RunHold::Refused) {
             run.hold = RunHold::Asleep;
             if run.open_segment.is_some()
                 && let Some(stdin) = run.stdin.as_mut()
@@ -2052,30 +2178,77 @@ impl<P: CaptureProcess> Recording<P> {
             // The audio's wake segment is above every number in the folder, video's included.
             let segment = P::next_free_segment(&self.folder)
                 .map_or(phase.segment, |free| free.max(phase.segment));
+            if run.has_refusal {
+                self.segment = segment;
+                return Ok(RunNext::Respawn);
+            }
             if self.send_start(segment, phase.segment, run).await? {
                 run.hold = RunHold::Free;
             }
         }
-        Ok(())
+        Ok(RunNext::Continue)
     }
 
-    /// Keeps the huddle watcher's new window for restarts, and hands it to an open segment.
-    async fn follow_hint(&mut self, hint: WindowHint, run: &mut ProcessRun) -> std::io::Result<()> {
+    /// Keeps the huddle watcher's new window for restarts, and hands it to an open segment. A
+    /// run whose last start found Screen Recording refused respawns on it instead.
+    async fn follow_hint(
+        &mut self,
+        hint: WindowHint,
+        run: &mut ProcessRun,
+        audio_phase: Option<AudioPhase>,
+    ) -> std::io::Result<RunNext> {
         tracing::info!(
             video.window_id = hint.window_id,
             "the call's window changed"
         );
         self.call.window_hint = Some(hint.clone());
+        if run.hold == RunHold::Refused {
+            // While the Mac sleeps the wake respawns, on the audio's wake segment.
+            if audio_phase.is_some_and(|phase| phase.is_asleep) {
+                return Ok(RunNext::Continue);
+            }
+            let audio_segment = audio_phase.map_or(self.segment, |phase| phase.segment);
+            self.segment = P::next_free_segment(&self.folder)
+                .map_or(audio_segment, |free| free.max(audio_segment));
+            return Ok(RunNext::Respawn);
+        }
         // A segment that starts later takes the hint from the call.
         if run.open_segment.is_none() || run.hold != RunHold::Free {
-            return Ok(());
+            return Ok(RunNext::Continue);
         }
         let (Some(stdin), Some(command)) = (run.stdin.as_mut(), P::window_command(hint)) else {
-            return Ok(());
+            return Ok(RunNext::Continue);
         };
         send_command(stdin, run.next_command_seq, &command).await?;
         run.next_command_seq += 1;
-        Ok(())
+        Ok(RunNext::Continue)
+    }
+
+    /// How a followed event ends the process, if it does: a respawn, or a failure to write to it.
+    async fn end_after(
+        segment: u32,
+        followed: std::io::Result<RunNext>,
+        failure: &str,
+        child: &mut Child,
+        run: &mut ProcessRun,
+    ) -> Option<ProcessEnd> {
+        match followed {
+            Ok(RunNext::Continue) => None,
+            Ok(RunNext::Respawn) => Some(Self::respawn(segment, child, run).await),
+            Err(error) => {
+                kill(child).await;
+                Some(failed(format!("{failure}: {error}")))
+            }
+        }
+    }
+
+    /// Closes stdin of a process that holds no segment, so it exits, and waits for it. The run
+    /// loop then starts a new process.
+    async fn respawn(segment: u32, child: &mut Child, run: &mut ProcessRun) -> ProcessEnd {
+        drop(run.stdin.take());
+        let deadline = tokio::time::Instant::now() + STOP_LIMIT;
+        Self::wait_stopped(segment, child, deadline, run.has_closed_segment).await;
+        ProcessEnd::Respawn
     }
 
     /// The call's next segment number after a sleep closed this one. Every capture process of
@@ -2109,6 +2282,9 @@ struct ProcessRun {
     hold: RunHold,
     /// The audio phase's sleep count when this run last read it.
     seen_sleep_count: u64,
+    /// The process reported a Screen Recording refusal. Its next start, at a wake or a new
+    /// window, goes to a new process instead.
+    has_refusal: bool,
 }
 
 /// What keeps a video run from recording.
@@ -2122,6 +2298,9 @@ enum RunHold {
     /// The user stopped video through the system's sharing controls. Wakes and window hints
     /// start nothing until the call resumes, which starts a new run.
     StoppedByUser,
+    /// macOS refused Screen Recording at the last start, so no segment is open. The next wake
+    /// or window hint starts a new process, whose preflight checks again.
+    Refused,
 }
 
 impl ProcessRun {

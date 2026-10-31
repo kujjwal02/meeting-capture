@@ -309,13 +309,27 @@ Done when:
 - [x] One video track for parts of different sizes or codecs: a differing part is encoded again in
   the first part's codec and size, letterboxed.
 - [ ] Delete fragments after a good finalize.
-- [ ] 90-day purge of call media.
+- [x] 90-day purge of call media: `call.mp4` and the video fragments of calls that ended over 90
+  days ago, only after a finalize succeeded, never the stems. Run on synthetic call folders
+  only: it kept a young folder, a locked one, one with no `finalize.json`, one with a retry left,
+  failed finalizes, fragments with no `video.json`, an open segment and a never-seen folder,
+  kept segments with no clock or with a fragment of an unrecorded part, refused links out of the
+  calls folder, and finished a purge killed after its record. A first run, a clock a year ahead
+  with a relaunch 5 minutes later, and a lost run record with future-dated files deleted
+  nothing. After a 3-day jump a call 89 days old stayed and one 91 days old went. A clock set
+  back a week aged calls by the wall clock.
+- [ ] A Screen Recording grant given mid-call takes effect at the next wake or new huddle window:
+  the video process is replaced, so its preflight is not cached. Needs a real revoke and re-grant
+  on a Mac; code only.
 - [ ] mc-meet tab capture for Meet video, with no Screen Recording grant.
 
 Done when:
 
 - [ ] Lips match voices within 100 ms on 3 calls.
-- [ ] Revoking Screen Recording shows the warning, and audio still records.
+- [ ] Revoking Screen Recording shows the warning, and audio still records. Only the debug
+  injection ran, never a real revoke: it made the preflight read denied at two segment starts and
+  at a stream rebuild inside an open segment, and video reported `permission_denied` each time
+  while the audio stems grew at 32 kB/s. The tray row is code only, not seen in a running app.
 - [ ] A Meet call records the Meet tab through a tab switch.
 
 ## Phase 4: local speech-to-text

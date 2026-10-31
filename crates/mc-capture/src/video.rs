@@ -177,7 +177,7 @@ pub(crate) fn serve() -> anyhow::Result<()> {
                 platform,
                 window_hint,
             } => {
-                let state = capture::permission_state(PermissionService::ScreenRecording);
+                let state = screen_recording_state();
                 writer.send(&VideoReport::Permission {
                     service: PermissionService::ScreenRecording,
                     state,
@@ -329,6 +329,9 @@ enum StopCause {
     StdinClosed,
     /// The system's sharing controls ended the capture.
     User,
+    /// A stream start in the segment, after a closed window or a rebuild, found Screen
+    /// Recording refused.
+    ScreenRecordingRefused,
 }
 
 impl StopCause {
@@ -337,6 +340,7 @@ impl StopCause {
             Self::Command => "stop",
             Self::StdinClosed => "stdin_closed",
             Self::User => "user",
+            Self::ScreenRecordingRefused => "screen_recording_refused",
         }
     }
 }
@@ -547,6 +551,16 @@ fn record_segment(
             reports.error(
                 VideoErrorKind::StoppedByUser,
                 "the capture was stopped through the system's sharing controls".to_owned(),
+            )?;
+            Ok(SegmentEnd::Stopped)
+        }
+        (Ok(StopCause::ScreenRecordingRefused), Ok(())) => {
+            reports.error(
+                VideoErrorKind::PermissionDenied,
+                format!(
+                    "screen recording was refused at a stream start: segment {} ended",
+                    request.number
+                ),
             )?;
             Ok(SegmentEnd::Stopped)
         }
@@ -1330,6 +1344,19 @@ impl Segment<'_> {
         if self.stop_count.is_stop_read() {
             return Ok(None);
         }
+        // Every stream start checks, not only the segment's: macOS 15 and later expire the grant
+        // monthly, and a refused stream would only fail into rebuilds and a restart.
+        let state = screen_recording_state();
+        if state != PermissionState::Granted {
+            self.reports.send(&VideoReport::Permission {
+                service: PermissionService::ScreenRecording,
+                state,
+            })?;
+            return Ok(Some(SegmentStop::new(
+                StopCause::ScreenRecordingRefused,
+                Instant::now(),
+            )));
+        }
         let was_missing = self.window.is_none();
         let previous_id = self
             .window
@@ -1472,6 +1499,16 @@ impl Segment<'_> {
             }
         }
     }
+}
+
+/// Screen Recording as the preflight reads it. A debug build's injection can report it refused.
+fn screen_recording_state() -> PermissionState {
+    #[cfg(debug_assertions)]
+    if let Some(state) = crate::inject::screen_recording_state() {
+        tracing::info!(permission.state = %state, "inject.screen_recording_state");
+        return state;
+    }
+    capture::permission_state(PermissionService::ScreenRecording)
 }
 
 /// Stops a stream, waiting at most `limit`. A stop that fails leaves nothing to do.

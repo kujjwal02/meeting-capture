@@ -131,6 +131,13 @@ pub fn plan_folder(folder: &Path) -> Result<CallTimeline, FinalizeError> {
     let mut skipped = Vec::new();
     let mut parts = Vec::new();
     for segment in &video.segments {
+        if has_fragment_without_part(segment) {
+            skipped.push(SkippedInput {
+                segment: segment.number,
+                track: InputTrack::Video,
+                reason: SkipReason::NoPartRecord,
+            });
+        }
         match window_capture_parts(folder, segment) {
             Ok(segment_parts) => parts.extend(segment_parts),
             Err(reason) => skipped.push(SkippedInput {
@@ -143,6 +150,18 @@ pub fn plan_folder(folder: &Path) -> Result<CallTimeline, FinalizeError> {
     let mut timeline = plan(folder, &audio, &parts);
     timeline.skipped.splice(0..0, skipped);
     Ok(timeline)
+}
+
+/// Whether a fragment names a part with no record. It never reaches `call.mp4`, so the skip
+/// entry keeps its segment folder from the purge.
+fn has_fragment_without_part(segment: &VideoSegmentRecord) -> bool {
+    !segment.parts.is_empty()
+        && segment.fragments.iter().any(|fragment| {
+            !segment
+                .parts
+                .iter()
+                .any(|part| part.number == fragment.part)
+        })
 }
 
 /// The parts of one segment `mc-capture video` wrote.
