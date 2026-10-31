@@ -265,7 +265,8 @@ runs. None has run on a real call yet.
 - [x] A live `just meet-e2e` run records a Meet call with no click. A Workspace account hosted
   and a personal account joined. Stop and resume through the popup gave two closed segments with
   nonzero stems, and macOS held off idle sleep only while recording.
-- [ ] The same run's caption checks: mc-meet turns captions on but never hides them again.
+- [x] The same run's caption checks. mc-meet presses Meet's captions toggle once per call, and
+  the caption box never shows. Two runs in a row passed every check.
 - [ ] AirPods connected and removed mid-call while Meet holds the AirPods mic.
 - [ ] A sleep mid-call, through the dev app.
 - [ ] 3 real calls, and the CPU check above.
