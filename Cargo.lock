@@ -482,7 +482,7 @@ dependencies = [
 
 [[package]]
 name = "browser-shortcut"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "dispatch2",
  "objc2",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "call-finalize"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "call-folder",
  "capture-protocol",
@@ -572,7 +572,7 @@ dependencies = [
 
 [[package]]
 name = "call-folder"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "tracing",
 ]
@@ -588,7 +588,7 @@ dependencies = [
 
 [[package]]
 name = "capture"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "cidre",
  "cpal",
@@ -601,7 +601,7 @@ dependencies = [
 
 [[package]]
 name = "capture-protocol"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "jiff",
  "serde",
@@ -767,7 +767,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "cli"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2108,7 +2108,7 @@ checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
 name = "huddle-captions"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "jiff",
  "objc2",
@@ -2577,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "jobs"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "jiff",
  "rusqlite",
@@ -2786,7 +2786,7 @@ dependencies = [
 
 [[package]]
 name = "mc-capture"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "call-finalize",
@@ -2807,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "meeting-capture"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "base64 0.22.1",
  "browser-shortcut",
@@ -2942,7 +2942,7 @@ checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "native-host"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "directories",
  "serde_json",
@@ -3680,7 +3680,7 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 
 [[package]]
 name = "pipeline"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -4906,7 +4906,7 @@ dependencies = [
 
 [[package]]
 name = "sources"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "jiff",
  "serde",
@@ -4942,14 +4942,14 @@ checksum = "ff7589a1859b09232522bb9edf076ca7fcf14ded96685d3fa629db73023ffbb7"
 
 [[package]]
 name = "stem-timing"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "stem-writer"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "call-folder",
  "jiff",
@@ -6102,7 +6102,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "video-capture"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "call-folder",
  "cidre",
