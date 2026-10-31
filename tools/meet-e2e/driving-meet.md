@@ -79,6 +79,11 @@ before you write a new driver or spike.
   synthetic `KeyboardEvent` from the page, starts the stream. With mc-meet's `captions_v2` open,
   Meet shows no caption box, but its captions button reads on about 30 s later. A second press
   stops the stream at once. Read `caption_box_shown`, not `captions_on`, to tell what is on screen.
+- Meet sometimes ignores that press. Its captions button then never reads on, and `captions_v2`
+  gets 1 control frame in total, against about 1 per second after a press Meet took. A silent
+  call gets no caption either way, so read the button, or `frame_counters` in the debug
+  snapshot. Open the guest browser only after the host is in the call. A driver that opened it
+  before the host joined saw 3 of 7 presses ignored. `run.mjs` opens it after and saw none.
 - The profile may hold a `meet.google.com/home` tab in another window. Pick the call tab by its
   meeting code, not by the first `meet.google.com` match.
 - `chrome.action.openPopup()` fails with "Could not find an active browser window" when another

@@ -66,8 +66,9 @@ failing frames; `just replay-frames <report folder>` runs them through `page/wir
 
 - No network requests, telemetry, remote config or downloads. The popup shows what the app
   reports and talks only to the service worker.
-- The extension never changes the caption language, and presses Meet's captions
-  button at most once per call: a second press would stop the caption stream.
+- The extension never changes the caption language. It presses Meet's captions button again
+  only while the button has not read on 45 s after the last press, at most 3 times per call: a
+  second press after one Meet took would stop the caption stream.
 - Plain JavaScript, no build step, no npm packages. `biome check extension/` must pass.
 
 ## Licences

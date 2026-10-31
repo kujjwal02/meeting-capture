@@ -201,7 +201,11 @@ stored value the content script hides the caption region.
   script presses Meet's captions button once, or Meet's C shortcut where the account has the
   "Captions and translation" button. The stream then goes to the hook's channels, and Meet's
   caption box never shows. About 30 s later Meet's captions button may read on, still with no
-  box. A second press would stop the stream, so mc-meet presses only once. Some Meet builds also
+  box. Meet sometimes ignores the press: the button never reads on and no stream comes. A second
+  press after one Meet took would stop the stream. So mc-meet presses again only while the
+  button has not read on 45 s after the last press, at most 3 times per call. Each press, with
+  `document.hasFocus()` and the page visibility, goes into the page snapshot of a debug folder
+  as `captions_presses`. Some Meet builds also
   open their own negotiated `captions_v2` channel at call start. The hook reads it too. When no
   caption arrives within 20 s of opening the channels, or 10 caption frames in a row fail to
   decode with no good caption in the last 20 s, the content
@@ -245,7 +249,7 @@ stored value the content script hides the caption region.
   `REC?`. One notification per tab asks for a click on the icon or the context menu entry. It
   waits until the call has a `caption_source` of `channel` or `dom`, or a problem reason: a
   notification can take the page's focus, and Meet may then ignore mc-meet's captions press.
-  The content script logs `document.hasFocus()` at that press. The invocation starts capture at
+  The page snapshot records `document.hasFocus()` at that press. The invocation starts capture at
   once. The icon and the context menu entry also retry video that failed. The command always
   stops a call that records, waits for captions or has a problem, whatever its video state.
   Pressed on a tab outside Meet, it stops every such call. It resumes a stopped call, and with

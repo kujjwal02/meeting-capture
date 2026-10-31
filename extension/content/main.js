@@ -40,6 +40,9 @@
   const cutUtterances = new Set();
   let leaveMissingSinceMs = null;
   let lastHealthKey = "";
+  // This call's captions presses, for the debug snapshot: Meet may ignore a press made while the
+  // page has no focus, and the console line is gone once the tab closes.
+  let captionsPresses = [];
   let isSelfRemoved = false;
   let selfName = "";
   let isRosterFromChannel = false;
@@ -213,6 +216,7 @@
     call.page_started_ms = Date.now();
     lastRosterKey = "";
     lastHealthKey = "";
+    captionsPresses = [];
     if (channelRoster) sendRoster(channelRoster);
     follow(captionSource.decide({ kind: "call_began", atMs: call.page_started_ms }));
     // The hook may have opened its channels before the page showed the call controls.
@@ -270,13 +274,24 @@
   // Meet streams nothing on the caption channels until something asks for captions. Pressing
   // Meet's captions control asks. Meet's captions button reads on about 30 s later, but Meet
   // renders no caption box, since the captions go to the hook's channels. A second press stops
-  // the stream, so the policy asks for one press per call. Never touches the caption language.
+  // the stream, so the policy presses again only while Meet's control has not read on since.
+  // Never touches the caption language.
   function requestCaptions(nowMs) {
-    // Meet may ignore the press while the page has no focus, as a notification can take it.
-    console.info("mc-meet: captions press", { has_focus: document.hasFocus() });
+    const notePress = (isShortcut) => {
+      // Meet may ignore the press while the page has no focus, as a notification can take it.
+      const press = {
+        at: new Date(nowMs).toISOString(),
+        is_shortcut: isShortcut,
+        has_focus: document.hasFocus(),
+        is_visible: document.visibilityState === "visible",
+      };
+      captionsPresses.push(press);
+      console.info("mc-meet: captions press", press);
+      captionSource.decide({ kind: "captions_requested", atMs: nowMs });
+    };
     const button = findIconButton(selectors.captionsOffIcon);
     if (button) {
-      captionSource.decide({ kind: "captions_requested", atMs: nowMs });
+      notePress(false);
       button.click();
       return;
     }
@@ -284,7 +299,7 @@
     // shortcut presses it without the popup.
     const menuButton = findIconButton(selectors.captionsMenuIcon);
     if (menuButton?.getAttribute("aria-pressed") !== "false") return;
-    captionSource.decide({ kind: "captions_requested", atMs: nowMs });
+    notePress(true);
     for (const type of ["keydown", "keyup"]) {
       document.body.dispatchEvent(
         new KeyboardEvent(type, {
@@ -370,6 +385,7 @@
           tooltip: button.tooltip,
         },
         caption_source: captionSource.health(),
+        captions_presses: captionsPresses,
         is_dom_reader_attached: domCaptions.isAttached(),
         caption_region: globalThis.mcMeetDescribeCaptionRegion(),
         page_hook: page,
@@ -486,7 +502,11 @@
     if (!call || !isInCall) return;
     if (nowMs - call.last_seen_ms >= 5000) storeSession();
 
-    const decision = captionSource.decide({ kind: "tick", atMs: nowMs });
+    const decision = captionSource.decide({
+      kind: "tick",
+      atMs: nowMs,
+      isCaptionsOn: globalThis.mcMeetReadCaptionsButton().isOn,
+    });
     follow(decision);
     if (decision.isCaptionsRequestDue) requestCaptions(nowMs);
 
