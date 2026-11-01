@@ -33,6 +33,7 @@ const TOTAL_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 /// A call's folder size is read again this often while its files grow.
 const FOLDER_MEASURE_INTERVAL: Duration = Duration::from_secs(10);
 const FRAMES_FILE: &str = "frames.jsonl";
+const MEET_EVENTS_FILE: &str = "events.jsonl";
 const LEAD_UP_FILE: &str = "lead-up.jsonl";
 const PAGE_SNAPSHOTS_FILE: &str = "page-snapshots.jsonl";
 const CALL_STATUS_FILE: &str = "call-status.json";
@@ -237,6 +238,12 @@ impl CallDebug {
         {
             lead_up.pop_front();
         }
+    }
+
+    /// Appends an mc-meet event line to the call's `events.jsonl`, so the debug folder alone shows
+    /// the presses and channel changes next to the counters in `metrics.jsonl`.
+    pub(crate) fn record_meet_event(&self, call_id: &Path, line: &serde_json::Value) {
+        self.append_line(call_id, MEET_EVENTS_FILE, line);
     }
 
     /// Writes the frame to the call's `frames.jsonl`, for the first `MAX_FAILED_FRAMES` of the
