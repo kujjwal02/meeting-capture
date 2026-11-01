@@ -2,7 +2,8 @@
 // end, forwards what the two caption readers emit, starts and stops the DOM reader as the caption
 // source policy decides, and reports health. While the app reports the call as stopped by the
 // user, it sends no caption or chat. Events go to the service worker over a port as they
-// happen. Debug material (failed frames, page snapshots) goes the same way but is never queued.
+// happen. Debug material (failed frames, page snapshots) and telemetry go the same way but are
+// never queued.
 (() => {
   if (globalThis.mcMeetContentStarted) return;
   globalThis.mcMeetContentStarted = true;
@@ -30,6 +31,9 @@
   const CAPTION_CHANNELS = new Set(["captions", "captions_v2"]);
   // The page hook answers a snapshot request at once; a hook from an older mc-meet never does.
   const HOOK_SNAPSHOT_WAIT_MS = 2000;
+  // Telemetry events held while the tab has no call: the hook opens its channels at join, a
+  // moment before the call controls show.
+  const MAX_HELD_TELEMETRY_EVENTS = 200;
 
   let call = null;
   // Kept out of the stored session: the worker tells a reloaded tab again.
@@ -58,6 +62,12 @@
   const failedFramesSent = new Map();
   // Snapshot requests waiting for the page hook's half, by session.
   const pendingSnapshots = new Map();
+  // Telemetry events not yet sent, from the hook and from this script. No text from the page.
+  let telemetryEvents = [];
+  // The captions control as last seen: { state, kind, labelCode }, or null before the first check.
+  let lastControl = null;
+  // The app's debug mode end, which the worker relays. The hook copies raw frames until then.
+  let debugModeUntilMs = 0;
 
   const captionSource = globalThis.mcMeetCreateCaptionSourcePolicy();
   const domCaptions = globalThis.mcMeetCreateDomCaptions({
@@ -90,6 +100,11 @@
     }
     if (message?.type === "snapshot_request") {
       if (call?.session_id === message.session_id) requestSnapshot(call.session_id);
+      return;
+    }
+    if (message?.type === "debug_mode") {
+      debugModeUntilMs = Number.isFinite(message.until_ms) ? message.until_ms : 0;
+      tellHookDebugMode();
       return;
     }
     // A restarted app knows nothing of the call's health; the next check resends it.
@@ -217,6 +232,9 @@
     lastRosterKey = "";
     lastHealthKey = "";
     captionsPresses = [];
+    lastControl = null;
+    // The last call's "unavailable" text would read as this call's notice.
+    globalThis.mcMeetForgetUnavailableTooltip();
     if (channelRoster) sendRoster(channelRoster);
     follow(captionSource.decide({ kind: "call_began", atMs: call.page_started_ms }));
     // The hook may have opened its channels before the page showed the call controls.
@@ -275,18 +293,29 @@
   // Meet's captions control asks. Meet's captions button reads on about 30 s later, but Meet
   // renders no caption box, since the captions go to the hook's channels. A second press stops
   // the stream, so the policy presses again only while Meet's control has not read on since.
-  // Never touches the caption language.
-  function requestCaptions(nowMs) {
+  // Never touches the caption language. control is Meet's captions control as the check read it.
+  function requestCaptions(nowMs, control) {
     const notePress = (isShortcut) => {
       // Meet may ignore the press while the page has no focus, as a notification can take it.
       const press = {
         at: new Date(nowMs).toISOString(),
         is_shortcut: isShortcut,
+        reason: captionsPresses.length === 0 ? "first" : "retry",
+        control_state_before: controlStateOf(control),
         has_focus: document.hasFocus(),
         is_visible: document.visibilityState === "visible",
       };
       captionsPresses.push(press);
       console.info("mc-meet: captions press", press);
+      noteTelemetryEvent("mc.caption.press", {
+        "mc.caption.press.kind": isShortcut ? "shortcut" : "click",
+        "mc.caption.press.reason": press.reason,
+        "mc.caption.press.has_focus": press.has_focus,
+        "mc.caption.press.is_visible": press.is_visible,
+        "mc.caption.control.state_before": press.control_state_before,
+        "mc.caption.control.kind": control.kind,
+        "mc.caption.press.number": captionsPresses.length,
+      });
       captionSource.decide({ kind: "captions_requested", atMs: nowMs });
     };
     const button = findIconButton(selectors.captionsOffIcon);
@@ -311,6 +340,68 @@
         }),
       );
     }
+  }
+
+  // ---- Telemetry. The hook posts once a second; each post goes on with this script's events.
+
+  function noteTelemetryEvent(name, attributes) {
+    if (telemetryEvents.length >= MAX_HELD_TELEMETRY_EVENTS) return;
+    telemetryEvents.push({ at_ms: Date.now(), name, attributes });
+  }
+
+  // "not_found", "unavailable", "on" or "off".
+  function controlStateOf(button) {
+    if (!button.isFound) return "not_found";
+    if (button.isUnavailable) return "unavailable";
+    return button.isOn ? "on" : "off";
+  }
+
+  function noteControl(button) {
+    const control = {
+      state: controlStateOf(button),
+      kind: button.kind,
+      labelCode: button.labelCode,
+    };
+    const isSame =
+      lastControl?.state === control.state &&
+      lastControl.kind === control.kind &&
+      lastControl.labelCode === control.labelCode;
+    if (isSame) return;
+    noteTelemetryEvent("mc.caption.control.changed", {
+      "mc.caption.control.state": control.state,
+      "mc.caption.control.state_before": lastControl?.state ?? "none",
+      "mc.caption.control.kind": control.kind,
+      "mc.caption.control.label": control.labelCode,
+      "mc.caption.control.notice": globalThis.mcMeetCaptionsTextCode(button.tooltip),
+    });
+    lastControl = control;
+  }
+
+  function forwardTelemetry(message) {
+    for (const event of message.events ?? []) {
+      if (telemetryEvents.length >= MAX_HELD_TELEMETRY_EVENTS) break;
+      telemetryEvents.push(event);
+    }
+    // Counters and frames outside a call have no call to land in.
+    if (!call) return;
+    postToWorker({
+      type: "telemetry",
+      session_id: call.session_id,
+      at_ms: message.at_ms,
+      channels: message.channels ?? [],
+      events: telemetryEvents,
+      // Raw frames hold the call's speech, which a stopped call must not send.
+      frames: isRecordingStopped ? [] : (message.frames ?? []),
+    });
+    telemetryEvents = [];
+  }
+
+  function tellHookDebugMode() {
+    document.dispatchEvent(
+      new CustomEvent("mc-meet:content", {
+        detail: JSON.stringify({ t: "debug_mode", until_ms: debugModeUntilMs }),
+      }),
+    );
   }
 
   // ---- Reader events. Both caption readers deliver spec events here; origin names the reader.
@@ -450,6 +541,8 @@
       onPageNotice(message.notice);
     } else if (message?.t === "page_snapshot") {
       for (const sessionId of [...pendingSnapshots.keys()]) finishSnapshot(sessionId, message.page);
+    } else if (message?.t === "telemetry") {
+      forwardTelemetry(message);
     } else if (message?.t === "caption_channel_failed") {
       const { label, error } = message;
       follow(captionSource.decide({ kind: "channel_open_failed", label, error }));
@@ -471,6 +564,7 @@
     document.dispatchEvent(
       new CustomEvent("mc-meet:content", { detail: JSON.stringify({ t: "listen" }) }),
     );
+    tellHookDebugMode();
   }
   document.addEventListener("mc-meet:hook-ready", askHookToTalk);
   askHookToTalk();
@@ -509,8 +603,9 @@
       isCaptionsOn: button.isOn,
       isCaptionsUnavailable: button.isUnavailable,
     });
+    noteControl(button);
     follow(decision);
-    if (decision.isCaptionsRequestDue) requestCaptions(nowMs);
+    if (decision.isCaptionsRequestDue) requestCaptions(nowMs, button);
 
     const isRosterLate = nowMs - call.page_started_ms >= ROSTER_WAIT_MS;
     if (!isRosterFromChannel && isRosterLate && nowMs - lastDomRosterMs >= DOM_ROSTER_EVERY_MS) {

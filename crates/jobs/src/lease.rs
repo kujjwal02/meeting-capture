@@ -217,6 +217,14 @@ impl JobStore {
                 meeting: self.get(id)?,
                 stop: Cell::new(None),
             };
+            // The meeting and its input revision start the attempt's trace, so a rerun on a new
+            // capture is a trace of its own.
+            let _attempt = tracing::info_span!(
+                "pipeline.attempt",
+                meeting.id = %id,
+                mc.input.revision = run.meeting.input_revision
+            )
+            .entered();
             // A panic in a step becomes a recorded failure, so the sweep does not rerun the
             // meeting forever and the tray shows the cause.
             let steps_outcome = std::panic::catch_unwind(AssertUnwindSafe(|| steps(&run)))

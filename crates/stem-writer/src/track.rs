@@ -547,6 +547,10 @@ impl StemTrack {
         }
     }
 
+    pub(crate) fn take_level(&mut self) -> crate::OutputLevel {
+        self.wav.take_level()
+    }
+
     pub(crate) fn reset_recent_peak(&mut self) {
         self.peak_recent = 0.0;
     }

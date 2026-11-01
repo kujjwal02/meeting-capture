@@ -1,9 +1,16 @@
 //! What a debug report without text keeps of each JSON line. It keeps only strings under keys
 //! known to hold times, ids, versions and codes. Every other string becomes its length: caption
 //! and chat text, names, meeting titles and codes, Slack channels and workspaces, window titles,
-//! error messages and any field added later. Numbers and booleans stay. Frame bytes are dropped.
+//! error messages, device names and any field added later. Numbers and booleans stay. Frame bytes
+//! are dropped. A log line from a dependency also loses its message and `file.path`. Log, metric
+//! and environment lines, capture manifests and the job row all go through it.
 //! Device and message ids become numbers that stay the same across the report: the DOM reader
-//! uses a speaker's name as the device id.
+//! uses a speaker's name as the device id. A kept path loses the user's name: its home folder
+//! becomes `~`.
+//!
+//! Object keys are kept as they are. The keys the app writes are field names, metric point keys
+//! and the labels of `frame_counters`; the app builds the last two from closed sets of values,
+//! never from page or user text.
 //!
 //! The module depends on `serde_json` alone, so a check outside the app can include it.
 
@@ -24,6 +31,27 @@ const KEPT_KEYS: &[&str] = &[
     "last_caption_at",
     "recording_since",
     "described_at",
+    "start_timestamp",
+    "created_at",
+    "updated_at",
+    "closed_at",
+    "first_frame_at",
+    "modified_at",
+    "recorded_at",
+    "debug_mode_until",
+    "utc",
+    "mc.meet.at",
+    // Units of metric points, such as `dBFS` and `{frame}`.
+    "unit",
+    // Files the capture helpers named in their manifests.
+    "stem",
+    "file",
+    "folder",
+    "playlist",
+    "init",
+    "codec",
+    // The report's own files that reached their size cap.
+    "mc.report.truncated_files",
     // Ids the extension, Meet or the app made up.
     "seq",
     "session_id",
@@ -35,16 +63,32 @@ const KEPT_KEYS: &[&str] = &[
     "file.path",
     "file.directory",
     "server.address",
+    "trace_id",
+    "span_id",
+    "parent_span_id",
+    "service.instance.id",
     // Names the app and the decoders chose.
     "event.name",
     "skeleton",
     "layout_profile",
     "slack.layout_profile",
     "target",
+    "scope",
+    "record",
+    "service.name",
+    // mc-meet's event attributes as JSON text. The app kept only booleans, numbers and codes.
+    "mc.meet.attributes",
     // The log message itself. Values go in fields, not in the message.
-    "message",
+    "body",
     // Versions and builds.
     "app_version",
+    "service.version",
+    "os.type",
+    "os.version",
+    "host.arch",
+    "chrome.version",
+    "mc_meet.version",
+    "meet.build",
     "extension_version",
     "browser.extension.version",
     "chrome_version",
@@ -77,12 +121,45 @@ const CODE_KEYS: &[&str] = &[
     "tag",
     "role",
     "level",
+    "severity_text",
+    "mc.recorder.reason",
+    "job.step",
+    "stopped_by",
+    // Metric point attributes.
+    "mc.audio.stem",
+    "mc.caption.channel.id",
+    "mc.caption.frame.kind",
+    "mc.video.frame.kind",
+    "process.command",
+    // Pipeline decisions.
+    "mc.decision.kind",
+    "mc.decision.chosen",
+    "mc.transcript.speaker_naming",
+    // Environment lines: device transports, permission states, power.
+    "transport",
+    "microphone",
+    "screen",
+    "accessibility",
+    "audio_capture",
+    "screen_recording",
+    "lid",
 ];
+
+/// The object that holds a `tracing` JSON line's fields, in reports saved before the telemetry
+/// format. Its `message` is the log message; a `message` anywhere else can be a chat message or
+/// an error's text.
+const LEGACY_FIELDS_KEY: &str = "fields";
+const LEGACY_MESSAGE_KEY: &str = "message";
 const MAX_CODE_CHARS: usize = 64;
 
 /// Meet's data channel labels. `channel` also names a Slack channel in a huddle log.
 const MEET_CHANNEL_LABELS: &[&str] = &["captions", "captions_v2", "collections", "meet_messages"];
-const CHANNEL_KEYS: &[&str] = &["channel", "browser_call.channel", "label"];
+const CHANNEL_KEYS: &[&str] = &[
+    "channel",
+    "browser_call.channel",
+    "label",
+    "mc.caption.channel.label",
+];
 
 /// Holds a tracing span's name, under `span` or `spans`. A `name` anywhere else is a person's.
 const SPAN_KEYS: &[&str] = &["span", "spans"];
@@ -92,6 +169,30 @@ const NUMBERED_KEYS: &[(&str, &str)] = &[("device_id", "device"), ("message_id",
 
 /// Frame bytes hold call speech.
 const BYTES_KEY: &str = "bytes_base64";
+
+/// The app's crates, as a log line's `scope` starts. A dependency's message and file path can
+/// hold anything, such as a URL or a meeting title. A crate missing here only loses its messages
+/// and paths in a report without text.
+const WORKSPACE_CRATES: &[&str] = &[
+    "browser_shortcut",
+    "call_finalize",
+    "call_folder",
+    "capture",
+    "capture_protocol",
+    "huddle_captions",
+    "jobs",
+    "mc",
+    "mc_capture",
+    "mc_meet",
+    "meeting_capture",
+    "native_host",
+    "pipeline",
+    "sources",
+    "stem_timing",
+    "stem_writer",
+    "telemetry",
+    "video_capture",
+];
 
 /// Redacts the lines of one report. It numbers ids in the order it meets them.
 #[derive(Default)]
@@ -103,6 +204,18 @@ impl Redactor {
     /// Replaces each string `value` must not keep with its length or a stand-in, and drops frame
     /// bytes.
     pub(crate) fn redact(&mut self, value: &mut Value) {
+        let is_dependency_line = value
+            .get("scope")
+            .and_then(Value::as_str)
+            .is_some_and(|scope| !is_workspace_scope(scope));
+        if is_dependency_line {
+            redact_text(value.get_mut("body"));
+            redact_text(
+                value
+                    .get_mut("attributes")
+                    .and_then(|attributes| attributes.get_mut("file.path")),
+            );
+        }
         self.redact_under(value, None, None);
     }
 
@@ -119,7 +232,9 @@ impl Redactor {
                 if let Some(stand_in) = self.stand_in(key, text) {
                     *value = Value::String(stand_in);
                 } else if !is_kept(key, container, text) {
-                    *value = Value::String(format!("[{} chars]", text.chars().count()));
+                    *value = Value::String(text_length(text));
+                } else if let Some(short) = without_home(text) {
+                    *value = Value::String(short);
                 }
             }
             Value::Null | Value::Bool(_) | Value::Number(_) => {}
@@ -155,6 +270,23 @@ impl Redactor {
     }
 }
 
+fn is_workspace_scope(scope: &str) -> bool {
+    let crate_name = scope.split("::").next().unwrap_or(scope);
+    WORKSPACE_CRATES.contains(&crate_name)
+}
+
+fn redact_text(value: Option<&mut Value>) {
+    if let Some(value) = value
+        && let Value::String(text) = value
+    {
+        *value = Value::String(text_length(text));
+    }
+}
+
+fn text_length(text: &str) -> String {
+    format!("[{} chars]", text.chars().count())
+}
+
 fn is_kept(key: Option<&str>, container: Option<&str>, text: &str) -> bool {
     let Some(key) = key else {
         return false;
@@ -168,7 +300,34 @@ fn is_kept(key: Option<&str>, container: Option<&str>, text: &str) -> bool {
     if CHANNEL_KEYS.contains(&key) {
         return MEET_CHANNEL_LABELS.contains(&text);
     }
+    if key == LEGACY_MESSAGE_KEY {
+        return container == Some(LEGACY_FIELDS_KEY);
+    }
     key == "name" && container.is_some_and(|container| SPAN_KEYS.contains(&container))
+}
+
+/// The path with the home folder written as `~`, or `None` when it starts in no home folder:
+/// `/Users/<name>`, `/home/<name>` or `<drive>:\Users\<name>`, with either slash on Windows.
+fn without_home(path: &str) -> Option<String> {
+    let after_users = path
+        .strip_prefix("/Users/")
+        .or_else(|| path.strip_prefix("/home/"))
+        .or_else(|| after_windows_users_folder(path))?;
+    let name_end = after_users.find(['/', '\\']).unwrap_or(after_users.len());
+    (name_end > 0).then(|| format!("~{}", &after_users[name_end..]))
+}
+
+// What follows `C:\Users\`, `\\?\C:\Users\` or `C:/Users/`.
+fn after_windows_users_folder(path: &str) -> Option<&str> {
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    let bytes = path.as_bytes();
+    let is_drive = bytes.len() > 9
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/')
+        && bytes[3..8].eq_ignore_ascii_case(b"users")
+        && matches!(bytes[8], b'\\' | b'/');
+    is_drive.then(|| &path[9..])
 }
 
 fn is_code(text: &str) -> bool {

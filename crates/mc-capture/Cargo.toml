@@ -14,14 +14,15 @@ capture.workspace = true
 clap.workspace = true
 serde_json.workspace = true
 stem-writer.workspace = true
+telemetry.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 video-capture.workspace = true
 
 # Only the macOS commands record.
 [target.'cfg(target_os = "macos")'.dependencies]
 capture-protocol.workspace = true
 hound.workspace = true
+jiff.workspace = true
 serde.workspace = true
 sources.workspace = true
 thiserror.workspace = true

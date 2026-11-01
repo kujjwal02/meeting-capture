@@ -15,6 +15,18 @@ globalThis.mcMeetSelectors = Object.freeze({
   // The text Meet shows on a disabled captions button, in English: "Live captions are
   // temporarily unavailable". Other UI languages rely on the disabled state alone.
   captionsUnavailableText: /captions (are )?(temporarily )?unavailable/i,
+  // The English texts Meet shows on its captions control, as the codes telemetry sends. Telemetry
+  // never sends Meet's text itself: in another UI language it could hold anything.
+  captionsControlTexts: [
+    { pattern: /^turn on captions/i, code: "turn_on_captions" },
+    { pattern: /^turn off captions/i, code: "turn_off_captions" },
+    {
+      pattern: /captions (are )?temporarily unavailable/i,
+      code: "captions_temporarily_unavailable",
+    },
+    { pattern: /captions (are )?unavailable/i, code: "captions_unavailable" },
+    { pattern: /^captions and translation/i, code: "captions_and_translation" },
+  ],
   // Elements that hold icon ligatures.
   icon: "i.google-symbols, i.material-icons-extended, i.material-symbols-outlined, i[aria-hidden='true']",
   // The caption region. Its children are speaker blocks: a name node, then a text node.

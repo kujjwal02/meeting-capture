@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 pub mod finalize;
 
 pub use sources::Platform;
-pub use stem_timing::{MicMoment, PermissionService, PermissionState, Stem};
+pub use stem_timing::{
+    MicMoment, MicPickReason, MicTransport, PermissionService, PermissionState, Stem,
+};
 pub use stem_writer::GapCause;
 pub use video_capture::{VideoCodec, VideoGapCause, WindowChangeCause, WindowHint, WindowRecord};
 
@@ -43,6 +45,13 @@ pub enum AudioCommand {
     /// Close the segment and wait for the next command. Closing stdin also stops, and then the
     /// helper exits. Closing stdin stops within 1 s once its devices are open.
     Stop,
+    /// Append the flight recorder's lines since the last dump into `path` to it. Valid in any
+    /// state; the helper answers nothing, and a failure only reaches its log.
+    DumpRecorder { path: PathBuf },
+    /// Debug mode: the log file keeps DEBUG lines until `until`, RFC 3339 UTC; `None` is off.
+    /// The app sends it after `start` and at each change. Valid in any state; the helper
+    /// answers nothing.
+    SetDebug { until: Option<String> },
 }
 
 /// Helper to app.
@@ -56,6 +65,9 @@ pub enum AudioReport {
         device: String,
         rate_hz: u32,
         first_host_time_ns: u64,
+        /// Why the mic rule chose this input. `None` on the remote stream.
+        #[serde(default)]
+        mic_route: Option<MicRoute>,
     },
     /// The writer filled a span with silence.
     Gap {
@@ -66,12 +78,17 @@ pub enum AudioReport {
         length_ms: f64,
         cause: GapCause,
     },
-    /// Every 5 s while a segment is open. The app restarts a helper whose counters stall while
-    /// its stem files stop growing.
+    /// Every 1 s while a segment is open. The app restarts a helper whose counters stall while
+    /// its stem files stop growing, and writes the levels into the call's metrics.
     Heartbeat {
         segment: u32,
         mic: Option<StreamCounters>,
         remote: Option<StreamCounters>,
+        /// The mic file's level over the second. `None` while the stem has no file.
+        #[serde(default)]
+        mic_level: Option<StemLevel>,
+        #[serde(default)]
+        remote_level: Option<StemLevel>,
     },
     /// A stem reached the 24-hour limit, so both stems moved to the next segment.
     Rotated { from_segment: u32, to_segment: u32 },
@@ -84,6 +101,9 @@ pub enum AudioReport {
         new_device: String,
         rate_hz: u32,
         cause: DeviceChangeCause,
+        /// Why the mic rule chose the new input. `None` on the remote stream.
+        #[serde(default)]
+        mic_route: Option<MicRoute>,
     },
     /// The mic went away, or a segment started, with no safe input left, so the mic stem
     /// records a gap. The helper tries again every 15 s and at each device change; a later
@@ -120,6 +140,25 @@ pub struct StreamCounters {
     pub samples_in: u64,
     /// 16 kHz samples in the stem file, inserted silence included.
     pub samples_written: u64,
+}
+
+/// One stem file's level over a heartbeat's second, on the 16 kHz samples the file holds.
+/// Digital silence reads `stem_writer::SILENCE_DBFS`, so both values are always finite.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StemLevel {
+    pub rms_dbfs: f64,
+    pub peak_dbfs: f64,
+}
+
+/// The mic rule's choice and the default input it chose against.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MicRoute {
+    pub reason: MicPickReason,
+    pub transport: MicTransport,
+    pub default_input: Option<String>,
+    pub default_input_transport: MicTransport,
+    /// The system's default output device, read when the mic was chosen.
+    pub default_output: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,7 +300,7 @@ pub enum VideoReport {
         service: PermissionService,
         state: PermissionState,
     },
-    /// Every 5 s while a segment is open, also while the window is missing. The app restarts a
+    /// Every 1 s while a segment is open, also while the window is missing. The app restarts a
     /// process whose output, fragments and lookups all stall.
     Heartbeat {
         segment: u32,
@@ -270,6 +309,9 @@ pub enum VideoReport {
         frames_idle: u64,
         /// Frames handed to the encoder, repeats included.
         frames_encoded: u64,
+        /// Repeats of the last frame among `frames_encoded`.
+        #[serde(default)]
+        frames_repeated: u64,
         /// Frames VideoToolbox handed back. Unlike `frames_encoded`, it stops when the encoder
         /// hangs.
         frames_output: u64,

@@ -80,7 +80,7 @@ Done when:
 - [x] "Start at login" toggle in the tray (a LaunchAgent), release builds only.
 - [x] Tray menu: listener state, the last 5 meetings with job state, open a note, retry one or
   all failed meetings, open the settings file, show the log file.
-- [x] JSON log in `logs/app.log` in the app data folder.
+- [x] JSON log in `logs/` in the app data folder, one `app-<UTC date>.jsonl` per day.
 - [x] Every tray "open" names its app: notes open in Obsidian (else the text editor), the
   settings file in the text editor, the log file selected in Finder. None depends on a file
   type's default app.
@@ -353,6 +353,85 @@ Done when:
   at a stream rebuild inside an open segment, and video reported `permission_denied` each time
   while the audio stems grew at 32 kB/s. The tray row is code only, not seen in a running app.
 - [ ] A Meet call records the Meet tab through a tab switch.
+
+## Phase 3d: telemetry
+
+[Design](10-telemetry.md).
+
+### Step 1: core
+
+- [x] `telemetry` crate, portable: `init`, `recorder`, `fields`, `trace`.
+- [ ] Builds on Windows. Not run yet.
+- [x] JSON lines in the OpenTelemetry log shape: severity, UTC timestamp, body, attributes,
+  `trace_id` and `span_id`, a `resource` line at the top of each file.
+- [x] Daily files `logs/<service>-<UTC date>.jsonl` for `app`, `native-host`, `mc-capture` and
+  `mc`, kept 14 days.
+- [x] The file layer at INFO behind a reload filter; `init` returns the handle that sets DEBUG.
+- [x] A call's trace id from `call.id`, a pipeline attempt's from `meeting.id` and its input
+  revision. Span lines with W3C span and parent ids.
+- [x] `mc-capture` opens a `capture.segment` span with the `call.id` from `start`.
+- [x] Pipeline step spans carry `meeting.id` and `job.step`.
+- [x] Flight recorder: 10 minutes or 8 MB of DEBUG lines from the app's crates. A dump appends to
+  its file, up to 32 MB.
+- [x] Dumps on a call problem (app and audio helper, through `dump_recorder`), a failed helper, a
+  failed pipeline run, a panic and "Save debug report".
+- [x] The debug report copies the app's daily files and the new dumps through its redaction.
+- [ ] The video helper dumps its recorder on a call problem.
+- [ ] A real call problem leaves `recorder-app.jsonl` and `recorder-mc-capture-audio.jsonl` in the
+  call's debug folder with the same `trace_id`.
+
+### Step 2: debug mode
+
+- [x] `[debug] enabled_until` in `settings.toml`, tray toggle "Debug mode (24 h)" with a check,
+  "Debug until DD Mon HH:MM" in the tooltip while on. The app ends it within 30 s of its end, and
+  follows a hand edit within 30 s.
+- [x] The app's and the native host's file layers follow it. The audio helper takes `set_debug`
+  on stdin after `start` and at each change.
+- [x] mc-meet gets `debug_mode` on connect and at each change. Its popup shows the end time.
+- [x] A saved report's `call-status.json` has `debug_mode_until`.
+- [ ] The video helper follows debug mode.
+- [ ] One call in debug mode leaves DEBUG lines in `app`, `native-host` and `mc-capture` files.
+
+### Step 3: metrics and environment
+
+- [x] Gauges every 10 s, or every 1 s in a call, into `debug/<id>/metrics.jsonl`.
+- [x] Per-stem audio levels and routes in the heartbeat.
+- [x] Caption channel series and acks from mc-meet, per channel and frame kind, with the caption
+  channel and press events.
+- [ ] The user's speech from mc-meet as `mc.meet.self_speaking`. Meet's speaking indicator has
+  nothing stable to read.
+- [ ] Host CPU, memory, disk and power. CPU, memory and disk are built; power is not.
+- [x] Decision events for source pick and calendar match.
+- [x] `env.jsonl` at app start, call start and each change.
+- [x] Video frames per second from the window video helper.
+- [x] A 50 MB cap per debug folder and a 1 GB cap over all of them.
+
+### Step 4: report and tools
+
+- [x] A report bundle for a call, with the helper's log lines, the job row, the meeting's debug
+  folder and the manifests, through the redaction.
+- [x] A report bundle for the last 30 minutes from the tray: every service's lines, the
+  environment and host metric lines, and an app recorder dump.
+- [ ] A report bundle for a job without its call.
+- [x] `mc debug timeline <bundle>` in IST, with `--by-minute` and `--service`.
+- [x] `mc debug export-otlp <bundle>`.
+- [ ] A Collector's `otlpjsonfile` receiver loads an export.
+
+### Step 5: the 0.8.0 caption bug
+
+- [ ] One call in debug mode on the caption bug: missing acks on Meet's channel, captions hidden
+  in `control` frames, throttling in hidden-box mode.
+
+### Step 6: detectors
+
+- [ ] One detector trait. The call status rules move under it.
+- [ ] `mc debug replay <bundle>`.
+- [ ] Each `MC_CAPTURE_INJECT` fault raises its problem and leaves a recorder dump.
+
+Done when:
+
+- [ ] One debug report from a bad call names the failing layer, with no second call.
+- [ ] Under 1% CPU and 20 MB of memory per process with debug mode off, on a 30-minute call.
 
 ## Phase 4: local speech-to-text
 

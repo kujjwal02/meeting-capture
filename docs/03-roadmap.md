@@ -11,6 +11,7 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 | 3 | Mac capture | Tap and mic stems from a supervised `mc-capture` helper, recovery of orphan WAVs at launch | 3 calls, one with AirPods connected mid-call, no gap over 1 s, app and helper under 5% CPU; a `kill -9` of the app or the helper mid-call leaves stems that play | 6 |
 | 3b | Mic detection | Calls in native apps such as Teams and Zoom, from the app that holds the mic, on both OSes. Also ends a Meet call at once when the browser crashes | Teams and Zoom each log start and end within 5 s, on the Mac and the PC | 2 |
 | 3c | Mac video | A Slack huddle's own window from a supervised `mc-capture video`: ScreenCaptureKit, VideoToolbox HEVC, 2 s HLS fragments, repair at launch. Meet video from mc-meet tab capture, armed by one click per Meet tab. One MP4 per call at finalize | Lips match voices within 100 ms on 3 calls; a `kill -9` of the video helper leaves fragments that play; revoking Screen Recording keeps audio recording | 8.5 |
+| 3d | Telemetry | One `telemetry` crate in every binary: OpenTelemetry-shaped JSON lines, daily log files, correlation ids, a 10-minute flight recorder dumped on a problem, a panic, a failed job or a failed helper. Then debug mode, metrics, environment snapshots, report bundles and detectors. [Design](10-telemetry.md) | A debug report from one bad call names the failing layer with no second call; the recorder dumps cost under 1% CPU and 20 MB per process | 6 |
 | 4 | Local STT | Parakeet, VAD, remote diarization, caption-name merge | A 1 h call transcribes in under 10 min on the M2; names match captions on 3 Meet calls | 4 |
 | 5 | Windows capture | WASAPI loopback, mic | Phase 3 checks pass on the PC | 4 |
 | 6 | Extra sources | Soniox routing, dropped audio files, calendar from a secret iCal address | A Hinglish call gets a Soniox transcript; an iCal address matches a call with no Google sign-in | 3 |
@@ -122,16 +123,20 @@ Progress is tracked in the [checklist](05-checklist.md).
   each side validates a line once, when it reads it.
 - App to helper: `start` with the call id, call folder, segment number, platform and mic moment,
   and `stop`. The mic moment is `call_start` for segment 1 and `mid_call` for every later
-  segment: a wake, a rotation, a resume or a helper restart.
-- Helper to app: `recording` per stream, `gap`, `heartbeat` every 5 s, `rotated`, `stopped` once
+  segment: a wake, a rotation, a resume or a helper restart. `dump_recorder` with a path makes
+  the helper dump its flight recorder there, in any state.
+- Helper to app: `recording` per stream, `gap`, `heartbeat` every 1 s, `rotated`, `stopped` once
   the segment is closed, `device_changed` when a stream moves to another device mid-segment,
   `mic_unavailable` when the mic is lost and no safe input is left, `permission` with a
   permission's state, `system_sleep` and `system_wake`, and `error` with a closed kind.
-- A heartbeat carries each stream's device samples read and 16 kHz samples written.
+- A heartbeat carries each stream's device samples read, 16 kHz samples written, and the stem
+  file's RMS and peak level over the second. `recording` and `device_changed` on the mic carry
+  the mic rule's reason for its pick.
 - Example lines: `{"seq":1,"type":"stop"}` and `{"segment":2,"seq":9,"type":"stopped"}`.
 - The helper holds a "prevent idle system sleep" assertion from segment start to segment close.
 - The app starts the helper from its own executable's folder, in the app's process group. The
-  helper's stderr goes to `mc-capture.log` in the app's log folder.
+  helper logs to `mc-capture-<UTC date>.jsonl` in the app's log folder, which the app passes as
+  `--log-dir`. Its raw stderr goes to `mc-capture-stderr.log` there.
 - A call start or resume takes one segment number for every capture process: one above any
   segment in `audio.json`, `video.json` or a `NNN-` file name.
 - If the helper exits, the app restarts it after 1, 2 and then 4 s. A restart takes the next
@@ -145,7 +150,7 @@ Progress is tracked in the [checklist](05-checklist.md).
   helper reads `stop` only after its device opens, which take up to 10 s. If the app exits, the
   helper sees stdin close and closes both WAVs, then exits. Closing stdin stops within 1 s once
   its devices are open.
-- The helper log moves to `mc-capture.log.1` at a helper start once it reaches 4 MB.
+- The stderr file moves to `mc-capture-stderr.log.1` at a helper start once it reaches 4 MB.
 - One call records at a time. A second open call waits until the first ends.
 - Remote audio: a global mono tap (`with_mono_global_tap_excluding_processes` with an empty list)
   in a private aggregate device whose only member is the tap. Adding the output device doubles

@@ -33,6 +33,30 @@ use crate::vault::Vault;
 
 pub use crate::intake::{InputError, Intake, IntakeError, MergeError};
 
+/// One decision event for the transcript the run reads: its source and what it holds. Counts
+/// only: no titles, names or text.
+fn log_source_decision(transcript: &Transcript) {
+    tracing::info!(
+        mc.decision.kind = "source_pick",
+        mc.decision.chosen = serde_name(&transcript.source),
+        mc.transcript.speaker_naming = serde_name(&transcript.speaker_naming),
+        mc.transcript.segment_count = transcript.segments.len(),
+        mc.transcript.chat_count = transcript.chat_messages.len(),
+        mc.transcript.attendee_count = transcript.attendees.len(),
+        mc.transcript.has_meeting_url = transcript.meeting_url.is_some(),
+        "transcript source picked"
+    );
+}
+
+// The name serde gives a closed enum, which is the name the stored files use.
+fn serde_name(value: &impl serde::Serialize) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(name)) => name,
+        Ok(other) => other.to_string(),
+        Err(error) => error.to_string(),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum PipelineError {
     #[error(transparent)]
@@ -171,7 +195,17 @@ impl Pipeline {
     /// Returns the error that stopped the run.
     pub fn run(&self, id: MeetingId) -> Result<RunOutcome, PipelineError> {
         let _span = tracing::info_span!("pipeline.run", meeting.id = %id).entered();
-        self.store.run(id, |run| self.run_steps(run))
+        let outcome = self.store.run(id, |run| self.run_steps(run));
+        if outcome.is_err() {
+            // The recorder holds the steps' DEBUG lines, which the log file does not.
+            let folder = self.app_dirs.call_debug_dir().join(format!("meeting-{id}"));
+            if let Err(error) =
+                telemetry::dump_recorder_into(&folder, telemetry::DumpReason::JobFailed)
+            {
+                tracing::warn!(exception.message = %error, "could not dump the flight recorder");
+            }
+        }
+        outcome
     }
 
     /// Runs every step again from the stored input. The note keeps its path. Without
@@ -193,9 +227,15 @@ impl Pipeline {
         let meeting = run.meeting();
         let id = meeting.id;
         let transcript = read_transcript(meeting.input_kind, &meeting.input_path)?;
+        log_source_decision(&transcript);
 
         let calendar_match = if meeting.finished_step < Step::Matched {
-            let _span = tracing::info_span!("pipeline.match", meeting.id = %id).entered();
+            let _span = tracing::info_span!(
+                "pipeline.match",
+                meeting.id = %id,
+                job.step = Step::Matched.as_str()
+            )
+            .entered();
             let calendar_match = self.settings_store.google().match_event(&transcript)?;
             let title = calendar_match
                 .event
@@ -234,7 +274,12 @@ impl Pipeline {
         };
 
         if meeting.finished_step < Step::Written || needs_extraction {
-            let _span = tracing::info_span!("pipeline.write", meeting.id = %id).entered();
+            let _span = tracing::info_span!(
+                "pipeline.write",
+                meeting.id = %id,
+                job.step = Step::Written.as_str()
+            )
+            .entered();
             let note = NoteInput {
                 meeting_id: id,
                 transcript: &transcript,
@@ -266,7 +311,9 @@ impl Pipeline {
                 &rendered,
                 extraction_at_write,
             )?;
-            tracing::info!(file.path = %note_path.display(), "note written");
+            // `note.path`, not `file.path`: the file name is the meeting's title, which a
+            // debug report without text shortens to its length.
+            tracing::info!(note.path = %note_path.display(), "note written");
         }
         Ok(())
     }
@@ -280,8 +327,12 @@ impl Pipeline {
         transcript: &Transcript,
         calendar_match: &CalendarMatch,
     ) -> Result<ExtractOutcome, PipelineError> {
-        let _span =
-            tracing::info_span!("pipeline.extract", meeting.id = %run.meeting().id).entered();
+        let _span = tracing::info_span!(
+            "pipeline.extract",
+            meeting.id = %run.meeting().id,
+            job.step = Step::Extracted.as_str()
+        )
+        .entered();
         // One read, so the prompt and the provider come from the same settings edit.
         let llm = self.llm();
         let prompt = self.prompt(transcript, calendar_match, &llm);

@@ -127,8 +127,10 @@ impl AppDirs {
         self.data_dir.join("logs")
     }
 
-    /// One folder per call with a problem: failing frames, the events before the problem, page
-    /// snapshots. They hold call speech, so they stay here and never go to the vault.
+    /// One folder per call with a problem, `meeting-<id>` per failed pipeline run, and
+    /// `panic-<time>-<service>` per panic: failing frames, the events before the problem, page
+    /// snapshots, flight recorder dumps. They hold call speech, so they stay here and never go
+    /// to the vault.
     #[must_use]
     pub fn call_debug_dir(&self) -> PathBuf {
         self.data_dir.join("debug")

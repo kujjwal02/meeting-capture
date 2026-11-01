@@ -1,6 +1,7 @@
 //! The types `capture`, `stem-writer` and `capture-protocol` share: which stem, where each
 //! device buffer sits in host time, the ring's losses, the host clock's reading against UTC, and
-//! the privacy permissions recording needs, and when in a call the mic is picked. Portable: no
+//! the privacy permissions recording needs, when in a call the mic is picked, and why the mic rule
+//! chose its input. Portable: no
 //! audio API.
 
 use std::fmt;
@@ -123,6 +124,90 @@ impl MicMoment {
 }
 
 impl fmt::Display for MicMoment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// How an input device connects, as far as the mic rule cares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicTransport {
+    BuiltIn,
+    /// Classic Bluetooth or Bluetooth LE.
+    Bluetooth,
+    /// An aggregate device, such as our own private tap aggregate.
+    Aggregate,
+    /// A software device such as `ZoomAudioDevice` or `BlackHole`. It carries another app's audio,
+    /// not a voice, so `AvoidBluetooth` never records from it.
+    Virtual,
+    Other,
+    /// The transport could not be read. `AvoidBluetooth` treats it as Bluetooth.
+    Unknown,
+}
+
+/// Why the mic rule chose the device it chose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicPickReason {
+    /// `FollowDefault` takes the default input as it is.
+    RuleFollowsDefault,
+    /// The default input is not Bluetooth.
+    DefaultIsSafe,
+    /// The default input is Bluetooth, so the built-in mic records instead.
+    DefaultIsBluetooth,
+    /// The default input's transport is unreadable, so the built-in mic records instead.
+    DefaultTransportUnknown,
+    /// The default input is a virtual device, so the built-in mic records instead.
+    DefaultIsVirtual,
+    /// The default input is the skipped one, so another input records instead.
+    DefaultIsSkipped,
+    /// The default input is Bluetooth, virtual or unreadable and no built-in mic exists, so the
+    /// first wired input records instead.
+    NoBuiltInMic,
+    /// At a call start, the default input is Bluetooth or unreadable and no other input
+    /// qualifies, as on a Mac mini with only a headset. Recording the headset is better than
+    /// no mic when the call has not started on another profile yet.
+    NoAlternativeInput,
+}
+
+impl MicTransport {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BuiltIn => "built_in",
+            Self::Bluetooth => "bluetooth",
+            Self::Aggregate => "aggregate",
+            Self::Virtual => "virtual",
+            Self::Other => "other",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl MicPickReason {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::RuleFollowsDefault => "rule_follows_default",
+            Self::DefaultIsSafe => "default_is_safe",
+            Self::DefaultIsBluetooth => "default_is_bluetooth",
+            Self::DefaultTransportUnknown => "default_transport_unknown",
+            Self::DefaultIsVirtual => "default_is_virtual",
+            Self::DefaultIsSkipped => "default_is_skipped",
+            Self::NoBuiltInMic => "no_built_in_mic",
+            Self::NoAlternativeInput => "no_alternative_input",
+        }
+    }
+}
+
+impl fmt::Display for MicTransport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl fmt::Display for MicPickReason {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }

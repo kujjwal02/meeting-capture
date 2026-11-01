@@ -47,7 +47,8 @@ their state. You can open a note or retry a failed meeting from there.
 | Settings, API keys, OAuth tokens | Stored in plain text in `settings.toml` in the app's config folder. |
 | Audio | v0.1.0 records no audio. |
 
-The app sends no telemetry. Logs are written locally to `logs/app.log` in the app data folder.
+The app sends no telemetry. Logs are written locally to `logs/` in the app data folder, one file
+per program per day, kept 14 days.
 
 ## Install
 
@@ -99,6 +100,8 @@ after a change.
 | `mc ingest <file>` | Adds a saved input: a browser call log, a Slack huddle log or a TranscripTonic body (`--kind`). |
 | `mc retry <id>` | Resumes a failed meeting. |
 | `mc reprocess <id>` | Reruns every step. It keeps a note you edited; `--discard-edits` overwrites it. |
+| `mc debug timeline <report>` | Prints a saved debug report on one IST clock. `--by-minute` sums each minute. |
+| `mc debug export-otlp <report> --out <file>` | Writes the report as OTLP/JSON lines for an OpenTelemetry Collector. |
 
 ## Build from source
 
@@ -142,6 +145,7 @@ so keep the folder path short, or relative to the working folder.
 - [LLM extraction](docs/07-llm-extraction.md): prompt, quote check, providers, retries, note sections
 - [Install](docs/08-install.md): install, upgrade, uninstall
 - [mc-meet](docs/09-meet-extension.md): the Meet extension and its link to the app
+- [Telemetry](docs/10-telemetry.md): logs, correlation ids, the flight recorder
 
 ## Contributing
 

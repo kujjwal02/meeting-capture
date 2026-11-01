@@ -23,8 +23,10 @@ serde.workspace = true
 serde_json.workspace = true
 sources.workspace = true
 stem-writer.workspace = true
+sysinfo.workspace = true
 video-capture.workspace = true
 tauri.workspace = true
+telemetry.workspace = true
 tauri-plugin-autostart.workspace = true
 tauri-plugin-notification.workspace = true
 tauri-plugin-opener.workspace = true
@@ -33,7 +35,6 @@ tauri-plugin-updater.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "sync", "time"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

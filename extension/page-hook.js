@@ -2,8 +2,9 @@
 // It wraps RTCPeerConnection to read Meet's data channels, opens the caption channels itself,
 // and reads two Meet RPC responses through a fetch wrapper. It sends what it reads to the
 // content script as JSON strings in "mc-meet:page" events, and takes commands from
-// "mc-meet:content" events: listen, and snapshot for debug material. It makes no network
-// requests of its own.
+// "mc-meet:content" events: listen, snapshot for debug material, and debug_mode. Once a second
+// it posts caption channel telemetry: counters, lifecycle events and, in debug mode, raw frames.
+// It makes no network requests of its own.
 (() => {
   if (window.__mcMeetHookInstalled) return;
   window.__mcMeetHookInstalled = true;
@@ -21,6 +22,20 @@
   const REOPEN_DELAY_MS = 2000;
   // Data channels a snapshot lists, newest last.
   const SNAPSHOT_CHANNELS = 30;
+  const TELEMETRY_INTERVAL_MS = 1000;
+  // Bounds on what one telemetry post carries, so a burst cannot grow the page's memory.
+  const MAX_TELEMETRY_EVENTS = 200;
+  const MAX_TELEMETRY_FRAMES = 1000;
+  // RTCErrorEvent.error.errorDetail values in the WebRTC spec. Anything else reads "unknown".
+  const CHANNEL_ERROR_DETAILS = new Set([
+    "data-channel-failure",
+    "dtls-failure",
+    "fingerprint-failure",
+    "sctp-failure",
+    "sdp-syntax-error",
+    "hardware-encoder-not-available",
+    "hardware-encoder-error",
+  ]);
 
   // Messages wait here until the content script says it listens.
   const earlyMessages = [];
@@ -32,6 +47,16 @@
   // { label, isOwn, channel } per channel seen, newest last. A closed channel's entry lets go of
   // it, so Meet's closed channels and their connections can be freed.
   const seenChannels = [];
+  // Telemetry of each caption channel, by channel. A closed channel's entry goes after the next
+  // post, which carries its final counts.
+  const captionChannelStats = new Map();
+  // Numbers the caption channels this hook tracks, from 1. A rejoin's channel can have the label
+  // and id of one before it; the serial keeps their counters apart.
+  let lastChannelSerial = 0;
+  let telemetryEvents = [];
+  let telemetryFrames = [];
+  // Raw frames are copied only while the app's debug mode runs: base64 costs page time.
+  let debugModeUntilMs = 0;
 
   function post(message) {
     if (!isContentListening) {
@@ -71,21 +96,188 @@
     return undefined;
   }
 
+  // ---- Caption channel telemetry. The frame path does integer increments only.
+
+  function channelAttributes(channel) {
+    const attributes = {
+      "mc.caption.channel.label": channel.label,
+      "mc.caption.channel.is_own": ownChannels.has(channel),
+      "mc.caption.channel.negotiated": channel.negotiated === true,
+    };
+    if (channel.id !== null) attributes["mc.caption.channel.id"] = channel.id;
+    const stats = captionChannelStats.get(channel);
+    if (stats) attributes["mc.caption.channel.serial"] = stats.serial;
+    return attributes;
+  }
+
+  function channelOptionAttributes(channel) {
+    const attributes = {
+      ...channelAttributes(channel),
+      "mc.caption.channel.ordered": channel.ordered === true,
+    };
+    if (channel.maxRetransmits !== null) {
+      attributes["mc.caption.channel.max_retransmits"] = channel.maxRetransmits;
+    }
+    return attributes;
+  }
+
+  function noteTelemetryEvent(name, attributes) {
+    if (telemetryEvents.length >= MAX_TELEMETRY_EVENTS) return;
+    telemetryEvents.push({ at_ms: Date.now(), name, attributes });
+  }
+
+  function trackCaptionChannel(channel) {
+    lastChannelSerial += 1;
+    const stats = {
+      channel,
+      serial: lastChannelSerial,
+      started_at_ms: Date.now(),
+      raw: 0,
+      parsed: 0,
+      control: 0,
+      rejected: 0,
+      acks: 0,
+      isFirstFrameSeen: false,
+      isFirstCaptionSeen: false,
+      isClosed: false,
+    };
+    captionChannelStats.set(channel, stats);
+    const noteOpened = () =>
+      noteTelemetryEvent("mc.caption.channel.opened", channelOptionAttributes(channel));
+    if (channel.readyState === "open") noteOpened();
+    else channel.addEventListener("open", noteOpened, { once: true });
+    channel.addEventListener("close", () => noteChannelClosed(stats));
+    channel.addEventListener("error", (errorEvent) => {
+      const detail = errorEvent?.error?.errorDetail;
+      noteTelemetryEvent("mc.caption.channel.error", {
+        ...channelAttributes(channel),
+        "error.type": CHANNEL_ERROR_DETAILS.has(detail) ? detail : "unknown",
+      });
+    });
+    return stats;
+  }
+
+  function noteChannelClosed(stats) {
+    if (stats.isClosed) return;
+    stats.isClosed = true;
+    noteTelemetryEvent("mc.caption.channel.closed", {
+      ...channelAttributes(stats.channel),
+      "mc.caption.channel.lifetime_ms": Date.now() - stats.started_at_ms,
+    });
+  }
+
+  function noteFrameOutcome(stats, outcome, captions) {
+    if (outcome === "parsed") stats.parsed += 1;
+    else if (outcome === "control") stats.control += 1;
+    else if (outcome === "rejected") stats.rejected += 1;
+    if (captions > 0 && !stats.isFirstCaptionSeen) {
+      stats.isFirstCaptionSeen = true;
+      noteTelemetryEvent("mc.caption.first_caption", {
+        ...channelAttributes(stats.channel),
+        "mc.caption.channel.age_ms": Date.now() - stats.started_at_ms,
+      });
+    }
+  }
+
+  function noteRawFrame(stats, bytes) {
+    if (Date.now() >= debugModeUntilMs || telemetryFrames.length >= MAX_TELEMETRY_FRAMES) return;
+    const channel = stats.channel;
+    telemetryFrames.push({
+      channel: channel.label,
+      channel_id: channel.id,
+      is_own: ownChannels.has(channel),
+      at_ms: Date.now(),
+      byte_length: bytes.length,
+      bytes_base64: wire.bytesToBase64(bytes),
+    });
+  }
+
+  function postTelemetry() {
+    // Early messages wait for the content script; telemetry posts would push them out.
+    if (!isContentListening) return;
+    const isIdle =
+      meetingConnection === undefined &&
+      captionChannelStats.size === 0 &&
+      telemetryEvents.length === 0;
+    if (isIdle) return;
+    const channels = [];
+    for (const stats of captionChannelStats.values()) {
+      const channel = stats.channel;
+      // RTCPeerConnection.close() closes its channels and fires no close event on them.
+      if (channel.readyState === "closed") noteChannelClosed(stats);
+      // A channel has an id once its transport is up, and no frame comes before that.
+      if (channel.id !== null) {
+        channels.push({
+          label: channel.label,
+          id: channel.id,
+          serial: stats.serial,
+          is_own: ownChannels.has(channel),
+          started_at_ms: stats.started_at_ms,
+          raw: stats.raw,
+          parsed: stats.parsed,
+          control: stats.control,
+          rejected: stats.rejected,
+          acks: stats.acks,
+        });
+      }
+      if (stats.isClosed) captionChannelStats.delete(channel);
+    }
+    post({
+      t: "telemetry",
+      at_ms: Date.now(),
+      channels,
+      events: telemetryEvents,
+      frames: telemetryFrames,
+    });
+    telemetryEvents = [];
+    telemetryFrames = [];
+  }
+
+  setInterval(postTelemetry, TELEMETRY_INTERVAL_MS);
+
   function watchChannel(channel) {
     if (watchedChannels.has(channel) || !READ_LABELS.has(channel.label)) return;
     watchedChannels.add(channel);
     const label = channel.label;
+    const stats = CAPTION_LABELS.includes(label) ? trackCaptionChannel(channel) : undefined;
     // Gzip inflation is async. The chain keeps frames of one channel in arrival order.
     let chain = Promise.resolve();
     channel.addEventListener("message", (messageEvent) => {
       const data = messageEvent.data;
+      if (stats) {
+        stats.raw += 1;
+        if (!stats.isFirstFrameSeen) {
+          stats.isFirstFrameSeen = true;
+          noteTelemetryEvent("mc.caption.first_frame", {
+            ...channelAttributes(channel),
+            "mc.caption.channel.age_ms": Date.now() - stats.started_at_ms,
+          });
+        }
+      }
       chain = chain
         .then(async () => {
           const bytes = await frameBytes(data);
-          if (!bytes) return;
-          const { acks = [] } = await reader.frame(label, bytes);
+          // A text frame on a caption channel is not Meet's caption protocol.
+          if (!bytes) {
+            if (stats) stats.rejected += 1;
+            return;
+          }
+          if (stats) noteRawFrame(stats, bytes);
+          let reading;
+          try {
+            reading = await reader.frame(label, bytes);
+          } catch {
+            if (stats) stats.rejected += 1;
+            return;
+          }
+          const { acks = [], outcome, captions = 0 } = reading;
+          if (stats) noteFrameOutcome(stats, outcome, captions);
           if (!ownChannels.has(channel)) return;
-          for (const ack of acks) if (channel.readyState === "open") channel.send(ack);
+          for (const ack of acks) {
+            if (channel.readyState !== "open") continue;
+            channel.send(ack);
+            if (stats) stats.acks += 1;
+          }
         })
         .catch(() => {});
     });
@@ -151,7 +343,12 @@
   // captions to this browser. Keeping that channel open keeps captions coming with CC off.
   const nativeCloseChannel = RTCDataChannel.prototype.close;
   RTCDataChannel.prototype.close = function (...args) {
-    if (CAPTION_LABELS.includes(this.label) && !ownChannels.has(this)) return;
+    if (CAPTION_LABELS.includes(this.label) && !ownChannels.has(this)) {
+      try {
+        noteTelemetryEvent("mc.caption.channel.close_blocked", channelOptionAttributes(this));
+      } catch {}
+      return;
+    }
     return nativeCloseChannel.apply(this, args);
   };
 
@@ -224,6 +421,10 @@
     }
     if (command?.t === "snapshot") {
       postSnapshot();
+      return;
+    }
+    if (command?.t === "debug_mode") {
+      debugModeUntilMs = Number.isFinite(command.until_ms) ? command.until_ms : 0;
       return;
     }
     if (command?.t !== "listen") return;

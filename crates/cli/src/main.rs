@@ -1,4 +1,6 @@
-//! `mc`: reruns pipeline steps without the tray app.
+//! `mc`: reruns pipeline steps without the tray app, and reads saved debug reports.
+
+mod debug;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -67,22 +69,38 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: u32,
     },
+    /// Read a saved debug report.
+    Debug {
+        #[command(subcommand)]
+        command: debug::DebugCommand,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .json()
-        .with_writer(std::io::stderr)
-        .init();
     let cli = Cli::parse();
+    // A report is read anywhere, also on a machine without the app's data folder.
+    let command = match cli.command {
+        Command::Debug { command } => return debug::run(command),
+        command => command,
+    };
 
     let app_dirs = AppDirs::locate()?;
     app_dirs.create()?;
+    // Into the app's log folder, next to the tray app's lines for the same meetings. Results
+    // and errors still print here.
+    let _file_level = telemetry::init(telemetry::TelemetryConfig {
+        service: telemetry::Service::Mc,
+        service_version: env!("CARGO_PKG_VERSION"),
+        log_sink: telemetry::LogSink::DailyFiles {
+            dir: app_dirs.log_dir(),
+        },
+        panic_dump_dir: Some(app_dirs.call_debug_dir()),
+    })?;
     let settings_store = Arc::new(SettingsStore::new(app_dirs.clone()));
     let pipeline = Pipeline::open(Arc::clone(&settings_store))?;
 
     let time_zone = pipeline.settings().time_zone.clone();
-    match cli.command {
+    match command {
         Command::Ingest { input_file, kind } => {
             let id = pipeline.take_in(kind.into(), &input_file)?;
             print_outcome(id, &pipeline.run(id)?, &time_zone);
@@ -157,6 +175,7 @@ fn main() -> anyhow::Result<()> {
                 print_meeting(&meeting, &time_zone);
             }
         }
+        Command::Debug { command } => return debug::run(command),
     }
     Ok(())
 }

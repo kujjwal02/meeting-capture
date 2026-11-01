@@ -155,7 +155,25 @@ globalThis.mcMeetReadDomRoster = () => {
 // The last "captions unavailable" text a hover tooltip showed, for page snapshots.
 let mcMeetUnavailableTooltip = null;
 
-// Reads Meet's captions button: { isOn, isUnavailable, isFound, tooltip }. Meet refuses captions
+// Each call starts with no such text.
+globalThis.mcMeetForgetUnavailableTooltip = () => {
+  mcMeetUnavailableTooltip = null;
+};
+
+// The code of a text Meet shows on its captions control: "none" for no text, "unknown" for a
+// text not in the selectors table.
+globalThis.mcMeetCaptionsTextCode = (text) => {
+  const trimmed = text?.trim();
+  if (!trimmed) return "none";
+  const known = globalThis.mcMeetSelectors.captionsControlTexts.find(({ pattern }) =>
+    pattern.test(trimmed),
+  );
+  return known?.code ?? "unknown";
+};
+
+// Reads Meet's captions button: { isOn, isUnavailable, isFound, kind, labelCode, tooltip }. kind
+// is "button" or "menu", the "Captions and translation" control; labelCode is the code of the
+// button's own label. Meet refuses captions
 // at times ("Live captions are temporarily unavailable"): it disables the button, or says so in
 // the button's own label. The state rests on those, which hold while the page shows the button.
 // A hover tooltip shows only under the pointer, so it would flip the state with each hover; it
@@ -173,17 +191,23 @@ globalThis.mcMeetReadCaptionsButton = () => {
   const menuButton = findIconButton(selectors.captionsMenuIcon);
   const button = onButton ?? findIconButton(selectors.captionsOffIcon) ?? menuButton;
   if (!button) {
-    return { isOn: false, isUnavailable: false, isFound: false, tooltip: mcMeetUnavailableTooltip };
+    return {
+      isOn: false,
+      isUnavailable: false,
+      isFound: false,
+      kind: "none",
+      labelCode: "none",
+      tooltip: mcMeetUnavailableTooltip,
+    };
   }
   const describedBy = button.getAttribute("aria-describedby");
-  const ownText = [
+  const labels = [
     button.getAttribute("aria-label"),
     button.getAttribute("data-tooltip"),
     button.getAttribute("title"),
     describedBy ? document.getElementById(describedBy)?.textContent : null,
-  ]
-    .map(sayUnavailable)
-    .find(Boolean);
+  ];
+  const ownText = labels.map(sayUnavailable).find(Boolean);
   if (ownText) mcMeetUnavailableTooltip = ownText.trim();
   const isDisabled = button.disabled === true || button.getAttribute("aria-disabled") === "true";
   const isUnavailable = isDisabled || Boolean(ownText);
@@ -194,6 +218,8 @@ globalThis.mcMeetReadCaptionsButton = () => {
       !isUnavailable,
     isUnavailable,
     isFound: true,
+    kind: button === menuButton ? "menu" : "button",
+    labelCode: globalThis.mcMeetCaptionsTextCode(labels.find(Boolean)),
     tooltip: mcMeetUnavailableTooltip,
   };
 };

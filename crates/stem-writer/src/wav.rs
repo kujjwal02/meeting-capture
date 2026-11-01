@@ -20,6 +20,47 @@ pub(crate) struct StemWav {
     samples_written: u64,
     /// Samples the header counted at the last sync.
     synced_samples: u64,
+    level: OutputLevel,
+}
+
+/// The level of the samples written since the last take: what the file holds, inserted silence
+/// included. Summed in the write loop, so measuring costs no pass and no allocation.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OutputLevel {
+    sum_of_squares: f64,
+    sample_count: u64,
+    peak: f32,
+}
+
+/// The floor for digital silence, whose level in dBFS is minus infinity. A 16-bit file's own
+/// floor is about -96 dBFS.
+pub const SILENCE_DBFS: f64 = -120.0;
+
+impl OutputLevel {
+    /// The RMS level in dBFS. `None` when nothing was written.
+    #[must_use]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a second of 16 kHz samples is far below 2^52"
+    )]
+    pub fn rms_dbfs(&self) -> Option<f64> {
+        (self.sample_count > 0)
+            .then(|| dbfs((self.sum_of_squares / self.sample_count as f64).sqrt()))
+    }
+
+    /// The peak sample magnitude in dBFS. `None` when nothing was written.
+    #[must_use]
+    pub fn peak_dbfs(&self) -> Option<f64> {
+        (self.sample_count > 0).then(|| dbfs(f64::from(self.peak)))
+    }
+}
+
+fn dbfs(magnitude: f64) -> f64 {
+    if magnitude > 0.0 {
+        (20.0 * magnitude.log10()).max(SILENCE_DBFS)
+    } else {
+        SILENCE_DBFS
+    }
 }
 
 impl StemWav {
@@ -41,12 +82,18 @@ impl StemWav {
             header_file,
             samples_written: 0,
             synced_samples: 0,
+            level: OutputLevel::default(),
         };
         let header = wav_header(0);
         wav.file
             .write_all(&header)
             .map_err(|source| io_error(path, source))?;
         Ok(wav)
+    }
+
+    /// The level since the last take, and starts the next.
+    pub(crate) fn take_level(&mut self) -> OutputLevel {
+        std::mem::take(&mut self.level)
     }
 
     pub(crate) fn samples_written(&self) -> u64 {
@@ -66,11 +113,18 @@ impl StemWav {
             });
         }
         for &sample in samples {
+            let pcm = pcm16(sample);
+            // The level is the file's: the sample after clamping and rounding, so an
+            // overdriven or NaN input cannot read above 0 dBFS or poison the second's sum.
+            let written = f32::from(pcm) / f32::from(i16::MAX);
+            self.level.sum_of_squares += f64::from(written) * f64::from(written);
+            self.level.peak = self.level.peak.max(written.abs());
             self.file
-                .write_all(&pcm16(sample).to_le_bytes())
+                .write_all(&pcm.to_le_bytes())
                 .map_err(|source| io_error(&self.path, source))?;
         }
         self.samples_written += samples.len() as u64;
+        self.level.sample_count += samples.len() as u64;
         Ok(())
     }
 

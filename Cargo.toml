@@ -69,6 +69,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2.6"
 schemars = "1.2"
 slug = "0.1"
+# Process CPU and memory, and disk free, on Mac and Windows with no unsafe code here.
+sysinfo = { version = "0.40", default-features = false, features = ["disk", "system"] }
 serde-saphyr = "2.0"
 sha2 = "0.11"
 tempfile = "3.27"
@@ -85,6 +87,7 @@ pipeline = { path = "crates/pipeline" }
 sources = { path = "crates/sources" }
 stem-timing = { path = "crates/stem-timing" }
 stem-writer = { path = "crates/stem-writer" }
+telemetry = { path = "crates/telemetry" }
 video-capture = { path = "crates/video-capture" }
 
 [workspace.lints.rust]

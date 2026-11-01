@@ -16,6 +16,7 @@ to the meeting-capture app over native messaging. The design is in `docs/09-meet
 | `content/caption-source.js` | Meet tab, isolated world, or plain Node | Caption source policy: picks the channel or the DOM reader, and owns the health fields. No DOM. |
 | `content/main.js` | Meet tab, isolated world | Call start and end, session, runs the DOM reader the policy picks, sends health events. |
 | `session-rules.js` | Service worker, or plain Node | Session rules and event numbers, with no `chrome.*` calls. |
+| `telemetry-rows.js` | Service worker, or plain Node | Turns a tab's telemetry post into the `telemetry` message of channel counts and events, and the `telemetry_frames` message. No `chrome.*` calls. |
 | `background.js` | Service worker | Storage, native port, queue, resend. Runs the effects `session-rules.js` returns. Sets each Meet tab's toolbar icon from the app's call status. |
 | `tab-video.js` | Service worker | Picks the Meet tab whose call wants video, starts and stops its capture, forwards fragments to the app. Tells the app where the Meet tab is and which key the shortcut uses, so the app can press it and start video with no click. |
 | `offscreen/offscreen.html` | Offscreen document | Page that loads `capture.js`. |
@@ -74,8 +75,8 @@ icon on the Meet tab when it shows `REC?`.
 
 ## Rules
 
-- No network requests, telemetry, remote config or downloads. The popup shows what the app
-  reports and talks only to the service worker.
+- No network requests, remote config or downloads. Telemetry goes only to the local app, over
+  native messaging. The popup shows what the app reports and talks only to the service worker.
 - The extension never changes the caption language. It presses Meet's captions button again
   only while the button has not read on 45 s after the last press, at most 3 times per call: a
   second press after one Meet took would stop the caption stream.

@@ -37,7 +37,8 @@ use video_capture::{
 };
 
 const TICK: Duration = Duration::from_millis(20);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// 1 s, so the app's per-second video metric rows each get fresh counters.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// No callback for this long after a complete frame, while the window is on screen, means the
 /// stream hangs (Loom). A hidden window is checked on the same timer, but never rebuilt.
 const STALL_LIMIT: Duration = Duration::from_secs(5);
@@ -494,6 +495,13 @@ fn record_segment(
     inputs: &Receiver<HelperInput>,
     stop_count: StopCount<'_>,
 ) -> Result<SegmentEnd, SegmentError> {
+    // Every line of the segment carries the call, so it joins the call's trace.
+    let _span = tracing::info_span!(
+        "capture.segment",
+        call.id = %request.call_id,
+        segment.number = request.number
+    )
+    .entered();
     let now = Instant::now();
     let mut segment = Segment {
         request,
@@ -1047,6 +1055,7 @@ impl Segment<'_> {
                 frames_captured: self.counts.captured,
                 frames_idle: self.counts.idle,
                 frames_encoded: self.counts.encoded,
+                frames_repeated: self.counts.repeated,
                 frames_output: self.counts.output,
                 fragments_written: self.fragments_written,
                 window_lookups: self.lookup.count,

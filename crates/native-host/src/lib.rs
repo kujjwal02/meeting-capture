@@ -7,6 +7,7 @@ pub mod frames;
 pub mod manifest;
 pub mod socket;
 
+use std::cell::RefCell;
 use std::io;
 use std::path::Path;
 use std::process::{Command, ExitCode, Stdio};
@@ -35,9 +36,9 @@ pub fn is_host_mode(first_argument: Option<&str>) -> bool {
 
 /// Relays frames between Chrome and the app at `socket` until either side closes. Starts the
 /// app when the socket is absent, and tells Chrome `app_unavailable` when it does not answer in
-/// 10 s.
+/// 10 s. Calls `on_frame` before each frame it relays, either way.
 #[must_use]
-pub fn run(origin: &str, socket: &Path) -> ExitCode {
+pub fn run(origin: &str, socket: &Path, mut on_frame: impl FnMut()) -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -49,7 +50,8 @@ pub fn run(origin: &str, socket: &Path) -> ExitCode {
         }
     };
     let span = tracing::info_span!("host.relay", server.address = %socket.display());
-    let relayed = runtime.block_on(relay(origin, socket).instrument(span));
+    let on_frame = RefCell::new(&mut on_frame as &mut dyn FnMut());
+    let relayed = runtime.block_on(relay(origin, socket, &on_frame).instrument(span));
     // Stdin is read on a blocking thread that only returns with the next frame.
     runtime.shutdown_background();
     match relayed {
@@ -61,7 +63,13 @@ pub fn run(origin: &str, socket: &Path) -> ExitCode {
     }
 }
 
-async fn relay(origin: &str, socket: &Path) -> io::Result<()> {
+// Both directions run on one thread, so they share `on_frame` through a `RefCell`; neither
+// holds the borrow across an await.
+async fn relay(
+    origin: &str,
+    socket: &Path,
+    on_frame: &RefCell<&mut dyn FnMut()>,
+) -> io::Result<()> {
     let mut to_chrome = tokio::io::stdout();
     let Some(connection) = connect_or_start_app(socket).await else {
         tracing::warn!("the app did not start in time");
@@ -100,6 +108,7 @@ async fn relay(origin: &str, socket: &Path) -> io::Result<()> {
         )
         .await?
         {
+            (on_frame.borrow_mut())();
             write_frame(
                 &mut to_app,
                 LengthOrder::Little,
@@ -115,6 +124,7 @@ async fn relay(origin: &str, socket: &Path) -> io::Result<()> {
         while let Some(frame) =
             read_frame(&mut from_app, LengthOrder::Little, FrameFlow::ToExtension).await?
         {
+            (on_frame.borrow_mut())();
             write_frame(
                 &mut to_chrome,
                 LengthOrder::Native,
