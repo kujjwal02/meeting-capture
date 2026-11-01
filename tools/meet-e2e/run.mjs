@@ -34,7 +34,7 @@ const signingIdentity = process.env.MEET_E2E_SIGNING_IDENTITY ?? devAppName;
 const homeDir = join(workDir, "home");
 const vaultDir = join(workDir, "vault");
 const logDir = join(homeDir, "data", "browser-calls");
-const appLogPath = join(homeDir, "data", "logs", "app.log");
+const appLogDir = join(homeDir, "data", "logs");
 // The app registers its native host with each of these browsers at start. patchrome runs Chrome.
 const hostManifestPaths = [
   "Google/Chrome",
@@ -448,11 +448,14 @@ function findNote(meetingCode) {
   return notes.find((path) => readFileSync(path, "utf8").includes(meetingCode));
 }
 
-// The app's log lines with this message since the run started.
+// The app's log lines with this message since the run started, from its daily files: a run can
+// cross midnight UTC.
 function appLogLines(message) {
-  if (!existsSync(appLogPath)) return [];
-  return readFileSync(appLogPath, "utf8")
-    .split("\n")
+  if (!existsSync(appLogDir)) return [];
+  return readdirSync(appLogDir)
+    .filter((name) => /^app-\d{4}-\d{2}-\d{2}\.jsonl$/.test(name))
+    .sort()
+    .flatMap((name) => readFileSync(join(appLogDir, name), "utf8").split("\n"))
     .filter((line) => line.includes(`"${message}"`))
     .map((line) => JSON.parse(line))
     .filter((line) => Date.parse(line.timestamp) >= startedMs);
@@ -589,12 +592,12 @@ try {
   ).catch(() => null);
   if (!sentPress) {
     const skips = appLogLines("video.shortcut_skipped").map(
-      (line) => line.fields["video.press_skip_reason"],
+      (line) => line.attributes["video.press_skip_reason"],
     );
     step(`  shortcut skips: ${JSON.stringify(skips)}`);
   }
   expect(Boolean(sentPress), "the app pressed mc-meet's shortcut with no click");
-  const sentShortcut = sentPress?.fields["video.shortcut"] ?? "";
+  const sentShortcut = sentPress?.attributes["video.shortcut"] ?? "";
   expect(sentShortcut.includes("⌘"), `the pressed shortcut ${sentShortcut} holds Command`);
   // A fake microphone's AudioContext starts suspended until a user gesture.
   await cdp.send(
@@ -675,7 +678,7 @@ try {
     "the press typed nothing into the Meet page",
   );
   const unseen = appLogLines("video.shortcut_unseen").map(
-    (line) => line.fields["video.press_miss"],
+    (line) => line.attributes["video.press_miss"],
   );
   secondMcMeet.stop();
   const noticeLeadMs = Date.parse(sentPress?.timestamp) - secondMcMeet.heard.noticeAtMs;
@@ -759,7 +762,7 @@ try {
   const resumedVideo = await until("tab video after the resume", 30000, () =>
     appLogLines("video.tab_state").find(
       (line) =>
-        line.fields["video.tab_state"] === "capturing" &&
+        line.attributes["video.tab_state"] === "capturing" &&
         Date.parse(line.timestamp) >= resumeSentMs,
     ),
   ).catch(() => null);

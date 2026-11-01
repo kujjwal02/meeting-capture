@@ -6,7 +6,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use serde::Serialize;
 
 use crate::ring::stem_ring;
-use crate::{CaptureError, MicMoment, StemFormat, StemReader};
+use crate::{CaptureError, MicMoment, MicPickReason, MicTransport, StemFormat, StemReader};
 
 /// Which input device records the mic stem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -41,48 +41,6 @@ impl MicRequest {
     }
 }
 
-/// How an input device connects, as far as the mic rule cares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MicTransport {
-    BuiltIn,
-    /// Classic Bluetooth or Bluetooth LE.
-    Bluetooth,
-    /// An aggregate device, such as our own private tap aggregate.
-    Aggregate,
-    /// A software device such as `ZoomAudioDevice` or `BlackHole`. It carries another app's audio,
-    /// not a voice, so `AvoidBluetooth` never records from it.
-    Virtual,
-    Other,
-    /// The transport could not be read. `AvoidBluetooth` treats it as Bluetooth.
-    Unknown,
-}
-
-/// Why the mic rule chose the device it chose.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MicPickReason {
-    /// `FollowDefault` takes the default input as it is.
-    RuleFollowsDefault,
-    /// The default input is not Bluetooth.
-    DefaultIsSafe,
-    /// The default input is Bluetooth, so the built-in mic records instead.
-    DefaultIsBluetooth,
-    /// The default input's transport is unreadable, so the built-in mic records instead.
-    DefaultTransportUnknown,
-    /// The default input is a virtual device, so the built-in mic records instead.
-    DefaultIsVirtual,
-    /// The default input is the skipped one, so another input records instead.
-    DefaultIsSkipped,
-    /// The default input is Bluetooth, virtual or unreadable and no built-in mic exists, so the
-    /// first wired input records instead.
-    NoBuiltInMic,
-    /// At a call start, the default input is Bluetooth or unreadable and no other input
-    /// qualifies, as on a Mac mini with only a headset. Recording the headset is better than
-    /// no mic when the call has not started on another profile yet.
-    NoAlternativeInput,
-}
-
 impl MicRule {
     #[must_use]
     pub fn as_str(self) -> &'static str {
@@ -93,42 +51,15 @@ impl MicRule {
     }
 }
 
-impl MicTransport {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::BuiltIn => "built_in",
-            Self::Bluetooth => "bluetooth",
-            Self::Aggregate => "aggregate",
-            Self::Virtual => "virtual",
-            Self::Other => "other",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    /// Whether `AvoidBluetooth` may record from a device with this transport when the built-in
-    /// mic is missing.
-    fn is_wired_alternative(self) -> bool {
-        match self {
-            Self::BuiltIn | Self::Other => true,
-            Self::Bluetooth | Self::Aggregate | Self::Virtual | Self::Unknown => false,
-        }
-    }
-}
-
-impl MicPickReason {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::RuleFollowsDefault => "rule_follows_default",
-            Self::DefaultIsSafe => "default_is_safe",
-            Self::DefaultIsBluetooth => "default_is_bluetooth",
-            Self::DefaultTransportUnknown => "default_transport_unknown",
-            Self::DefaultIsVirtual => "default_is_virtual",
-            Self::DefaultIsSkipped => "default_is_skipped",
-            Self::NoBuiltInMic => "no_built_in_mic",
-            Self::NoAlternativeInput => "no_alternative_input",
-        }
+/// Whether `AvoidBluetooth` may record from a device with this transport when the built-in mic
+/// is missing.
+fn is_wired_alternative(transport: MicTransport) -> bool {
+    match transport {
+        MicTransport::BuiltIn | MicTransport::Other => true,
+        MicTransport::Bluetooth
+        | MicTransport::Aggregate
+        | MicTransport::Virtual
+        | MicTransport::Unknown => false,
     }
 }
 
@@ -141,7 +72,7 @@ macro_rules! display_as_str {
         }
     )*};
 }
-display_as_str!(MicRule, MicTransport, MicPickReason);
+display_as_str!(MicRule);
 
 /// The mic rule's decision, made without opening any device.
 #[derive(Debug, Clone, Serialize)]
@@ -373,7 +304,7 @@ fn pick_alternative(
         .find(|(_, transport)| *transport == MicTransport::BuiltIn);
     let wired = inputs
         .iter()
-        .find(|(_, transport)| transport.is_wired_alternative());
+        .find(|(_, transport)| is_wired_alternative(*transport));
     match (built_in, wired) {
         (Some((built_in, _)), _) => return Ok((built_in.clone(), cause.reason())),
         (None, Some((wired, _))) => return Ok((wired.clone(), MicPickReason::NoBuiltInMic)),

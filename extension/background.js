@@ -12,10 +12,12 @@
 // chrome.storage.session keys, which the popup reads:
 //   call_status   the app's last call_status message
 //   app           { is_reachable, app_version, checked_at_ms }
+//   debugModeUntil  the end of the app's debug mode, RFC 3339 UTC, absent when it is off
 // tab-video.js owns the Meet tab video capture and its own chrome.storage.session keys.
 
 import { decide, hasOpenSessions, restoreState, STATE_KEYS } from "./session-rules.js";
 import { createTabVideo, NEEDS_CLICK_KEY, VIDEO_CAPTURE_KEY } from "./tab-video.js";
+import { framesMessage, isDebugModeOn, telemetryMessage } from "./telemetry-rows.js";
 
 const HOST_NAME = "com.meetingcapture.app";
 const PROTOCOL = 1;
@@ -28,6 +30,9 @@ const SETTINGS_KEY = "settings";
 const RELOADED_FOR_KEY = "reloaded_for";
 const CALL_STATUS_KEY = "call_status";
 const APP_KEY = "app";
+const DEBUG_MODE_KEY = "debugModeUntil";
+// Telemetry events held per session while the app is not welcomed.
+const MAX_HELD_TELEMETRY_EVENTS = 200;
 const APP_UNREACHABLE_NOTICE = "mc-meet-app-unreachable";
 const MEET_TABS = "https://meet.google.com/*";
 const BADGE_COLOURS = { recording: "#d93025", problem: "#f29900", off: "#5f6368" };
@@ -158,11 +163,17 @@ chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== "mc-meet-tab") return;
   const tabId = port.sender?.tab?.id;
   if (tabId !== undefined) tabPorts.set(tabId, port);
+  tellTabDebugMode(port).catch(() => {});
   port.onMessage.addListener((message) => {
     if (tabId === undefined) return;
     // Debug material: sent when the app listens, dropped otherwise.
     if (message?.type === "frame_failed" || message?.type === "page_snapshot") {
       if (nativePort && isWelcomed) nativePort.postMessage(message);
+      return;
+    }
+    // In the serial queue, so telemetry never overtakes the call_started it belongs to.
+    if (message?.type === "telemetry") {
+      serially(() => sendTelemetry(message));
       return;
     }
     serially(async () => {
@@ -190,6 +201,59 @@ chrome.tabs.onUpdated.addListener((_tabId, change, tab) => {
   if (change.status === "complete" && tab.url?.startsWith("https://meet.google.com/")) {
     serially(showStatusOnTabs);
   }
+});
+
+// ---- Telemetry. Counters and frames are never stored: a lost second costs nothing. Events
+// happen once, such as a channel opening, so the worker holds them in memory until the app is
+// welcomed.
+
+// Events not yet sent, by session.
+const heldTelemetryEvents = new Map();
+
+async function readDebugModeUntil() {
+  return (await chrome.storage.session.get(DEBUG_MODE_KEY))[DEBUG_MODE_KEY];
+}
+
+async function sendTelemetry(post) {
+  const events = [
+    ...(heldTelemetryEvents.get(post.session_id) ?? []),
+    ...(Array.isArray(post.events) ? post.events : []),
+  ];
+  if (!nativePort || !isWelcomed) {
+    if (events.length > 0) {
+      heldTelemetryEvents.set(post.session_id, events.slice(0, MAX_HELD_TELEMETRY_EVENTS));
+    }
+    return;
+  }
+  heldTelemetryEvents.delete(post.session_id);
+  const telemetry = telemetryMessage(post, events);
+  if (telemetry) nativePort.postMessage(telemetry);
+  const frames = framesMessage(post);
+  if (frames && isDebugModeOn(await readDebugModeUntil(), Date.now())) {
+    nativePort?.postMessage(frames);
+  }
+}
+
+// The tab's page hook copies raw caption frames only while debug mode runs.
+async function tellTabDebugMode(port) {
+  const until = await readDebugModeUntil();
+  const untilMs = isDebugModeOn(until, Date.now()) ? Date.parse(until) : 0;
+  tellTab(port, { type: "debug_mode", until_ms: untilMs });
+}
+
+// The app sends the end of its debug mode, or null, on connect and on every change. A closed
+// port forgets it: the app may turn it off while no port hears.
+function storeDebugMode(until) {
+  const stored =
+    typeof until === "string"
+      ? chrome.storage.session.set({ [DEBUG_MODE_KEY]: until })
+      : chrome.storage.session.remove(DEBUG_MODE_KEY);
+  stored.catch((error) => console.error("mc-meet: could not store the debug mode:", error));
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== "session" || !(DEBUG_MODE_KEY in changes)) return;
+  for (const port of tabPorts.values()) tellTabDebugMode(port).catch(() => {});
 });
 
 // ---- Toolbar icon and popup.
@@ -415,6 +479,7 @@ async function closeNativeIfIdle() {
     nativePort.disconnect();
     nativePort = null;
     isWelcomed = false;
+    storeDebugMode(null);
     // The status names calls of other profiles too. Kept past the port, a press here would
     // read them as this profile's.
     await chrome.storage.session.remove(CALL_STATUS_KEY);
@@ -453,6 +518,7 @@ function dropNative(port) {
   if (nativePort !== port) return;
   nativePort = null;
   isWelcomed = false;
+  storeDebugMode(null);
   scheduleReconnect();
 }
 
@@ -486,6 +552,8 @@ function connectNative(sessions) {
       tellPopups({ type: "app_changed" });
     } else if (message?.type === "settings") {
       storeSettings(message.settings);
+    } else if (message?.type === "debug_mode") {
+      storeDebugMode(message.until);
     } else if (message?.type === "ack") {
       serially(() => onAck(message.seq));
     } else if (message?.type === "call_status") {

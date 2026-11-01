@@ -11,7 +11,8 @@ use std::path::PathBuf;
 pub use app_dirs::AppDirs;
 pub use edit::{SettingsChange, SettingsStore};
 pub use file::{
-    Effort, GoogleSettings, LlmSettings, MeetSettings, ProviderKind, SettingsFile, SlackSettings,
+    DebugSettings, Effort, GoogleSettings, LlmSettings, MeetSettings, ProviderKind, SettingsFile,
+    SlackSettings,
 };
 pub use validate::Settings;
 
@@ -75,6 +76,10 @@ pub enum SettingsError {
     LlmGlossary { max: usize },
     #[error("settings field llm.claude_path: {path} is not a file{hint}")]
     ClaudePath { path: PathBuf, hint: &'static str },
+    #[error(
+        "settings field debug.enabled_until: {value:?} is not an RFC 3339 time such as \"2026-11-01T04:10:00Z\"; remove it to turn debug mode off"
+    )]
+    DebugEnabledUntil { value: String },
     #[error("could not write settings file {path}: {source}")]
     Write {
         path: PathBuf,

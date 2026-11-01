@@ -23,6 +23,7 @@ use pipeline::settings::MeetSettings;
 use serde::{Deserialize, Serialize};
 use sources::browser_call::HealthSource;
 use tauri::{AppHandle, Manager as _};
+use telemetry::debug_mode::DebugMode;
 use tokio::io::{AsyncWrite, ReadHalf};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -616,6 +617,11 @@ enum AppMessage {
     DebugReportFailed {
         error: String,
     },
+    /// The end of debug mode in RFC 3339 UTC, or `None` when it is off. mc-meet stores it and
+    /// shows it.
+    DebugMode {
+        until: Option<String>,
+    },
 }
 
 /// The open Meet calls, as mc-meet shows them on its icon and in its popup.
@@ -884,7 +890,8 @@ impl Port {
         let mut is_host_known = false;
         // Debug reports are written off the runtime and answered through here.
         let (reply_sender, replies) = mpsc::unbounded_channel::<AppMessage>();
-        let mut feeds = PortFeeds::new(self.calls(), replies);
+        let debug_mode = self.app.state::<AppState>().debug_mode.subscribe();
+        let mut feeds = PortFeeds::new(self.calls(), debug_mode, replies);
         let mut is_welcomed = false;
         // A frame read dropped halfway would lose its bytes, so one read lives across the
         // other sends and owns the read half until it finishes.
@@ -964,6 +971,9 @@ impl Port {
                 | ExtensionMessage::ShortcutPressLanded { .. }
                 | ExtensionMessage::ShortcutPressNoted { .. }) => {
                     self.take_video_message(message);
+                }
+                ExtensionMessage::Unknown if is_host_known => {
+                    crate::meet_telemetry::take(&self.app, &frame);
                 }
                 ExtensionMessage::Unknown => {}
             }
@@ -1442,10 +1452,12 @@ fn is_acked(logged: &Result<Logged, EventError>) -> bool {
     }
 }
 
-/// What the app sends a welcomed port unasked: settings, call status, snapshot requests,
+/// What the app sends a welcomed port unasked: settings, debug mode, call status, snapshot requests,
 /// shortcut press notices and debug report replies.
 struct PortFeeds {
     meet_settings: watch::Receiver<MeetSettings>,
+    /// `None` once the sender is gone.
+    debug_mode: Option<watch::Receiver<DebugMode>>,
     call_status: watch::Receiver<CallStatusMessage>,
     session_requests: broadcast::Receiver<SessionRequest>,
     replies: mpsc::UnboundedReceiver<AppMessage>,
@@ -1456,9 +1468,14 @@ struct PortFeeds {
 }
 
 impl PortFeeds {
-    fn new(calls: &BrowserCalls, replies: mpsc::UnboundedReceiver<AppMessage>) -> Self {
+    fn new(
+        calls: &BrowserCalls,
+        debug_mode: watch::Receiver<DebugMode>,
+        replies: mpsc::UnboundedReceiver<AppMessage>,
+    ) -> Self {
         Self {
             meet_settings: calls.meet_settings.subscribe(),
+            debug_mode: Some(debug_mode),
             call_status: calls.call_status.subscribe(),
             session_requests: calls.session_requests.subscribe(),
             replies,
@@ -1479,6 +1496,11 @@ impl PortFeeds {
                     }
                     let settings = (*self.meet_settings.borrow_and_update()).into();
                     return AppMessage::Settings { settings };
+                }
+                mode = next_debug_mode(&mut self.debug_mode) => {
+                    return AppMessage::DebugMode {
+                        until: mode.enabled_until(),
+                    };
                 }
                 changed = self.call_status.changed(), if self.is_call_status_open => {
                     if changed.is_err() {
@@ -1514,7 +1536,18 @@ impl PortFeeds {
     }
 }
 
-/// Sends `welcome` and the current call status, which a port needs before anything else.
+/// The next debug mode change. Never ends once the sender is gone.
+async fn next_debug_mode(modes: &mut Option<watch::Receiver<DebugMode>>) -> DebugMode {
+    if let Some(receiver) = modes {
+        if receiver.changed().await.is_ok() {
+            return *receiver.borrow_and_update();
+        }
+        *modes = None;
+    }
+    std::future::pending().await
+}
+
+/// Sends `welcome`, the debug mode and the current call status, which a port needs before anything else.
 async fn welcome(
     to_host: &mut (impl AsyncWrite + Unpin),
     app: &AppHandle,
@@ -1529,6 +1562,17 @@ async fn welcome(
         settings: (*feeds.meet_settings.borrow_and_update()).into(),
     };
     send(to_host, &welcome).await?;
+    let debug_mode = feeds
+        .debug_mode
+        .as_mut()
+        .map_or(DebugMode::Off, |modes| *modes.borrow_and_update());
+    send(
+        to_host,
+        &AppMessage::DebugMode {
+            until: debug_mode.enabled_until(),
+        },
+    )
+    .await?;
     let status = feeds.call_status.borrow_and_update().clone();
     send(to_host, &AppMessage::CallStatus(status)).await
 }

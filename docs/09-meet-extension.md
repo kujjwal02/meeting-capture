@@ -57,7 +57,8 @@ flowchart LR
 - `MEETING_CAPTURE_HOME` moves the data folder for both the app and host mode, as it does for `mc`.
   On Windows it adds `-<8 hex digits>` from the data folder's SHA-256 to the pipe name.
 - The app drops a connection whose first frame is not `host_hello` with the extension's origin.
-- Host mode logs to `native-host.log` in the app's logs folder. Stdout carries only frames.
+- Host mode logs to `native-host-<UTC date>.jsonl` in the app's logs folder. Stdout carries only
+  frames.
 - One socket connection per extension port. The app serves several at once: one per Chrome
   profile.
 
@@ -87,6 +88,8 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `hello` | `protocol` (integer, now 1), `extension_version`, `sessions` (the session IDs the worker has open) | First message on each port. The app counts the port as the holder of those calls. |
 | `event` | `seq`, `session_id`, `event` | Each call event. `seq` grows by one per event for the whole install and survives a worker restart. A new install starts it at the install time in microseconds, so a reinstall mid-call never repeats a `seq` in the session it resumes. |
 | `frame_failed` | `session_id`, `channel` (`captions` or `captions_v2`), `at`, `reason`, `skeleton`, `byte_length`, `bytes_base64` (the frame as received, or null above 256 KB) | A caption channel frame that did not decode. At most 20 per channel per call from the page, and 20 per session from the content script. Failures on `collections` and `meet_messages` stay in the page: a chat or roster frame with nothing to read is common. Not queued: sent only while the app is connected. |
+| `telemetry` | `schema` (now 2), `session_id`, `at`, `channels` (each `label`, `id`, `serial`, `is_own`, `started_at`, `raw`, `parsed`, `control`, `rejected`, `acks`), `events` (each `at`, `name`, `attributes`) | Once a second while the tab is in a call. See "Telemetry". Counts are not queued; events wait in the worker until the app is welcomed. |
+| `telemetry_frames` | `session_id`, `frames` (each `channel`, `channel_id`, `is_own`, `at`, `byte_length`, `bytes_base64`) | Once a second in debug mode, with every caption channel frame of that second. None while the call is stopped. Not queued. |
 | `pages_away` | `session_ids`: every session whose tab closed, reloaded or crashed and may still come back | After `welcome`, and whenever the list changes. Not queued. A call all of whose sessions are away shows "the Meet tab closed or reloaded", with no notification. |
 | `page_snapshot` | `session_id`, `snapshot` | Reply to `snapshot_request`. See "Debug material". |
 | `stop_recording` | `session_id` | The popup's "Stop recording this call" button. The app handles it as the tray row of the same name. |
@@ -163,6 +166,7 @@ unknown fields are ignored on both sides, so either side can be newer.
 | `shortcut_press_expected` | `session_id` | Before the app presses mc-meet's shortcut for that session's tab. To every welcomed port: the one that holds the session answers ready or refused, and every other one answers noted. The app presses only after every port welcomed at the notice answered, within 1 s. |
 | `debug_report_saved` | `path` | Reply to `save_debug_report`. |
 | `debug_report_failed` | `error` | Reply to `save_debug_report`. |
+| `debug_mode` | `until`: the end of debug mode in RFC 3339 UTC, or null when it is off | After `welcome`, and at each change. See "Telemetry". |
 
 Each `call_status` entry has `session_ids`, `title`, `state` (`waiting`, `recording`, `problem`
 or `stopped`), `reason` and `reason_text` (null unless `problem`), `started_at`, `started_at_label`,
@@ -212,9 +216,9 @@ stored value the content script hides the caption region.
   box. Meet sometimes ignores the press: the button never reads on and no stream comes. A second
   press after one Meet took would stop the stream. So mc-meet presses again only while the
   button has not read on 45 s after the last press, at most 3 times per call. Each press, with
-  `document.hasFocus()` and the page visibility, goes into the page snapshot of a debug folder
-  as `captions_presses`. Some Meet builds also
-  open their own negotiated `captions_v2` channel at call start. The hook reads it too. When no
+  its reason, the control state before it, `document.hasFocus()` and the page visibility, goes
+  into the page snapshot of a debug folder as `captions_presses`. Some Meet builds also open
+  their own negotiated `captions_v2` channel at call start. The hook reads it too. When no
   caption arrives within 20 s of opening the channels, or 10 caption frames in a row fail to
   decode with no good caption in the last 20 s, the content
   script reads the caption region in the DOM. That region exists only while the user has Meet's
@@ -365,6 +369,66 @@ app is not reachable.
   writes the report and reveals it in Finder or Explorer. With no answer in 30 s, the popup says
   the report was not saved.
 
+## Telemetry
+
+mc-meet sends caption channel telemetry to the app once a second while its tab is in a call. It
+holds no caption text, names, titles or meeting codes. Every string in it is a code from a fixed
+list. The app keeps only the attributes it lists for each event name, each with a value of the
+right kind: a boolean, a whole number, or one of the event's codes. It logs how many it dropped
+in `mc.meet.dropped_attribute_count`.
+
+- The page hook counts each caption channel apart: Meet's own, such as its negotiated
+  `captions_v2` with id 125, and the two the hook opens. It counts `raw` frames on arrival, then
+  each frame's outcome: `parsed`, `control` or `rejected`. A text frame and a frame the reader
+  throws on count as `rejected`. It also counts the acks it sends. The frame path does integer
+  increments only. The hook posts once a second.
+- Each tracked channel gets a `serial`, counted from 1 in the page. A rejoin in the same tab can
+  bring a channel with the label and id of an old one; the serial keeps their counters apart.
+- `RTCPeerConnection.close()` closes its channels and fires no `close` on them. The hook checks
+  each channel's `readyState` at each post. A closed channel goes into one last post with its
+  final counts and a `closed` event, then the hook drops it.
+- The worker sends the counts as `channels`. The app builds the metric row from these typed
+  fields: `mc.captions.frames` per channel and frame kind, and `mc.captions.acks` per channel,
+  with the attributes `mc.caption.channel.label`, `mc.caption.channel.id`,
+  `mc.caption.channel.serial` and `mc.caption.channel.is_own`. The counts are cumulative from
+  the channel's start. `extension/telemetry-rows.js` builds the messages.
+- The worker sends telemetry through its serial queue, so it never overtakes the
+  `call_started` it belongs to. While the app is not welcomed it drops the counts and holds the
+  events in memory, up to 200 per session, and sends them with the next post after `welcome`.
+- A message of another `schema` is dropped. The app warns once per session: mc-meet and the app
+  then differ in version.
+- Events, by `name`:
+
+| `name` | From | Attributes |
+| --- | --- | --- |
+| `mc.caption.channel.opened` | page hook, on the channel's `open` | channel label, id, `serial`, `is_own`, `negotiated`, `ordered`, `max_retransmits` |
+| `mc.caption.channel.closed` | page hook, on `close` or a closed `readyState` | channel attributes, `lifetime_ms` |
+| `mc.caption.channel.error` | page hook | channel attributes, `error.type` (a WebRTC `errorDetail`, or `unknown`) |
+| `mc.caption.channel.close_blocked` | page hook, when it blocks Meet's `close()` | as `opened` |
+| `mc.caption.first_frame` | page hook, per channel | channel attributes, `age_ms` |
+| `mc.caption.first_caption` | page hook, per channel | channel attributes, `age_ms` |
+| `mc.caption.press` | content script, at each captions press | `kind` (`click` or `shortcut`), `reason` (`first` or `retry`), `has_focus`, `is_visible`, the control's `state_before` and `kind`, `number` |
+| `mc.caption.control.changed` | content script, when the captions control changes | `state` and `state_before` (`on`, `off`, `unavailable`, `not_found`), `kind` (`button`, `menu`, `none`), `label`, `notice` |
+
+- `label` codes the control's own label, and `notice` the last "captions unavailable" text Meet
+  showed. Both use the English texts in `content/selectors.js`: `turn_on_captions`,
+  `turn_off_captions`, `captions_temporarily_unavailable`, `captions_unavailable`,
+  `captions_and_translation`, `none` for no text, and `unknown` for any other text.
+- `notice` starts each call at `none`: the last call's text is forgotten.
+- A press has one of two reasons: `first` for the call's first press, `retry` for each later one.
+- mc-meet does not report whether the user speaks. Meet's speaking indicator has no stable
+  attribute or role to read, only generated class names and an animation.
+- The app writes the row to the call's `debug/<call>/metrics.jsonl` with `service.name`
+  `mc-meet` and the call's `trace_id`. It logs each event at INFO with target `mc_meet`,
+  `event.name`, `mc.meet.at` and the attributes as JSON in `mc.meet.attributes`.
+- Debug mode: the app sends `debug_mode` with its end time. The worker stores it in
+  `chrome.storage.session` as `debugModeUntil`, removes the key when `until` is null or the
+  native port closes, and tells each tab. Until then, the page hook also copies every caption
+  channel frame, and the worker sends them as `telemetry_frames`. The content script sends none
+  while the call is stopped. The app appends them to the call's `frames.jsonl` as `raw_frame`
+  lines, up to 50 MB per call. It drops them when its own debug mode is off or the user stopped
+  the call.
+
 ## Debug material
 
 The app keeps debug material per call in `debug/<call>/` in the data folder. Raw frames hold call
@@ -373,7 +437,8 @@ folders after 14 days.
 
 | File | What |
 | --- | --- |
-| `frames.jsonl` | The first 20 `frame_failed` messages of the call, one per line, bytes included. |
+| `frames.jsonl` | The first 20 `frame_failed` messages of the call, one per line, bytes included. In debug mode also every caption frame, as `raw_frame` lines, up to 50 MB. |
+| `metrics.jsonl` | mc-meet's metric rows, one per second. See "Telemetry". |
 | `lead-up.jsonl` | The last 2 minutes of mc-meet events before the call's first problem, written once. Kept in memory until then. |
 | `page-snapshots.jsonl` | Up to 5 page snapshots per call, one per problem. |
 
@@ -384,12 +449,13 @@ counters per channel, Meet's build label when the page exposes it, the Chrome ve
 mc-meet version. It holds no caption text.
 
 "Save debug report" (tray, or popup) writes `debug-reports/<time>-<call>/` in the data folder:
-`call-status.json`, the `app.log` lines that name the call, the call's session logs and its debug
-files. By default the report keeps only strings under keys known to hold times, ids, versions and
-codes. Every other string becomes `[N chars]`: caption and chat text, speaker, sender and
-participant names, meeting titles and codes, Slack channels, workspaces and window titles, error
-messages and `detail`. Device and message IDs become `device-N` and `message-N`, the same number
-for the same ID across the report, since the DOM reader uses a speaker's name as the device ID.
+`call-status.json`, the app log lines that name the call, the call's session logs and its debug
+files, with a fresh dump of the app's flight recorder. By default the report keeps only strings
+under keys known to hold times, ids, versions and codes. Every other string becomes `[N chars]`:
+caption and chat text, speaker, sender and participant names, meeting titles and codes, Slack
+channels, workspaces and window titles, error messages and `detail`. Device and message IDs become
+`device-N` and `message-N`, the same number for the same ID across the report, since the DOM
+reader uses a speaker's name as the device ID.
 Frame bytes are dropped. "Save debug report with caption text" keeps everything.
 
 `just replay-frames <path>` runs the frames of a report folder, a call's debug folder or a

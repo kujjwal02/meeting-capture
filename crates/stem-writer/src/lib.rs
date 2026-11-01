@@ -22,6 +22,7 @@ pub use manifest::{
 };
 pub use repair::{FolderRepair, repair_folder};
 pub use track::StemProgress;
+pub use wav::{OutputLevel, SILENCE_DBFS};
 
 use call_folder::FolderLock;
 use track::StemTrack;
@@ -389,6 +390,11 @@ impl Segment {
             }
         }
         self.store_manifest();
+    }
+
+    /// The stem file's level since the last take. `None` while the stem has no file.
+    pub fn take_level(&mut self, stem: Stem) -> Option<OutputLevel> {
+        self.track_slot(stem).as_mut().map(StemTrack::take_level)
     }
 
     /// The stem's progress. Resets its recent peak.

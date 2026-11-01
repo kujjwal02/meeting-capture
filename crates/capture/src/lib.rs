@@ -12,14 +12,12 @@ mod permission;
 mod ring;
 
 pub use call::{CallAudioSource, CallReaders, OpenedStem};
-pub use mic::{
-    InputDevices, MicPick, MicPickReason, MicRequest, MicRule, MicStream, MicTransport,
-    default_devices, mic_pick,
-};
+pub use mic::{InputDevices, MicPick, MicRequest, MicRule, MicStream, default_devices, mic_pick};
 pub use permission::permission_state;
 pub use ring::StemReader;
 pub use stem_timing::{
-    BufferStamp, MicMoment, PermissionService, PermissionState, Stem, StemLosses, UtcAnchor,
+    BufferStamp, MicMoment, MicPickReason, MicTransport, PermissionService, PermissionState, Stem,
+    StemLosses, UtcAnchor,
 };
 
 #[cfg(target_os = "macos")]

@@ -157,6 +157,8 @@ The app tracks each open Meet call and huddle in one status board
 - mc-meet gets the status of its calls as `call_status` messages and shows it on its toolbar
   icon. At a Meet call's first problem the app writes the lead-up and asks for a page snapshot.
   [mc-meet](09-meet-extension.md) has the debug material and the debug report.
+- At every call problem start, Meet or huddle, the app and the audio helper dump their flight
+  recorders into the call's debug folder. [Telemetry](10-telemetry.md) has the triggers.
 
 ### Audio and video (phases 2, 3, 3b, 3c, 5)
 
@@ -438,7 +440,7 @@ flowchart TB
 Later crates attach in their phase: the app depends on `detect`, `capture-protocol`,
 `stem-writer`, `video-capture` and `browser-shortcut`; `mc-capture` on `capture`, `stem-writer`,
 `video-capture` and `call-finalize`;
-`sources` depends on `stt`.
+`sources` depends on `stt`. The app, `mc-capture`, `cli` and `pipeline` depend on `telemetry`.
 
 - The two binaries own the wiring. Library crates never depend on `meeting-capture` or `cli`.
 - Only `meeting-capture` depends on Tauri.
@@ -462,6 +464,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 | call-finalize | 3c | Place a call's video parts and stems on one timeline, mix the stems, write `call.mp4`. Purge call video after 90 days. The planning, mixing and purge are portable | Mac: AVFoundation via `cidre` |
 | stt | 4 | VAD, Parakeet TDT 0.6B v3 int8, diarization of the remote stem | `sherpa-onnx` |
 | video-capture | 3c | Record one window through ScreenCaptureKit, encode it with VideoToolbox, cut 2 s HLS fragments with AVAssetWriter, write `video.json`, repair dead segments. The writer and repair are portable | Mac: `cidre` |
+| telemetry | 3d | One subscriber for every binary: OpenTelemetry-shaped JSON lines into daily log files, trace ids derived from `call.id` and `meeting.id`, the flight recorder and its dumps, the panic hook. Portable. [Telemetry](10-telemetry.md) | `tracing-subscriber`, `sha2` |
 | browser-shortcut | 3c | Press mc-meet's shortcut into one Chrome process: parse Chrome's shortcut text, find the key on the current keyboard layout, read the Accessibility grant, post the key events. Builds everywhere; only the Mac presses | Mac: `objc2-core-graphics`, `objc2-app-kit`, `objc2-application-services`, `dispatch2`, Carbon's `UCKeyTranslate` |
 
 ## Design rules
@@ -478,6 +481,9 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 - Secrets live in `settings.toml`: Google refresh tokens, the OAuth client secret, the LLM API key.
   The file is owner-only and stays out of the vault and git.
 - Stored times are UTC.
+- Every binary logs through `telemetry::init`, never its own subscriber. A field takes its
+  OpenTelemetry semantic convention name where one exists, such as `file.path`. Otherwise it takes
+  a domain prefix, such as `call.id` or `audio.*`. New names in the telemetry plan start with `mc.`.
 
 ## Common transcript format
 

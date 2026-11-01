@@ -60,6 +60,7 @@ impl Settings {
             }
         }
         file.llm.validate()?;
+        file.debug.mode()?;
         Ok(Self {
             vault_dir,
             my_name: file.my_name.clone(),

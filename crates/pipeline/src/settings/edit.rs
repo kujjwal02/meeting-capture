@@ -92,7 +92,7 @@ impl SettingsStore {
         let old = SettingsFile::read(&self.app_dirs)?;
         let mut file = old.clone();
         edit(&mut file)?;
-        file.write(&self.app_dirs)?;
+        file.write(&self.app_dirs, &old)?;
         self.take_live_sections(&file);
         Ok(SettingsChange::between(&old, &file))
     }

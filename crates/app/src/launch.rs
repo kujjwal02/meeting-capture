@@ -24,11 +24,20 @@ pub(crate) fn launch(app: &AppHandle, target: &LaunchTarget<'_>) {
         ),
     };
     if let Err(failure) = launched {
-        tracing::error!(
-            file.path = %path.display(),
-            exception.message = failure,
-            "could not open"
-        );
+        // A note's file name is the meeting's title: `note.path` is a key a debug report
+        // without text shortens.
+        match target {
+            LaunchTarget::Note(_) => tracing::error!(
+                note.path = %path.display(),
+                exception.message = failure,
+                "could not open"
+            ),
+            LaunchTarget::RevealFile(_) => tracing::error!(
+                file.path = %path.display(),
+                exception.message = failure,
+                "could not open"
+            ),
+        }
     }
 }
 

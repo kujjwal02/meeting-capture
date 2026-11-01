@@ -9,25 +9,30 @@
 mod browser_calls;
 mod call_capture;
 mod call_debug;
+mod call_metrics;
 mod call_status;
 mod calls;
+mod debug_mode;
 mod finished_logs;
+mod host_metrics;
 mod huddles;
 mod launch;
 mod meet_extension;
+mod meet_telemetry;
 mod meetings;
 mod settings_window;
 mod tray;
 mod updates;
 
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use pipeline::Pipeline;
 use pipeline::settings::{AppDirs, SettingsStore};
 use tauri::{AppHandle, Manager, RunEvent};
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_notification::NotificationExt as _;
+use telemetry::debug_mode::{DebugMode, DebugModeFollower};
 
 pub(crate) struct AppState {
     /// `None` when the settings or the job store failed to load. `pipeline_error` says why.
@@ -40,6 +45,7 @@ pub(crate) struct AppState {
     pub calls: calls::Calls,
     pub call_capture: call_capture::CallCapture,
     pub call_debug: call_debug::CallDebug,
+    pub debug_mode: debug_mode::AppDebugMode,
     pub updates: updates::Updates,
 }
 
@@ -69,10 +75,30 @@ fn run_host_mode(origin: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    if let Err(error) = init_host_logging(&app_dirs) {
-        eprintln!("host mode: could not open its log file: {error}");
-    }
-    native_host::run(origin, app_dirs.browser_call_socket())
+    let file_level = match init_host_logging(&app_dirs) {
+        Ok(file_level) => Some(file_level),
+        Err(error) => {
+            eprintln!("host mode: could not open its log file: {error}");
+            None
+        }
+    };
+    let socket = app_dirs.browser_call_socket().to_path_buf();
+    let Some(file_level) = file_level else {
+        return native_host::run(origin, &socket, || {});
+    };
+    // The host hears no settings change, so it rereads the file as it relays.
+    let settings = SettingsStore::new(app_dirs);
+    let mut debug_mode = DebugModeFollower::new(file_level, move || {
+        match settings.read().and_then(|file| file.debug.mode()) {
+            Ok(mode) => mode,
+            Err(error) => {
+                tracing::warn!(exception.message = %error, "could not read debug mode; it stays off");
+                DebugMode::Off
+            }
+        }
+    });
+    debug_mode.follow();
+    native_host::run(origin, &socket, move || debug_mode.follow())
 }
 
 fn run_tray_app() -> tauri::Result<()> {
@@ -130,7 +156,8 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
 
     let app_dirs = AppDirs::locate()?;
     app_dirs.create()?;
-    init_logging(&app_dirs)?;
+    let file_level = init_logging(&app_dirs)?;
+    remove_plain_text_logs(&app_dirs);
 
     let settings_store = Arc::new(SettingsStore::new(app_dirs));
     let (pipeline, pipeline_error) = match Pipeline::open(Arc::clone(&settings_store)) {
@@ -153,13 +180,17 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         calls: calls::Calls::new(),
         call_capture: call_capture::CallCapture::new(),
         call_debug,
+        debug_mode: debug_mode::AppDebugMode::new(file_level),
         updates: updates::Updates::default(),
     });
+    // Before the tray and the helpers, so they start in the stored mode.
+    debug_mode::start(app.handle());
     tray::create(app.handle())?;
     updates::start(app.handle());
     meet_extension::start(app.handle());
     call_status::start(app.handle());
     call_debug::start(app.handle());
+    host_metrics::start(app.handle());
     // Before the call sources, so it hears every call from the first.
     call_capture::start(app.handle());
     if let Some(pipeline) = pipeline {
@@ -193,39 +224,54 @@ pub(crate) fn notify(app: &AppHandle, heading: &str, body: &str) {
     }
 }
 
-pub(crate) const LOG_FILE_NAME: &str = "app.log";
-const HOST_LOG_FILE_NAME: &str = "native-host.log";
-
 // JSON lines in the app's log folder. A tray app has no terminal to write to.
-fn init_logging(app_dirs: &AppDirs) -> std::io::Result<()> {
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(app_dirs.log_dir().join(LOG_FILE_NAME))?;
-    tracing_subscriber::fmt()
-        .json()
-        .with_writer(Mutex::new(log_file))
-        .init();
-    // A panic on a worker thread would otherwise reach only stderr, which a login item discards.
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic| {
-        tracing::error!(exception.message = %panic, "panic");
-        default_hook(panic);
-    }));
-    Ok(())
+fn init_logging(app_dirs: &AppDirs) -> Result<telemetry::FileLevelHandle, telemetry::InitError> {
+    telemetry::init(telemetry::TelemetryConfig {
+        service: telemetry::Service::App,
+        service_version: env!("CARGO_PKG_VERSION"),
+        log_sink: telemetry::LogSink::DailyFiles {
+            dir: app_dirs.log_dir(),
+        },
+        panic_dump_dir: Some(app_dirs.call_debug_dir()),
+    })
 }
 
-// JSON lines in their own file: several hosts can run at once, one per Chrome profile, next to
-// the tray app.
-fn init_host_logging(app_dirs: &AppDirs) -> std::io::Result<()> {
-    std::fs::create_dir_all(app_dirs.log_dir())?;
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(app_dirs.log_dir().join(HOST_LOG_FILE_NAME))?;
-    tracing_subscriber::fmt()
-        .json()
-        .with_writer(Mutex::new(log_file))
-        .init();
-    Ok(())
+/// The log files of versions before the daily JSON files. Nothing writes them any more.
+const PLAIN_TEXT_LOG_FILE_NAMES: &[&str] = &[
+    "app.log",
+    "native-host.log",
+    "mc-capture.log",
+    "mc-capture.log.1",
+];
+
+// Runs at every launch: once the files are gone, it costs four failed unlinks.
+fn remove_plain_text_logs(app_dirs: &AppDirs) {
+    let log_dir = app_dirs.log_dir();
+    for file_name in PLAIN_TEXT_LOG_FILE_NAMES {
+        let path = log_dir.join(file_name);
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(file.path = %path.display(), "removed an old log file"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => tracing::warn!(
+                file.path = %path.display(),
+                exception.message = %error,
+                "could not remove an old log file"
+            ),
+        }
+    }
+}
+
+// Its own service and so its own files: several hosts can run at once, one per Chrome profile,
+// next to the tray app.
+fn init_host_logging(
+    app_dirs: &AppDirs,
+) -> Result<telemetry::FileLevelHandle, telemetry::InitError> {
+    telemetry::init(telemetry::TelemetryConfig {
+        service: telemetry::Service::NativeHost,
+        service_version: env!("CARGO_PKG_VERSION"),
+        log_sink: telemetry::LogSink::DailyFiles {
+            dir: app_dirs.log_dir(),
+        },
+        panic_dump_dir: Some(app_dirs.call_debug_dir()),
+    })
 }

@@ -68,7 +68,9 @@ impl Step {
         Step::Written,
     ];
 
-    fn as_str(self) -> &'static str {
+    /// The stored name, also the `job.step` of the span that finishes the step.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
         match self {
             Step::Captured => "captured",
             Step::Matched => "matched",

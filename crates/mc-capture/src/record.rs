@@ -11,11 +11,11 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use capture::{
-    BufferStamp, CallAudioSource, CaptureError, IdleSleepBlock, MicMoment, MicRequest,
-    MicTransport, PermissionService, PermissionState, PowerEvent, SleepAck, Stem, StemLosses,
-    StemReader,
+    BufferStamp, CallAudioSource, CaptureError, IdleSleepBlock, MicMoment, MicPick, MicRequest,
+    MicStream, MicTransport, PermissionService, PermissionState, PowerEvent, SleepAck, Stem,
+    StemLosses, StemReader,
 };
-use capture_protocol::DeviceChangeCause;
+use capture_protocol::{DeviceChangeCause, MicRoute};
 use serde::Serialize;
 use stem_writer::{Segment, SegmentEvent, SegmentReport, StemProgress};
 
@@ -23,6 +23,18 @@ use crate::devices::{
     CandidateState, DeliveredRate, DeviceWatch, MicCandidate, MicSwap, RebuildDecision, Takeover,
 };
 use crate::{LineKind, MicChoice};
+
+/// The pick as the app's environment rows report it, with the default output read now: a mic
+/// is picked at a segment start or a device change, so this never runs per buffer.
+fn mic_route(pick: &MicPick) -> MicRoute {
+    MicRoute {
+        reason: pick.reason,
+        transport: pick.transport,
+        default_input: pick.default_input_name.clone(),
+        default_input_transport: pick.default_input_transport,
+        default_output: capture::default_devices().default_output,
+    }
+}
 
 /// Drain often enough that a 65,536-sample ring at 48 kHz (1.4 s) never fills. Also bounds how
 /// long a stop waits before the segment closes.
@@ -114,6 +126,8 @@ pub(crate) struct DeviceChange {
     pub new_device: String,
     pub rate_hz: u32,
     pub cause: DeviceChangeCause,
+    /// Why the mic rule chose the new input. `None` for the tap.
+    pub mic_route: Option<MicRoute>,
 }
 
 /// A stem's first buffer in the segment.
@@ -122,6 +136,8 @@ pub(crate) struct StemStart {
     pub device: String,
     pub rate_hz: u32,
     pub first_host_time_ns: u64,
+    /// Why the mic rule chose the input. `None` for the tap.
+    pub mic_route: Option<MicRoute>,
 }
 
 /// What a recording loop tells the outside, and when it stops.
@@ -185,6 +201,15 @@ impl LiveSegment<'_> {
         self.segment
             .take_progress(stem)
             .map(|progress| record_stem.status_line(progress))
+    }
+
+    /// The stem file's level since the last call. `None` while the stem has no file.
+    pub fn level(&mut self, stem: Stem) -> Option<capture_protocol::StemLevel> {
+        let level = self.segment.take_level(stem)?;
+        Some(capture_protocol::StemLevel {
+            rms_dbfs: level.rms_dbfs()?,
+            peak_dbfs: level.peak_dbfs()?,
+        })
     }
 
     /// The stem's counters. Resets its recent peak.
@@ -401,6 +426,7 @@ impl RecordStem {
                 device: device.to_owned(),
                 rate_hz: first.sample_rate_hz,
                 first_host_time_ns: first.host_time_ns,
+                mic_route: None,
             });
         }
         segment.note_ring_losses(self.stem, self.total_losses());
@@ -570,11 +596,17 @@ impl Feeds {
         Ok(())
     }
 
+    /// Hands each stem's first buffer and add failures to the observer. `mic` is the open mic
+    /// stream, whose pick goes with the mic's first buffer.
     fn report(
         &mut self,
         number: u32,
         observer: &mut impl SegmentObserver,
+        mic: Option<&MicStream>,
     ) -> Result<(), SegmentError> {
+        if let Some(start) = self.mic.stem.pending_start.as_mut() {
+            start.mic_route = mic.map(|stream| mic_route(stream.pick()));
+        }
         self.mic.stem.report(number, observer)?;
         if let Some(remote) = self.remote.as_mut() {
             remote.stem.report(number, observer)?;
@@ -741,7 +773,9 @@ fn record_until_stopped(
         }
         segment.checkpoint_if_due();
         let number = segment.number();
-        devices.feeds.report(number, observer)?;
+        devices
+            .feeds
+            .report(number, observer, devices.source.mic())?;
         observer
             .segment_events(number, segment.take_events())
             .map_err(SegmentError::Report)?;
@@ -960,6 +994,7 @@ fn take_over_mic(
         samples,
         dropped_samples,
     } = candidate.take_over(feeds.mic.stem.last_end_ns);
+    let route = mic_route(stream.pick());
     source.replace_mic(stream);
     let new_device = reader.format().device_name.clone();
     let rate_hz = stamps
@@ -999,6 +1034,7 @@ fn take_over_mic(
                 new_device,
                 rate_hz,
                 cause,
+                mic_route: Some(route),
             },
         )
         .map_err(SegmentError::Report)
@@ -1079,6 +1115,7 @@ fn rebuild_tap(
                 new_device,
                 rate_hz,
                 cause,
+                mic_route: None,
             },
         )
         .map_err(SegmentError::Report)

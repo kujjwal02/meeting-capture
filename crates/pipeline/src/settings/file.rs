@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use telemetry::debug_mode::DebugMode;
 
 use super::{AppDirs, Settings, SettingsError};
 
@@ -42,6 +43,35 @@ impl Default for MeetSettings {
         Self {
             hide_captions: true,
         }
+    }
+}
+
+/// Debug mode, which the tray turns on for 24 hours. Every process rereads it, so a hand edit
+/// applies within a minute. A time more than 24 hours ahead reads as 24 hours from the read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DebugSettings {
+    /// RFC 3339 UTC. Absent when debug mode is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    enabled_until: Option<String>,
+}
+
+impl DebugSettings {
+    /// # Errors
+    ///
+    /// Returns `SettingsError` naming `debug.enabled_until` when it is not a time.
+    pub fn mode(&self) -> Result<DebugMode, SettingsError> {
+        DebugMode::from_enabled_until(self.enabled_until.as_deref(), jiff::Timestamp::now())
+            .map_err(|error| SettingsError::DebugEnabledUntil { value: error.value })
+    }
+
+    /// Off removes the key.
+    pub fn set_mode(&mut self, mode: DebugMode) {
+        self.enabled_until = mode.enabled_until();
+    }
+
+    fn is_off(&self) -> bool {
+        self.enabled_until.is_none()
     }
 }
 
@@ -192,7 +222,7 @@ impl std::fmt::Debug for GoogleSettings {
 
 /// The settings file as written, before defaults fill the gaps. Edits go through
 /// `SettingsStore::edit`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsFile {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -212,6 +242,8 @@ pub struct SettingsFile {
     pub slack: SlackSettings,
     #[serde(default)]
     pub meet: MeetSettings,
+    #[serde(default, skip_serializing_if = "DebugSettings::is_off")]
+    pub debug: DebugSettings,
 }
 
 /// Heads the settings file whenever the app writes it.
@@ -237,6 +269,9 @@ const SETTINGS_HEADER: &str = "\
 # [slack] min_huddle_seconds: a shorter huddle writes no note. Default 120.
 # [meet] hide_captions: hide Meet's caption box while mc-meet reads captions from it, so it
 #   covers no shared screen. With the data channel, the box never shows. Default true.
+# [debug] enabled_until: every log file keeps DEBUG lines until this UTC time, at most 24 hours
+#   ahead. The tray's \"Debug mode (24 h)\" sets it and removes it. A hand edit applies within a
+#   minute, with no restart.
 
 ";
 
@@ -268,13 +303,19 @@ impl SettingsFile {
         }
     }
 
-    /// Validates the settings, then replaces the file in one rename.
+    /// Validates the settings, then replaces the file in one rename. An edit of `[debug]` alone
+    /// validates only that table: the tray's debug toggle must work while another field, such as
+    /// a vault folder that is gone, fails to resolve.
     ///
     /// # Errors
     ///
     /// Returns `SettingsError` naming the invalid field or the file.
-    pub(super) fn write(&self, app_dirs: &AppDirs) -> Result<(), SettingsError> {
-        Settings::resolve(self)?;
+    pub(super) fn write(&self, app_dirs: &AppDirs, old: &Self) -> Result<(), SettingsError> {
+        if self.is_debug_change_only(old) {
+            self.debug.mode()?;
+        } else {
+            Settings::resolve(self)?;
+        }
         let path = app_dirs.settings_file();
         let write_error = |source| SettingsError::Write {
             path: path.clone(),
@@ -292,6 +333,14 @@ impl SettingsFile {
             .persist(&path)
             .map_err(|error| write_error(error.error))?;
         Ok(())
+    }
+}
+
+impl SettingsFile {
+    fn is_debug_change_only(&self, old: &Self) -> bool {
+        let mut unchanged = self.clone();
+        unchanged.debug.clone_from(&old.debug);
+        unchanged == *old
     }
 }
 

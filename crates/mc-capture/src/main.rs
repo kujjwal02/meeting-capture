@@ -23,10 +23,12 @@ mod record;
 mod video;
 
 use std::path::PathBuf;
+use std::sync::OnceLock;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use telemetry::debug_mode::DebugModeSwitch;
 
 /// What a JSON line on stdout reports.
 #[cfg(target_os = "macos")]
@@ -45,6 +47,14 @@ enum LineKind {
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
+    /// Write the log to `<dir>/mc-capture-<UTC date>.jsonl` instead of stderr. The app passes
+    /// its log folder.
+    #[arg(long)]
+    log_dir: Option<PathBuf>,
+    /// A panic dumps the flight recorder into a new folder here. The app passes its debug
+    /// folder.
+    #[arg(long)]
+    debug_dir: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -158,11 +168,9 @@ enum MicChoice {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .json()
-        .init();
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    init_logging(cli.log_dir, cli.debug_dir)?;
+    match cli.command {
         Command::Audio { mic } => {
             #[cfg(target_os = "macos")]
             return audio::serve(mic);
@@ -253,6 +261,44 @@ fn main() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+/// Turns the log file to DEBUG and back at the app's `set_debug`.
+static DEBUG_MODE_SWITCH: OnceLock<DebugModeSwitch> = OnceLock::new();
+
+// The app passes both folders. Run by hand, the helper logs to stderr. A log folder that will
+// not open also falls back to stderr, which the app sends to a file: a recording must not fail
+// over its log.
+fn init_logging(
+    log_dir: Option<PathBuf>,
+    debug_dir: Option<PathBuf>,
+) -> Result<(), telemetry::InitError> {
+    let config = |log_sink, panic_dump_dir| telemetry::TelemetryConfig {
+        service: telemetry::Service::McCapture,
+        service_version: env!("CARGO_PKG_VERSION"),
+        log_sink,
+        panic_dump_dir,
+    };
+    let file_level = match log_dir {
+        Some(dir) => match telemetry::init(config(
+            telemetry::LogSink::DailyFiles { dir: dir.clone() },
+            debug_dir.clone(),
+        )) {
+            Err(telemetry::InitError::LogFile(error)) => {
+                let file_level = telemetry::init(config(telemetry::LogSink::Stderr, debug_dir))?;
+                tracing::warn!(
+                    file.directory = %dir.display(),
+                    exception.message = %error,
+                    "could not open the log folder; logging to stderr"
+                );
+                file_level
+            }
+            opened => opened?,
+        },
+        None => telemetry::init(config(telemetry::LogSink::Stderr, debug_dir))?,
+    };
+    let _first_init = DEBUG_MODE_SWITCH.set(DebugModeSwitch::new(file_level));
+    Ok(())
 }
 
 /// Prints the outcome. A failure to lock the folder or write its record is a failed outcome

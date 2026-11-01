@@ -7,14 +7,18 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead as _, Write as _};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use capture::{CaptureError, PermissionService, PermissionState, PowerEvent, Stem};
 use capture_protocol::{AudioCommand, AudioErrorKind, AudioReport, DeviceChangeCause};
 use stem_writer::SegmentEvent;
+use telemetry::DumpReason;
+use telemetry::debug_mode::DebugMode;
 
 use crate::MicChoice;
 use crate::record::{
@@ -22,7 +26,9 @@ use crate::record::{
     SegmentRequest, StemStart,
 };
 
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Each heartbeat carries one second of stem levels, so the app's 1 s metric rows need no
+/// second message kind.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What reaches the serving loop: commands from stdin, its close, and power events.
 enum HelperInput {
@@ -84,6 +90,13 @@ impl ReportedPermissions {
 /// Serves commands until stdin closes. Returns an error, and so exits non-zero, when a segment
 /// fails: the app then restarts the process with the next segment number.
 pub(crate) fn serve(mic: MicChoice) -> anyhow::Result<()> {
+    let served = serve_commands(mic);
+    // The process ends when this returns, and a dump cut off there loses its last lines.
+    join_recorder_dumps();
+    served
+}
+
+fn serve_commands(mic: MicChoice) -> anyhow::Result<()> {
     let writer = ReportWriter::new();
     let (sender, inputs) = mpsc::channel();
     let power_sender = sender.clone();
@@ -117,6 +130,8 @@ pub(crate) fn serve(mic: MicChoice) -> anyhow::Result<()> {
                 AudioErrorKind::BadCommand,
                 "stop arrived with no segment open".to_owned(),
             )?,
+            AudioCommand::DumpRecorder { path } => spawn_recorder_dump(path),
+            AudioCommand::SetDebug { until } => follow_debug_mode(until.as_deref()),
             AudioCommand::Start {
                 call_id,
                 folder,
@@ -131,6 +146,12 @@ pub(crate) fn serve(mic: MicChoice) -> anyhow::Result<()> {
                     next_heartbeat: HEARTBEAT_INTERVAL,
                     is_stdin_closed: false,
                 };
+                let _span = tracing::info_span!(
+                    "capture.segment",
+                    call.id = %call_id,
+                    segment.number = segment
+                )
+                .entered();
                 let request = SegmentRequest {
                     folder: &folder,
                     number: segment,
@@ -245,6 +266,68 @@ fn report_segment_end(writer: &ReportWriter, number: u32, end: SegmentEnd) -> an
     }
 }
 
+/// Sets the log file level from the app's `set_debug`. A value that is not a time turns debug
+/// mode off: the app wrote it, so the next change corrects it.
+fn follow_debug_mode(until: Option<&str>) {
+    let mode =
+        DebugMode::from_enabled_until(until, jiff::Timestamp::now()).unwrap_or_else(|error| {
+            tracing::warn!(exception.message = %error, "set_debug.bad_until");
+            DebugMode::Off
+        });
+    if let Some(switch) = crate::DEBUG_MODE_SWITCH.get() {
+        switch.apply_now(mode);
+    }
+}
+
+/// The dump threads still running, joined before the process ends.
+static RECORDER_DUMPS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
+/// Dumps the flight recorder on its own thread: a dump writes up to 8 MB, which would stall the
+/// drain loop past what the rings hold.
+fn spawn_recorder_dump(path: PathBuf) {
+    let spawned = std::thread::Builder::new()
+        .name("recorder-dump".to_owned())
+        .spawn(
+            move || match telemetry::dump_recorder(&path, DumpReason::AppRequest) {
+                Ok(line_count) => tracing::info!(
+                    file.path = %path.display(),
+                    mc.recorder.line_count = line_count,
+                    "recorder.dumped"
+                ),
+                Err(error) => tracing::warn!(
+                    file.path = %path.display(),
+                    exception.message = %error,
+                    "recorder.dump_failed"
+                ),
+            },
+        );
+    match spawned {
+        Ok(dump) => {
+            let mut dumps = RECORDER_DUMPS
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            dumps.retain(|running| !running.is_finished());
+            dumps.push(dump);
+        }
+        Err(error) => {
+            tracing::warn!(exception.message = %error, "recorder.dump_thread_failed");
+        }
+    }
+}
+
+fn join_recorder_dumps() {
+    let dumps = std::mem::take(
+        &mut *RECORDER_DUMPS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
+    for dump in dumps {
+        if dump.join().is_err() {
+            tracing::warn!("recorder.dump_panicked");
+        }
+    }
+}
+
 /// Parses each stdin line once. A bad line is reported and skipped. At EOF it sends
 /// `StdinClosed`, which is how the recording loop hears that stdin closed.
 fn read_commands(sender: &mpsc::Sender<HelperInput>, writer: &ReportWriter) {
@@ -294,6 +377,7 @@ impl SegmentObserver for AudioObserver<'_> {
             device: start.device.clone(),
             rate_hz: start.rate_hz,
             first_host_time_ns: start.first_host_time_ns,
+            mic_route: start.mic_route.clone(),
         })
     }
 
@@ -334,6 +418,7 @@ impl SegmentObserver for AudioObserver<'_> {
             new_device: change.new_device.clone(),
             rate_hz: change.rate_hz,
             cause: change.cause,
+            mic_route: change.mic_route.clone(),
         })
     }
 
@@ -367,6 +452,8 @@ impl SegmentObserver for AudioObserver<'_> {
                 segment: live.number(),
                 mic: live.counters(Stem::Mic),
                 remote: live.counters(Stem::Remote),
+                mic_level: live.level(Stem::Mic),
+                remote_level: live.level(Stem::Remote),
             })?;
         }
         match self.inputs.try_recv() {
@@ -379,6 +466,14 @@ impl SegmentObserver for AudioObserver<'_> {
                         live.number()
                     ),
                 )?;
+                Ok(LoopControl::Continue)
+            }
+            Ok(HelperInput::Command(AudioCommand::DumpRecorder { path })) => {
+                spawn_recorder_dump(path);
+                Ok(LoopControl::Continue)
+            }
+            Ok(HelperInput::Command(AudioCommand::SetDebug { until })) => {
+                follow_debug_mode(until.as_deref());
                 Ok(LoopControl::Continue)
             }
             Ok(HelperInput::Power(PowerEvent::WillSleep(ack))) => {

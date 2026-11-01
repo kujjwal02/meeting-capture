@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
+use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use jobs::{JobState, Meeting, MeetingId};
 use pipeline::settings::SettingsStore;
@@ -18,6 +19,7 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_autostart::ManagerExt as _;
 use tauri_plugin_opener::OpenerExt as _;
+use telemetry::debug_mode::DebugMode;
 
 use crate::call_capture::{AudioState, VideoSettingsPane, VideoState};
 use crate::call_status::{BoardView, CallState, CallView, Moment, TrayLook, display_time_zone};
@@ -27,6 +29,8 @@ use capture_protocol::PermissionService;
 
 const TRAY_ID: &str = "main";
 const TOOLTIP_HEADING: &str = "Meeting Capture";
+/// A date and clock time such as `02 Nov 14:30 IST`.
+const DATED_CLOCK_FORMAT: &str = "%d %b %H:%M %Z";
 /// Big enough for a 22 pt menu bar on a 2x display.
 const TRAY_ICON_PX: u32 = 44;
 /// Each pixel's coverage is sampled on a grid this many samples wide, for a smooth edge.
@@ -60,8 +64,10 @@ enum MenuAction {
     StartAtLogin,
     OpenSettings,
     ShowLogFile,
+    ToggleDebugMode,
     SaveDebugReport,
     SaveDebugReportWithText,
+    SaveRecentDebugReport,
     Quit,
 }
 
@@ -84,8 +90,10 @@ impl MenuAction {
             MenuAction::StartAtLogin => "start-at-login".to_owned(),
             MenuAction::OpenSettings => "open-settings".to_owned(),
             MenuAction::ShowLogFile => "show-log-file".to_owned(),
+            MenuAction::ToggleDebugMode => "toggle-debug-mode".to_owned(),
             MenuAction::SaveDebugReport => "save-debug-report".to_owned(),
             MenuAction::SaveDebugReportWithText => "save-debug-report-with-text".to_owned(),
+            MenuAction::SaveRecentDebugReport => "save-recent-debug-report".to_owned(),
             MenuAction::Quit => "quit".to_owned(),
         }
     }
@@ -119,8 +127,10 @@ impl MenuAction {
             MenuAction::StartAtLogin,
             MenuAction::OpenSettings,
             MenuAction::ShowLogFile,
+            MenuAction::ToggleDebugMode,
             MenuAction::SaveDebugReport,
             MenuAction::SaveDebugReportWithText,
+            MenuAction::SaveRecentDebugReport,
             MenuAction::Quit,
         ]
         .into_iter()
@@ -352,6 +362,7 @@ fn show_look(app: &AppHandle, tray: &TrayIcon, view: &BoardView) -> tauri::Resul
     }
     let time_zone = display_time_zone(&app.state::<AppState>());
     let mut tooltip = vec![TOOLTIP_HEADING.to_owned()];
+    tooltip.extend(debug_mode_line(&app.state::<AppState>(), &time_zone));
     if view.is_huddle_permission_missing {
         tooltip.push(HUDDLE_PERMISSION_LINE.to_owned());
     }
@@ -485,6 +496,7 @@ fn compose_menu(app: &AppHandle, view: &BoardView) -> tauri::Result<Menu<Wry>> {
         "Show log file",
         true,
     )?)?;
+    menu.append(&debug_mode_entry(app, &state)?)?;
     let has_call = view.current_or_last_call().is_some();
     menu.append(&action_entry(
         app,
@@ -497,6 +509,12 @@ fn compose_menu(app: &AppHandle, view: &BoardView) -> tauri::Result<Menu<Wry>> {
         &MenuAction::SaveDebugReportWithText,
         "Save debug report with caption text",
         has_call,
+    )?)?;
+    menu.append(&action_entry(
+        app,
+        &MenuAction::SaveRecentDebugReport,
+        "Save debug report of the last 30 min",
+        true,
     )?)?;
     menu.append(&PredefinedMenuItem::separator(app)?)?;
     menu.append(&action_entry(app, &MenuAction::Quit, "Quit", true)?)?;
@@ -654,7 +672,7 @@ fn meeting_submenu(
     let started_at = meeting
         .started_at
         .to_zoned(time_zone.clone())
-        .strftime("%d %b %H:%M %Z");
+        .strftime(DATED_CLOCK_FORMAT);
     let title = shorten(
         meeting.title.as_deref().unwrap_or("Untitled call"),
         MAX_TITLE_CHARS,
@@ -742,6 +760,34 @@ fn start_at_login_entry(app: &AppHandle) -> tauri::Result<tauri::menu::CheckMenu
     )
 }
 
+fn debug_mode_entry(
+    app: &AppHandle,
+    state: &AppState,
+) -> tauri::Result<tauri::menu::CheckMenuItem<Wry>> {
+    tauri::menu::CheckMenuItem::with_id(
+        app,
+        MenuAction::ToggleDebugMode.id(),
+        "Debug mode (24 h)",
+        true,
+        state.debug_mode.mode().is_on(Timestamp::now()),
+        None::<&str>,
+    )
+}
+
+/// "Debug until 02 Nov 14:30 IST" while debug mode is on. The end is up to 24 hours away, so a
+/// clock time alone could be today or tomorrow.
+fn debug_mode_line(state: &AppState, time_zone: &TimeZone) -> Option<String> {
+    match state.debug_mode.mode().at(Timestamp::now()) {
+        DebugMode::Off => None,
+        DebugMode::On { until } => Some(format!(
+            "Debug until {}",
+            until
+                .to_zoned(time_zone.clone())
+                .strftime(DATED_CLOCK_FORMAT)
+        )),
+    }
+}
+
 fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
     let Some(action) = MenuAction::parse(event.id().as_ref()) else {
         tracing::warn!(menu.item.id = event.id().as_ref(), "unknown tray menu item");
@@ -812,16 +858,19 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
         MenuAction::OpenSettings => crate::settings_window::open(app),
         MenuAction::SaveDebugReport => save_debug_report(app, false),
         MenuAction::SaveDebugReportWithText => save_debug_report(app, true),
-        MenuAction::ShowLogFile => launch(
-            app,
-            &LaunchTarget::RevealFile(
-                &state
-                    .settings
-                    .app_dirs()
-                    .log_dir()
-                    .join(crate::LOG_FILE_NAME),
-            ),
-        ),
+        MenuAction::ToggleDebugMode => crate::debug_mode::toggle(app),
+        MenuAction::SaveRecentDebugReport => save_recent_debug_report(app),
+        MenuAction::ShowLogFile => {
+            let log_dir = state.settings.app_dirs().log_dir();
+            // Today's file, the newest; the folder when listing it fails.
+            let newest = telemetry::daily_log_files(&log_dir, telemetry::Service::App)
+                .ok()
+                .and_then(|files| files.last().cloned());
+            launch(
+                app,
+                &LaunchTarget::RevealFile(newest.as_deref().unwrap_or(&log_dir)),
+            );
+        }
         MenuAction::Quit => app.exit(0),
     }
 }
@@ -830,6 +879,16 @@ fn save_debug_report(app: &AppHandle, is_with_text: bool) {
     let app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
         if let Err(error) = crate::call_debug::save_debug_report(&app, None, is_with_text) {
+            tracing::error!(exception.message = %error, "could not save a debug report");
+            crate::notify(&app, "Debug report not saved", &error.to_string());
+        }
+    });
+}
+
+fn save_recent_debug_report(app: &AppHandle) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = crate::call_debug::save_recent_debug_report(&app, false) {
             tracing::error!(exception.message = %error, "could not save a debug report");
             crate::notify(&app, "Debug report not saved", &error.to_string());
         }

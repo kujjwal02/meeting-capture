@@ -450,18 +450,19 @@
       return Object.values(counters).reduce((sum, c) => sum + c.rejected, 0);
     }
 
-    // bytes is the frame as decoded; rawBytes as received, before gzip inflation.
+    // bytes is the frame as decoded; rawBytes as received, before gzip inflation. Returns the
+    // frame's outcome: "parsed", "control" or "rejected".
     function noteResult(label, result, bytes, rawBytes) {
       const counter = counters[label];
       counter.raw += 1;
       if (result.ok) {
         counter.parsed += 1;
         counter.consecutive = 0;
-        return;
+        return "parsed";
       }
       if (result.control) {
         counter.control += 1;
-        return;
+        return "control";
       }
       counter.rejected += 1;
       counter.consecutive += 1;
@@ -490,6 +491,7 @@
           detail: `${label}: ${run} frames in a row failed (${reasonList}); skeleton ${skeleton(bytes)}`,
         });
       }
+      return "rejected";
     }
 
     function emitRosterIfChanged() {
@@ -571,23 +573,26 @@
       });
     }
 
-    // Decodes one data channel frame. Returns { acks }, one per captions_v2 utterance, so the
-    // hook can ack frames on channels it opened itself.
+    // Decodes one data channel frame. Returns { acks, outcome, captions }: acks, one per
+    // captions_v2 utterance, so the hook can ack frames on channels it opened itself; outcome,
+    // "parsed", "control" or "rejected"; captions, how many captions with text the frame held.
     async function frame(label, data) {
       if (!counters[label]) return {};
       let bytes;
       try {
         bytes = await inflateFrame(data);
       } catch {
-        noteResult(label, { ok: false, reason: "gunzip-threw" }, data, data);
-        return {};
+        const outcome = noteResult(label, { ok: false, reason: "gunzip-threw" }, data, data);
+        return { outcome, captions: 0 };
       }
       if (label === "captions_v2") {
         const result = decodeCaptionV2(bytes);
-        noteResult(label, result, bytes, data);
-        if (!result.ok) return {};
+        const outcome = noteResult(label, result, bytes, data);
+        if (!result.ok) return { outcome, captions: 0 };
         for (const caption of result.captions) emitCaption(label, caption);
         return {
+          outcome,
+          captions: result.captions.filter((caption) => caption.text).length,
           acks: result.captions.map((caption) =>
             encodeCaptionV2Ack(caption.utteranceId, caption.version),
           ),
@@ -595,22 +600,22 @@
       }
       if (label === "captions") {
         const result = decodeCaptionV1(bytes);
-        noteResult(label, result, bytes, data);
+        const outcome = noteResult(label, result, bytes, data);
         if (result.ok) emitCaption(label, result);
-        return {};
+        return { outcome, captions: result.ok && result.text ? 1 : 0 };
       }
       if (label === "collections") {
         const result = decodeCollections(bytes);
-        noteResult(label, result, bytes, data);
-        if (!result.ok) return {};
+        const outcome = noteResult(label, result, bytes, data);
+        if (!result.ok) return { outcome, captions: 0 };
         if (result.participants.length) mergeParticipants(result.participants);
         if (result.chats.length) emitChats(result.chats);
-        return {};
+        return { outcome, captions: 0 };
       }
       const result = decodeMeetMessage(bytes);
-      noteResult(label, result, bytes, data);
+      const outcome = noteResult(label, result, bytes, data);
       if (result.ok) emitChats(result.chats);
-      return {};
+      return { outcome, captions: 0 };
     }
 
     return {
@@ -647,6 +652,7 @@
   }
 
   globalThis.mcMeetWire = Object.freeze({
+    bytesToBase64,
     parseFields,
     inflateFrame,
     skeleton,

@@ -7,6 +7,7 @@
   const APP_KEY = "app";
   const VIDEO_CAPTURE_KEY = "video_capture";
   const NEEDS_CLICK_KEY = "video_needs_click";
+  const DEBUG_MODE_KEY = "debugModeUntil";
   const STATE_WORDS = {
     waiting: "Waiting for captions",
     recording: "Recording",
@@ -25,6 +26,7 @@
   let sessionId;
   let videoCapture = null;
   let needsClick = {};
+  let debugModeUntil = null;
   let isOpeningSent = false;
   let port;
   let reportTimer = null;
@@ -100,6 +102,17 @@
         : "not connected",
     );
     show("extension", chrome.runtime.getManifest().version);
+
+    const debugEndMs = debugModeUntil ? Date.parse(debugModeUntil) : NaN;
+    const isDebugOn = debugEndMs > Date.now();
+    byId("debug-mode").hidden = !isDebugOn;
+    if (isDebugOn) {
+      const end = new Date(debugEndMs).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      show("debug-mode", `Debug mode on until ${end}`);
+    }
   }
 
   async function load() {
@@ -116,11 +129,13 @@
       APP_KEY,
       VIDEO_CAPTURE_KEY,
       NEEDS_CLICK_KEY,
+      DEBUG_MODE_KEY,
     ]);
     callStatus = stored[CALL_STATUS_KEY];
     app = stored[APP_KEY] ?? { is_reachable: true };
     videoCapture = stored[VIDEO_CAPTURE_KEY] ?? null;
     needsClick = stored[NEEDS_CLICK_KEY] ?? {};
+    debugModeUntil = stored[DEBUG_MODE_KEY] ?? null;
     render();
   }
 
@@ -165,7 +180,7 @@
   chrome.storage.onChanged.addListener((changes, area) => {
     const isStatusChange =
       (area === "session" &&
-        [CALL_STATUS_KEY, APP_KEY, VIDEO_CAPTURE_KEY, NEEDS_CLICK_KEY].some(
+        [CALL_STATUS_KEY, APP_KEY, VIDEO_CAPTURE_KEY, NEEDS_CLICK_KEY, DEBUG_MODE_KEY].some(
           (key) => key in changes,
         )) ||
       (area === "local" && "tabSessions" in changes);

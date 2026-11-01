@@ -233,12 +233,9 @@ impl GoogleAccounts {
                     .filter_map(|event| Candidate::new(transcript, event, account_rank)),
             );
         }
-        tracing::info!(
-            calendar.candidates = candidates.len(),
-            "calendar events found"
-        );
-
-        let best = candidates.into_iter().min_by_key(Candidate::rank);
+        candidates.sort_by_key(Candidate::rank);
+        log_match_decision(&candidates);
+        let best = candidates.into_iter().next();
         Ok(CalendarMatch {
             event: best.map(|candidate| candidate.into_event(&accounts)),
         })
@@ -278,6 +275,25 @@ impl GoogleAccounts {
     fn lock(&self) -> std::sync::MutexGuard<'_, AccountsState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// One decision event: how many events overlapped, and the rank parts of the winner and the
+/// runner-up. No titles, names or emails: the rank parts say why one won.
+fn log_match_decision(ranked: &[Candidate]) {
+    let chosen = ranked.first();
+    let runner_up = ranked.get(1);
+    tracing::info!(
+        mc.decision.kind = "calendar_match",
+        mc.decision.candidate_count = ranked.len(),
+        mc.decision.chosen = if chosen.is_some() { "event" } else { "none" },
+        mc.decision.chosen.is_same_meet = chosen.map(|candidate| candidate.is_same_meet),
+        mc.decision.chosen.overlap_s = chosen.map(|candidate| candidate.overlap_s),
+        mc.decision.chosen.has_meet_link = chosen.map(|candidate| candidate.has_meet_link),
+        mc.decision.chosen.account_rank = chosen.map(|candidate| candidate.account_rank),
+        mc.decision.runner_up.is_same_meet = runner_up.map(|candidate| candidate.is_same_meet),
+        mc.decision.runner_up.overlap_s = runner_up.map(|candidate| candidate.overlap_s),
+        "calendar match decided"
+    );
 }
 
 struct Candidate {

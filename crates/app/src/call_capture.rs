@@ -53,6 +53,7 @@ use capture_protocol::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tauri::{AppHandle, Manager as _};
+use telemetry::debug_mode::DebugMode;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
@@ -70,7 +71,9 @@ const LIVENESS_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// The helper reads `stop` only after its two device opens of at most 5 s each, then closes its
 /// segment within 1 s. Past this it is killed.
 const STOP_LIMIT: Duration = Duration::from_secs(12);
-const SIDECAR_LOG_FILE_NAME: &str = "mc-capture.log";
+/// What the helper prints outside its log: a crash message from the Rust runtime, or a system
+/// framework's own output. Its log lines go to its daily log file.
+const SIDECAR_STDERR_FILE_NAME: &str = "mc-capture-stderr.log";
 /// The shortest time between two respawns of one call's process for a new Screen Recording
 /// check, so a refusal that comes back at once cannot spin the helper.
 const RESPAWN_GAP: Duration = Duration::from_secs(5);
@@ -87,12 +90,14 @@ const PURGE_LIMIT: Duration = Duration::from_mins(10);
 /// The purge interval is time on the wall clock, not the monotonic one, which stops while the
 /// Mac sleeps: a laptop asleep every night would otherwise purge every few days.
 const PURGE_CHECK_INTERVAL: Duration = Duration::from_hours(1);
-/// The helper log moves to `mc-capture.log.1` at a start once it is this big.
-const SIDECAR_LOG_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
+/// The helper's stderr file moves to `mc-capture-stderr.log.1` at a start once it is this big.
+const SIDECAR_STDERR_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(windows)]
 const SIDECAR_FILE_NAME: &str = "mc-capture.exe";
 #[cfg(not(windows))]
 const SIDECAR_FILE_NAME: &str = "mc-capture";
+/// Dump requests a helper's run may fall behind by. Problems start a few per call at most.
+const RECORDER_DUMP_BACKLOG: usize = 16;
 /// After a device change ends a backoff early, the wait before the restart: Bluetooth routes
 /// take this long to settle.
 const DEVICE_CHANGE_SETTLE: Duration = Duration::from_millis(1_500);
@@ -300,6 +305,8 @@ pub(crate) struct CallCapture {
     video_states: Mutex<HashMap<PathBuf, VideoState>>,
     /// The last state the helper read for each permission.
     permissions: Mutex<HashMap<PermissionService, PermissionState>>,
+    /// The call whose capture helpers should dump their flight recorders.
+    recorder_dumps: broadcast::Sender<PathBuf>,
 }
 
 impl CallCapture {
@@ -311,7 +318,14 @@ impl CallCapture {
             states: Mutex::new(HashMap::new()),
             video_states: Mutex::new(HashMap::new()),
             permissions: Mutex::new(HashMap::new()),
+            recorder_dumps: broadcast::channel(RECORDER_DUMP_BACKLOG).0,
         }
+    }
+
+    /// Asks each capture helper recording `call_id` to dump its flight recorder into the call's
+    /// debug folder. No helper records it: nothing happens.
+    pub fn request_recorder_dumps(&self, call_id: &Path) {
+        let _no_helper_listens = self.recorder_dumps.send(call_id.to_path_buf());
     }
 
     /// The permissions recording needs that macOS refuses.
@@ -357,6 +371,16 @@ impl CallCapture {
             );
         }
         crate::tray::show_call_status(app);
+    }
+
+    /// The last state the helpers read for each permission.
+    pub fn permission_states(&self) -> Vec<(PermissionService, PermissionState)> {
+        self.permissions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .map(|(service, state)| (*service, *state))
+            .collect()
     }
 
     /// The audio state of each open call that has one.
@@ -513,7 +537,7 @@ pub(crate) fn start(app: &AppHandle) {
     let state = app.state::<AppState>();
     let app_dirs = state.settings.app_dirs();
     let calls_dir = app_dirs.calls_dir();
-    let log_file = app_dirs.log_dir().join(SIDECAR_LOG_FILE_NAME);
+    let helper_logs = HelperLogs::new(app_dirs);
     tauri::async_runtime::spawn(async move {
         let repair_dir = calls_dir.clone();
         if let Err(error) =
@@ -525,9 +549,9 @@ pub(crate) fn start(app: &AppHandle) {
         // Only the Mac records video, a huddle's window or a Meet tab, so only the Mac has any
         // to finalize or purge.
         if cfg!(target_os = "macos") {
-            finalize_pending(&calls_dir, &log_file).await;
+            finalize_pending(&calls_dir, &helper_logs).await;
             // After finalize, so a folder that waited for its `call.mp4` has it by now.
-            purge_media_daily(&calls_dir, &log_file).await;
+            purge_media_daily(&calls_dir, &helper_logs).await;
         }
     });
     let stop_changes = state
@@ -550,7 +574,7 @@ pub(crate) fn start(app: &AppHandle) {
     let supervisor = Supervisor {
         app: app.clone(),
         calls_dir: app_dirs.calls_dir(),
-        log_file: app_dirs.log_dir().join(SIDECAR_LOG_FILE_NAME),
+        helper_logs: HelperLogs::new(app_dirs),
         open_calls: Vec::new(),
         recorded_calls: Vec::new(),
         active: None,
@@ -618,14 +642,14 @@ fn repair_call_folders(calls_dir: &Path) {
 /// Writes `call.mp4` for each call folder that lacks a current one, one helper run per folder,
 /// so a folder that hangs or fails holds up none of the others. The helper lists the folders,
 /// so the app links no AVFoundation.
-async fn finalize_pending(calls_dir: &Path, log_file: &Path) {
+async fn finalize_pending(calls_dir: &Path, helper_logs: &HelperLogs) {
     let listing = run_helper(
         &[
             "pending-finalize".as_ref(),
             "--calls-dir".as_ref(),
             calls_dir.as_os_str(),
         ],
-        log_file,
+        helper_logs,
         PENDING_LIST_LIMIT,
     )
     .await;
@@ -641,14 +665,14 @@ async fn finalize_pending(calls_dir: &Path, log_file: &Path) {
         }
     };
     for folder in pending.folders {
-        finalize_call(folder, log_file.to_owned()).await;
+        finalize_call(folder, helper_logs.clone()).await;
     }
 }
 
 /// Runs the purge now, then whenever a day has passed on the wall clock. Never returns.
-async fn purge_media_daily(calls_dir: &Path, log_file: &Path) {
+async fn purge_media_daily(calls_dir: &Path, helper_logs: &HelperLogs) {
     loop {
-        purge_media(calls_dir, log_file).await;
+        purge_media(calls_dir, helper_logs).await;
         let last_run = SystemTime::now();
         loop {
             tokio::time::sleep(PURGE_CHECK_INTERVAL).await;
@@ -665,14 +689,14 @@ async fn purge_media_daily(calls_dir: &Path, log_file: &Path) {
 
 /// Deletes the video of calls past the retention through the helper's `purge-media`. The helper
 /// logs each deletion in the helper log; the app logs the totals.
-async fn purge_media(calls_dir: &Path, log_file: &Path) {
+async fn purge_media(calls_dir: &Path, helper_logs: &HelperLogs) {
     let run = run_helper(
         &[
             "purge-media".as_ref(),
             "--calls-dir".as_ref(),
             calls_dir.as_os_str(),
         ],
-        log_file,
+        helper_logs,
         PURGE_LIMIT,
     )
     .await;
@@ -700,9 +724,9 @@ async fn purge_media(calls_dir: &Path, log_file: &Path) {
 
 /// Writes one call folder's `call.mp4` through the helper's `finalize`. A folder some capture
 /// process still records in gets one more try once that process has had time to close.
-async fn finalize_call(folder: PathBuf, log_file: PathBuf) {
+async fn finalize_call(folder: PathBuf, helper_logs: HelperLogs) {
     for is_retry in [false, true] {
-        let outcome = finalize_once(&folder, &log_file).await;
+        let outcome = finalize_once(&folder, &helper_logs).await;
         if !matches!(outcome, Some(FinalizeOutcome::Recording)) || is_retry {
             return;
         }
@@ -710,10 +734,10 @@ async fn finalize_call(folder: PathBuf, log_file: PathBuf) {
     }
 }
 
-async fn finalize_once(folder: &Path, log_file: &Path) -> Option<FinalizeOutcome> {
+async fn finalize_once(folder: &Path, helper_logs: &HelperLogs) -> Option<FinalizeOutcome> {
     let run = run_helper(
         &["finalize".as_ref(), "--folder".as_ref(), folder.as_os_str()],
-        log_file,
+        helper_logs,
         FINALIZE_LIMIT,
     )
     .await;
@@ -774,17 +798,13 @@ async fn finalize_once(folder: &Path, log_file: &Path) -> Option<FinalizeOutcome
 /// Its stdout, or why there is none.
 async fn run_helper(
     args: &[&std::ffi::OsStr],
-    log_file: &Path,
+    helper_logs: &HelperLogs,
     limit: Duration,
 ) -> Result<String, String> {
     let helper = sidecar_path()?;
-    rotate_log_if_full(log_file);
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_file)
-        .map_err(|error| format!("could not open {}: {error}", log_file.display()))?;
+    let log = helper_logs.open_stderr()?;
     let child = Command::new(&helper)
+        .args(helper_logs.arguments())
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -819,6 +839,8 @@ struct ActiveRecording {
     audio_phase: watch::Receiver<AudioPhase>,
     /// New window hints for the video process. `None` while no video process runs.
     window_hints: Option<mpsc::UnboundedSender<WindowHint>>,
+    /// The call's metric rows, until the recording ends.
+    _metrics: crate::call_metrics::OpenCallMetrics,
 }
 
 /// Where the call's audio process stands. The video process follows it across a sleep.
@@ -835,6 +857,15 @@ struct AudioPhase {
     awake_since: jiff::Timestamp,
 }
 
+/// What the app asks of a running helper outside its recording.
+enum HelperRequest {
+    /// Dump the flight recorder, when the helper records `call_id`.
+    RecorderDump {
+        call_id: PathBuf,
+    },
+    DebugMode(DebugMode),
+}
+
 /// What one process of a recording shares with the other.
 #[derive(Default)]
 struct ProcessLinks {
@@ -844,6 +875,10 @@ struct ProcessLinks {
     audio_phase_in: Option<watch::Receiver<AudioPhase>>,
     /// The video process takes each window hint the huddle watcher sends.
     window_hints: Option<mpsc::UnboundedReceiver<WindowHint>>,
+    /// Calls whose helpers should dump their flight recorders. `spawn_process` subscribes.
+    recorder_dumps: Option<broadcast::Receiver<PathBuf>>,
+    /// The app's debug mode, which the process follows. `spawn_process` subscribes.
+    debug_mode: Option<watch::Receiver<DebugMode>>,
 }
 
 impl ProcessLinks {
@@ -887,6 +922,54 @@ impl ProcessLinks {
         std::future::pending().await
     }
 
+    /// The next call whose helpers should dump their recorders. Never ends once the sender is
+    /// gone.
+    async fn next_recorder_dump(requests: &mut Option<broadcast::Receiver<PathBuf>>) -> PathBuf {
+        if let Some(receiver) = requests {
+            loop {
+                match receiver.recv().await {
+                    Ok(call_id) => return call_id,
+                    // A missed request is a missed dump, not a reason to stop listening.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            *requests = None;
+        }
+        std::future::pending().await
+    }
+
+    /// The next debug mode change. Never ends once the sender is gone.
+    async fn next_debug_mode(modes: &mut Option<watch::Receiver<DebugMode>>) -> DebugMode {
+        if let Some(receiver) = modes {
+            if receiver.changed().await.is_ok() {
+                return *receiver.borrow_and_update();
+            }
+            *modes = None;
+        }
+        std::future::pending().await
+    }
+
+    /// The debug mode now, marked seen, for a process that just started.
+    fn debug_mode(&mut self) -> DebugMode {
+        self.debug_mode
+            .as_mut()
+            .map_or(DebugMode::Off, |modes| *modes.borrow_and_update())
+    }
+
+    /// The next request the app has for the helper itself, beside its recording.
+    async fn next_helper_request(
+        recorder_dumps: &mut Option<broadcast::Receiver<PathBuf>>,
+        debug_mode: &mut Option<watch::Receiver<DebugMode>>,
+    ) -> HelperRequest {
+        tokio::select! {
+            call_id = Self::next_recorder_dump(recorder_dumps) => {
+                HelperRequest::RecorderDump { call_id }
+            }
+            mode = Self::next_debug_mode(debug_mode) => HelperRequest::DebugMode(mode),
+        }
+    }
+
     /// The latest hint that came while no process ran.
     fn latest_hint(&mut self) -> Option<WindowHint> {
         let receiver = self.window_hints.as_mut()?;
@@ -901,7 +984,7 @@ impl ProcessLinks {
 struct Supervisor {
     app: AppHandle,
     calls_dir: PathBuf,
-    log_file: PathBuf,
+    helper_logs: HelperLogs,
     /// Open calls, oldest first.
     open_calls: Vec<Call>,
     active: Option<ActiveRecording>,
@@ -988,10 +1071,18 @@ impl Supervisor {
             audio_phase_out: None,
             audio_phase_in: Some(active.audio_phase.clone()),
             window_hints: Some(hint_receiver),
+            recorder_dumps: None,
+            debug_mode: None,
         };
         active.window_hints = Some(hints);
-        let process =
-            spawn_process::<VideoProcess>(&self.app, &self.log_file, call, &folder, segment, links);
+        let process = spawn_process::<VideoProcess>(
+            &self.app,
+            &self.helper_logs,
+            call,
+            &folder,
+            segment,
+            links,
+        );
         if let Some(active) = self.active.as_mut() {
             active.processes.push(process);
         }
@@ -1030,7 +1121,7 @@ impl Supervisor {
             // Its processes have stopped, so their segments are closed. Its own task, because a
             // long call takes minutes to write and the next call must not wait for it.
             let folder = self.calls_dir.join(call_folder_name(call_id));
-            tauri::async_runtime::spawn(finalize_call(folder, self.log_file.clone()));
+            tauri::async_runtime::spawn(finalize_call(folder, self.helper_logs.clone()));
         }
     }
 
@@ -1100,6 +1191,7 @@ impl Supervisor {
                 .cloned()
         {
             let folder = self.calls_dir.join(call_folder_name(&call.id));
+            let metrics = crate::call_metrics::open_call(&self.app, &call.id);
             let segment = next_call_segment(&folder).unwrap_or_else(|reason| {
                 // The process's own check of the folder fails too, and restarts it.
                 tracing::error!(exception.message = reason, "could not read the call folder");
@@ -1117,7 +1209,7 @@ impl Supervisor {
             };
             let mut processes = vec![spawn_process::<AudioProcess>(
                 &self.app,
-                &self.log_file,
+                &self.helper_logs,
                 &call,
                 &folder,
                 segment,
@@ -1147,10 +1239,12 @@ impl Supervisor {
                     audio_phase_out: None,
                     audio_phase_in: Some(audio_phase.clone()),
                     window_hints: Some(hint_receiver),
+                    recorder_dumps: None,
+                    debug_mode: None,
                 };
                 processes.push(spawn_process::<VideoProcess>(
                     &self.app,
-                    &self.log_file,
+                    &self.helper_logs,
                     &call,
                     &folder,
                     segment,
@@ -1166,6 +1260,7 @@ impl Supervisor {
                 processes,
                 audio_phase,
                 window_hints,
+                _metrics: metrics,
             });
         }
         let active_id = self.active.as_ref().map(|active| active.call_id.clone());
@@ -1180,18 +1275,25 @@ impl Supervisor {
 
 fn spawn_process<P: CaptureProcess>(
     app: &AppHandle,
-    log_file: &Path,
+    helper_logs: &HelperLogs,
     call: &Call,
     folder: &Path,
     segment: u32,
-    links: ProcessLinks,
+    mut links: ProcessLinks,
 ) -> RunningProcess {
+    links.recorder_dumps = Some(
+        app.state::<AppState>()
+            .call_capture
+            .recorder_dumps
+            .subscribe(),
+    );
+    links.debug_mode = Some(app.state::<AppState>().debug_mode.subscribe());
     let (stop, stop_receiver) = oneshot::channel();
     let recording = Recording::<P> {
         app: app.clone(),
         call: call.clone(),
         folder: folder.to_path_buf(),
-        log_file: log_file.to_path_buf(),
+        helper_logs: helper_logs.clone(),
         segment,
         backoff: RestartBackoff::default(),
         last_respawn_at: None,
@@ -1294,6 +1396,11 @@ trait CaptureProcess: Send + 'static {
     fn stop_command() -> Self::Command;
     /// The command that hands a running process a new window, for a process that records one.
     fn window_command(hint: WindowHint) -> Option<Self::Command>;
+    /// The command that makes the process dump its flight recorder into `path`, for a process
+    /// that has one.
+    fn recorder_dump_command(path: PathBuf) -> Option<Self::Command>;
+    /// The command that sets the process's debug mode, for a process that follows it.
+    fn debug_command(mode: DebugMode) -> Option<Self::Command>;
     /// The lowest segment number the process may start in the folder.
     fn next_free_segment(folder: &Path) -> Result<u32, String>;
     /// The files whose growth shows the process still writes `segment`.
@@ -1344,6 +1451,16 @@ impl CaptureProcess for AudioProcess {
         None
     }
 
+    fn recorder_dump_command(path: PathBuf) -> Option<AudioCommand> {
+        Some(AudioCommand::DumpRecorder { path })
+    }
+
+    fn debug_command(mode: DebugMode) -> Option<AudioCommand> {
+        Some(AudioCommand::SetDebug {
+            until: mode.enabled_until(),
+        })
+    }
+
     fn next_free_segment(folder: &Path) -> Result<u32, String> {
         stem_writer::next_segment_number(folder)
             .map_err(|error| format!("could not read the call folder: {error}"))
@@ -1358,6 +1475,7 @@ impl CaptureProcess for AudioProcess {
 
     fn read_report(app: &AppHandle, call_id: &Path, report: &AudioReport) -> ReportSign {
         log_audio_report(call_id, report);
+        crate::call_metrics::take_audio_report(app, call_id, report);
         let capture = &app.state::<AppState>().call_capture;
         match report {
             AudioReport::Recording { segment, .. } => ReportSign::Recording { segment: *segment },
@@ -1365,6 +1483,7 @@ impl CaptureProcess for AudioProcess {
                 segment,
                 mic,
                 remote,
+                ..
             } => ReportSign::Progress {
                 segment: *segment,
                 counter_total: [mic, remote]
@@ -1511,6 +1630,16 @@ impl CaptureProcess for VideoProcess {
         Some(VideoCommand::Window { window_hint: hint })
     }
 
+    // The video helper has no dump command yet; its own log file still holds its INFO lines.
+    // The video protocol has no debug command yet.
+    fn debug_command(_mode: DebugMode) -> Option<VideoCommand> {
+        None
+    }
+
+    fn recorder_dump_command(_path: PathBuf) -> Option<VideoCommand> {
+        None
+    }
+
     fn next_free_segment(folder: &Path) -> Result<u32, String> {
         video_capture::next_segment_number(folder)
             .map_err(|error| format!("could not read the call folder's video: {error}"))
@@ -1526,6 +1655,7 @@ impl CaptureProcess for VideoProcess {
 
     fn read_report(app: &AppHandle, call_id: &Path, report: &VideoReport) -> ReportSign {
         log_video_report(call_id, report);
+        crate::call_metrics::take_video_report(call_id, report);
         match report {
             VideoReport::Recording { segment, .. } => ReportSign::Recording { segment: *segment },
             VideoReport::Heartbeat {
@@ -1688,6 +1818,7 @@ fn log_audio_report(call_id: &Path, report: &AudioReport) {
             device,
             rate_hz,
             first_host_time_ns,
+            mic_route,
         } => tracing::info!(
             call.id = call_id,
             segment.number = segment,
@@ -1695,6 +1826,7 @@ fn log_audio_report(call_id: &Path, report: &AudioReport) {
             audio.device = device,
             audio.rate_hz = rate_hz,
             audio.first_host_time_ns = first_host_time_ns,
+            mic.reason = mic_route.as_ref().map(|route| route.reason.as_str()),
             "audio stream recording"
         ),
         AudioReport::Gap {
@@ -1739,6 +1871,7 @@ fn log_audio_report(call_id: &Path, report: &AudioReport) {
             new_device,
             rate_hz,
             cause,
+            mic_route,
         } => tracing::info!(
             call.id = call_id,
             segment.number = segment,
@@ -1747,6 +1880,7 @@ fn log_audio_report(call_id: &Path, report: &AudioReport) {
             audio.device = new_device,
             audio.rate_hz = rate_hz,
             audio.change_cause = %cause,
+            mic.reason = mic_route.as_ref().map(|route| route.reason.as_str()),
             "audio device changed"
         ),
         AudioReport::MicUnavailable {
@@ -1781,7 +1915,7 @@ struct Recording<P: CaptureProcess> {
     app: AppHandle,
     call: Call,
     folder: PathBuf,
-    log_file: PathBuf,
+    helper_logs: HelperLogs,
     /// The segment the next start uses, or the last one started or rotated to.
     segment: u32,
     backoff: RestartBackoff,
@@ -1852,6 +1986,11 @@ impl<P: CaptureProcess> Recording<P> {
                     is_device_open_failed,
                 } => (reason, is_device_open_failed),
             };
+            crate::call_debug::dump_recorder_in_background(
+                &self.app,
+                self.call.id.clone(),
+                telemetry::DumpReason::HelperFailed,
+            );
             let restart = self
                 .backoff
                 .note_failure(Instant::now(), is_device_open_failed);
@@ -1886,7 +2025,8 @@ impl<P: CaptureProcess> Recording<P> {
             let is_device_watched =
                 cfg!(target_os = "macos") && is_device_open_failed && restart.is_failing;
             let device_changed = async {
-                if is_device_watched && await_device_change(restart.delay).await {
+                if is_device_watched && await_device_change(restart.delay, &self.helper_logs).await
+                {
                     tokio::time::sleep(DEVICE_CHANGE_SETTLE).await;
                 } else {
                     std::future::pending::<()>().await;
@@ -1924,18 +2064,13 @@ impl<P: CaptureProcess> Recording<P> {
             Err(reason) => return failed(reason),
         };
         let pid = child.id().unwrap_or_default();
+        let _tracked = crate::host_metrics::track_helper(pid, P::SUBCOMMAND);
         let mut reports = BufReader::new(stdout).lines();
         let mut check = tokio::time::interval(LIVENESS_CHECK_INTERVAL);
         check.tick().await;
         let mut stop_deadline: Option<tokio::time::Instant> = None;
         loop {
-            // A future that never ends until a stop sets the deadline.
-            let stop_limit = async {
-                match stop_deadline {
-                    Some(deadline) => tokio::time::sleep_until(deadline).await,
-                    None => std::future::pending().await,
-                }
-            };
+            let stop_limit = until_stop_deadline(stop_deadline);
             tokio::select! {
                 line = reports.next_line() => match line {
                     Ok(Some(line)) => {
@@ -1946,22 +2081,14 @@ impl<P: CaptureProcess> Recording<P> {
                         }
                     }
                     Ok(None) => {
-                        let Some(deadline) = stop_deadline else {
-                            let status = child.wait().await;
-                            log_exit(pid, status.as_ref());
-                            return ProcessEnd::Failed {
-                                reason: exit_reason(status.as_ref()),
-                                is_device_open_failed: run.is_device_open_failed,
-                            };
-                        };
-                        Self::wait_stopped(
+                        return Self::end_at_stdout_close(
                             self.segment,
                             &mut child,
-                            deadline,
-                            run.has_closed_segment,
+                            pid,
+                            stop_deadline,
+                            &run,
                         )
                         .await;
-                        return ProcessEnd::Stopped;
                     }
                     Err(error) => {
                         kill(&mut child).await;
@@ -1997,6 +2124,14 @@ impl<P: CaptureProcess> Recording<P> {
                     {
                         return end;
                     }
+                }
+                request = ProcessLinks::next_helper_request(
+                    &mut links.recorder_dumps,
+                    &mut links.debug_mode,
+                ),
+                    if stop_deadline.is_none() =>
+                {
+                    self.forward_helper_request(request, &mut run).await;
                 }
                 () = stop_limit => {
                     tracing::warn!(
@@ -2039,7 +2174,7 @@ impl<P: CaptureProcess> Recording<P> {
             phase.is_asleep = false;
             phase.awake_since = started_at;
         });
-        let run = ProcessRun {
+        let mut run = ProcessRun {
             stdin: Some(stdin),
             liveness: Liveness::new(segment),
             open_segment: (!is_sleeping).then_some(segment),
@@ -2054,7 +2189,31 @@ impl<P: CaptureProcess> Recording<P> {
             seen_sleep_count: audio_phase.map_or(0, |phase| phase.sleep_count),
             has_refusal: false,
         };
+        // Right after `start`, so the segment's DEBUG lines reach the file in debug mode.
+        let debug_mode = links.debug_mode();
+        self.forward_debug_mode(debug_mode, &mut run).await;
         Ok((child, stdout, run))
+    }
+
+    /// How the run ends once the process closed its stdout: a stop when the supervisor asked for
+    /// one, else a failure with its exit status.
+    async fn end_at_stdout_close(
+        segment: u32,
+        child: &mut Child,
+        pid: u32,
+        stop_deadline: Option<tokio::time::Instant>,
+        run: &ProcessRun,
+    ) -> ProcessEnd {
+        let Some(deadline) = stop_deadline else {
+            let status = child.wait().await;
+            log_exit(pid, status.as_ref());
+            return ProcessEnd::Failed {
+                reason: exit_reason(status.as_ref()),
+                is_device_open_failed: run.is_device_open_failed,
+            };
+        };
+        Self::wait_stopped(segment, child, deadline, run.has_closed_segment).await;
+        ProcessEnd::Stopped
     }
 
     /// Waits for a stopped process that closed its stdout to exit. One that never exits is
@@ -2124,13 +2283,9 @@ impl<P: CaptureProcess> Recording<P> {
     // app, and Core Audio then delivered zeros with no error.
     fn spawn_sidecar(&self) -> Result<Child, String> {
         let helper = sidecar_path()?;
-        rotate_log_if_full(&self.log_file);
-        let log = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.log_file)
-            .map_err(|error| format!("could not open {}: {error}", self.log_file.display()))?;
+        let log = self.helper_logs.open_stderr()?;
         Command::new(&helper)
+            .args(self.helper_logs.arguments())
             .arg(P::SUBCOMMAND)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2351,6 +2506,53 @@ impl<P: CaptureProcess> Recording<P> {
         Ok(RunNext::Continue)
     }
 
+    /// Sends the process its recorder dump command. A failed send is only logged: the next read
+    /// of its stdout finds out whether it is gone.
+    async fn forward_recorder_dump(&mut self, run: &mut ProcessRun) {
+        let path = self
+            .app
+            .state::<AppState>()
+            .call_debug
+            .helper_recorder_path(&self.call.id, P::SUBCOMMAND);
+        let (Some(stdin), Some(command)) = (run.stdin.as_mut(), P::recorder_dump_command(path))
+        else {
+            return;
+        };
+        match send_command(stdin, run.next_command_seq, &command).await {
+            Ok(()) => run.next_command_seq += 1,
+            Err(error) => tracing::warn!(
+                call.id = %self.call.id.display(),
+                exception.message = %error,
+                "could not ask the capture process to dump its recorder"
+            ),
+        }
+    }
+
+    async fn forward_helper_request(&mut self, request: HelperRequest, run: &mut ProcessRun) {
+        match request {
+            HelperRequest::RecorderDump { call_id } => {
+                if call_id == self.call.id {
+                    self.forward_recorder_dump(run).await;
+                }
+            }
+            HelperRequest::DebugMode(mode) => self.forward_debug_mode(mode, run).await,
+        }
+    }
+
+    async fn forward_debug_mode(&mut self, mode: DebugMode, run: &mut ProcessRun) {
+        let (Some(stdin), Some(command)) = (run.stdin.as_mut(), P::debug_command(mode)) else {
+            return;
+        };
+        match send_command(stdin, run.next_command_seq, &command).await {
+            Ok(()) => run.next_command_seq += 1,
+            Err(error) => tracing::warn!(
+                call.id = %self.call.id.display(),
+                exception.message = %error,
+                "could not send the debug mode to the capture process"
+            ),
+        }
+    }
+
     /// How a followed event ends the process, if it does: a respawn, or a failure to write to it.
     async fn end_after(
         segment: u32,
@@ -2502,21 +2704,54 @@ impl Liveness {
     }
 }
 
-/// Moves a full helper log to `<name>.1`, replacing the one before.
-fn rotate_log_if_full(log_file: &Path) {
-    let is_full =
-        std::fs::metadata(log_file).is_ok_and(|metadata| metadata.len() >= SIDECAR_LOG_LIMIT_BYTES);
-    if !is_full {
-        return;
+/// Where a helper writes: its log folder and debug folder, passed as arguments, and the file its
+/// stderr goes to.
+#[derive(Debug, Clone)]
+struct HelperLogs {
+    log_dir: PathBuf,
+    debug_dir: PathBuf,
+    stderr_file: PathBuf,
+}
+
+impl HelperLogs {
+    fn new(app_dirs: &pipeline::settings::AppDirs) -> Self {
+        Self {
+            log_dir: app_dirs.log_dir(),
+            debug_dir: app_dirs.call_debug_dir(),
+            stderr_file: app_dirs.log_dir().join(SIDECAR_STDERR_FILE_NAME),
+        }
     }
-    let mut older = log_file.as_os_str().to_owned();
-    older.push(".1");
-    if let Err(error) = std::fs::rename(log_file, &older) {
-        tracing::warn!(
-            file.path = %log_file.display(),
-            exception.message = %error,
-            "could not rotate the helper log"
-        );
+
+    /// The arguments before the subcommand.
+    fn arguments(&self) -> [&std::ffi::OsStr; 4] {
+        [
+            "--log-dir".as_ref(),
+            self.log_dir.as_os_str(),
+            "--debug-dir".as_ref(),
+            self.debug_dir.as_os_str(),
+        ]
+    }
+
+    /// The stderr file for one more helper, moved to `<name>.1` first once it is full.
+    fn open_stderr(&self) -> Result<std::fs::File, String> {
+        let is_full = std::fs::metadata(&self.stderr_file)
+            .is_ok_and(|metadata| metadata.len() >= SIDECAR_STDERR_LIMIT_BYTES);
+        if is_full {
+            let mut older = self.stderr_file.as_os_str().to_owned();
+            older.push(".1");
+            if let Err(error) = std::fs::rename(&self.stderr_file, &older) {
+                tracing::warn!(
+                    file.path = %self.stderr_file.display(),
+                    exception.message = %error,
+                    "could not rotate the helper's stderr file"
+                );
+            }
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.stderr_file)
+            .map_err(|error| format!("could not open {}: {error}", self.stderr_file.display()))
     }
 }
 
@@ -2542,7 +2777,7 @@ fn sidecar_path() -> Result<PathBuf, String> {
 /// Waits up to `limit` for the default devices or the device list to change, through the
 /// helper's `await-device-change`, so the app links no Core Audio. False when the time ran
 /// out or the helper could not watch.
-async fn await_device_change(limit: Duration) -> bool {
+async fn await_device_change(limit: Duration, helper_logs: &HelperLogs) -> bool {
     #[derive(serde::Deserialize)]
     struct AwaitedChange {
         changed: bool,
@@ -2557,12 +2792,23 @@ async fn await_device_change(limit: Duration) -> bool {
             return false;
         }
     };
+    let log = match helper_logs.open_stderr() {
+        Ok(log) => log,
+        Err(reason) => {
+            tracing::warn!(
+                exception.message = reason,
+                "could not watch for device changes"
+            );
+            return false;
+        }
+    };
     let output = Command::new(&helper)
+        .args(helper_logs.arguments())
         .arg("await-device-change")
         .arg("--seconds")
         .arg(limit.as_secs().to_string())
         .stdin(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(log))
         .kill_on_drop(true)
         .output()
         .await;
@@ -2621,5 +2867,13 @@ fn exit_reason(status: Result<&ExitStatus, &std::io::Error>) -> String {
     match status {
         Ok(status) => format!("exited with {status}"),
         Err(error) => format!("exited; its status could not be read: {error}"),
+    }
+}
+
+/// Ends at the stop deadline. Without one, it never ends: no stop was asked for.
+async fn until_stop_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }

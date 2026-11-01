@@ -76,6 +76,22 @@ button reads on (`aria-pressed` true), still with no box. A second press stops t
 and the button reads off about 30 s later. Meet also opens its own negotiated `captions_v2`
 (id 125) at call start.
 
+## Telemetry counts
+
+The page hook counts each caption channel apart, by the channel object, and reports it under
+its label, id and serial. The serial counts the hook's tracked channels from 1, since a rejoin in
+the same tab can bring a channel with an old one's label and id. A frame counts as `raw` when it
+arrives. Its outcome follows from the decoder: `parsed` when it held an utterance, `control` for
+a `captions_v2` wrapper with no utterance or a legacy frame with field `2`, and `rejected` for
+any other failure. A text frame and a frame the decoder throws on also count as `rejected`. An
+ack counts when the hook sends it, one per `captions_v2` utterance, on its own channels only. A
+channel has no id until its transport is up, and no frame comes before that, so the hook reports
+a channel from its first id on.
+
+`RTCPeerConnection.close()` sets each of its channels' `readyState` to `closed` and fires no
+`close` event on them. The hook reads `readyState` at each post, so such a channel still gets its
+final counts and a `closed` event.
+
 ## Not used
 
 - `media-session` caption language config (T:9697-9727). We never change the caption language.

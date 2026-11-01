@@ -1055,9 +1055,16 @@ async fn watch_calls(app: AppHandle) {
 }
 
 fn report_problem_start(app: &AppHandle, start: &ProblemStart) {
+    let state = app.state::<AppState>();
+    // Every platform: the recorders hold what the call's own log does not.
+    crate::call_debug::dump_recorder_in_background(
+        app,
+        start.call_id.clone(),
+        telemetry::DumpReason::CallProblem,
+    );
+    state.call_capture.request_recorder_dumps(&start.call_id);
     match start.platform {
         CallPlatform::Meet => {
-            let state = app.state::<AppState>();
             if start.is_first {
                 state.call_debug.write_lead_up(&start.call_id);
             }
