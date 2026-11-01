@@ -1,8 +1,8 @@
 //! mc-meet's telemetry: once a second in a Meet call, caption channel counters and lifecycle and
 //! press events; in debug mode, also the raw caption frames. The app builds the counters' metric
 //! row from typed fields, so no page text can reach a point key. Rows go to the call's
-//! `metrics.jsonl`, events to the app log as `tracing` events with target `mc_meet`, and frames
-//! to the call's `frames.jsonl` under a size cap. None of it is queued, acked or replayed.
+//! `metrics.jsonl`, events to the app log as `tracing` events with target `mc_meet` and to the
+//! call's `events.jsonl`, and frames to the call's `frames.jsonl` under a size cap. None of it is queued, acked or replayed.
 
 use std::collections::HashSet;
 use std::fs::OpenOptions;
@@ -16,12 +16,14 @@ use serde_json::Value;
 use tauri::{AppHandle, Manager as _};
 
 use telemetry::metrics::RowPoints;
+use telemetry::trace::TraceId;
 
 use crate::AppState;
-use crate::call_debug::FrameChannel;
+use crate::call_debug::{CallDebug, FrameChannel};
 use crate::call_metrics;
 
 const SCHEMA: u32 = 2;
+const MC_MEET_SERVICE: &str = "mc-meet";
 const FRAMES_FILE: &str = "frames.jsonl";
 // Raw frames hold call speech and arrive every second in debug mode; a long call must not fill
 // the disk.
@@ -305,8 +307,9 @@ pub(crate) fn take(app: &AppHandle, frame: &[u8]) {
                     &[(at, channel_points(&channels))],
                 );
             }
+            let call_debug = &app.state::<AppState>().call_debug;
             for event in events {
-                log_event(&call_id, &session_id, event);
+                log_event(call_debug, &call_id, &session_id, event);
             }
         }
         TelemetryMessage::TelemetryFrames { session_id, frames } => {
@@ -401,7 +404,7 @@ fn call_folder(app: &AppHandle, session_id: &str) -> Option<(PathBuf, PathBuf)> 
     Some((call_id, folder))
 }
 
-fn log_event(call_id: &Path, session_id: &str, event: Value) {
+fn log_event(call_debug: &CallDebug, call_id: &Path, session_id: &str, event: Value) {
     let event: MeetEvent = match serde_json::from_value(event) {
         Ok(event) => event,
         Err(error) => {
@@ -431,6 +434,29 @@ fn log_event(call_id: &Path, session_id: &str, event: Value) {
             mc.meet.dropped_attribute_count = dropped_count,
         },
         "{name}"
+    );
+    // The same fields as the log line, so a bundle holding both keeps one of them.
+    let call_id_text = call_id.display().to_string();
+    call_debug.record_meet_event(
+        call_id,
+        &serde_json::json!({
+            "record": "log",
+            "timestamp": event.at,
+            "severity_text": "INFO",
+            "severity_number": 9,
+            "body": name,
+            "service.name": MC_MEET_SERVICE,
+            "scope": "mc_meet",
+            "trace_id": TraceId::for_call(&call_id_text).to_string(),
+            "attributes": {
+                "call.id": call_id_text,
+                "browser_call.session_id": session_id,
+                "event.name": name,
+                "mc.meet.at": event.at,
+                "mc.meet.attributes": attributes.to_string(),
+                "mc.meet.dropped_attribute_count": dropped_count,
+            },
+        }),
     );
 }
 

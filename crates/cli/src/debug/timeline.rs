@@ -14,6 +14,10 @@ const SELF_SPEAKING: &str = "mc.meet.self_speaking";
 const LEVEL_RMS: &str = "mc.audio.level.rms";
 const CAPTION_FRAMES: &str = "mc.captions.frames";
 const CAPTION_ACKS: &str = "mc.captions.acks";
+/// The per-minute view counts a channel's acks next to its frame kinds.
+const ACKS_KIND: &str = "acks";
+/// The order the per-minute view prints a channel's counts in.
+const COUNT_KINDS: [&str; 5] = ["raw", "parsed", "control", "rejected", ACKS_KIND];
 const CAPTION_PRESS: &str = "mc.caption.press";
 const CALL_PROBLEM: &str = "call.problem";
 /// A minute with more of the user's speech than this and no parsed caption frame is flagged.
@@ -190,19 +194,18 @@ struct Minute {
     speech_ms: Option<f64>,
     mic_levels: Vec<f64>,
     remote_levels: Vec<f64>,
-    /// New caption frames by channel label and frame kind.
-    frames: BTreeMap<(String, String), f64>,
-    acks: Option<f64>,
+    /// New caption frames and acks per channel, keyed by channel name and then by frame kind
+    /// or `acks`.
+    channels: BTreeMap<String, BTreeMap<String, f64>>,
     presses: u32,
     problems: Vec<String>,
 }
 
 impl Minute {
     fn parsed_frames(&self) -> f64 {
-        self.frames
-            .iter()
-            .filter(|((_, kind), _)| kind == "parsed")
-            .map(|(_, count)| count)
+        self.channels
+            .values()
+            .filter_map(|counts| counts.get("parsed"))
             .sum()
     }
 }
@@ -263,17 +266,14 @@ pub(crate) fn print_by_minute(
         );
         let _infallible = write!(
             row,
-            "  speech {}  mic {}  remote {} dBFS  frames {}  acks {}  presses {}  problems {}",
+            "  speech {}  mic {}  remote {} dBFS  captions {}  presses {}  problems {}",
             minute.speech_ms.map_or_else(
                 || "-".to_owned(),
                 |speech_ms| format!("{:.0} s", speech_ms / 1000.0)
             ),
             mean_text(&minute.mic_levels),
             mean_text(&minute.remote_levels),
-            frames_text(&minute.frames),
-            minute
-                .acks
-                .map_or_else(|| "-".to_owned(), |acks| format!("{acks:.0}")),
+            channels_text(&minute.channels),
             minute.presses,
             if minute.problems.is_empty() {
                 "-".to_owned()
@@ -318,16 +318,24 @@ fn add_metric_row(
             },
             CAPTION_FRAMES => {
                 let added = counters.added_since_last(point, line);
-                let channel = point
-                    .attribute("mc.caption.channel.label")
-                    .unwrap_or_else(|| "?".to_owned());
                 let kind = point
                     .attribute("mc.caption.frame.kind")
                     .unwrap_or_else(|| "?".to_owned());
-                *minute.frames.entry((channel, kind)).or_default() += added;
+                *minute
+                    .channels
+                    .entry(channel_name(point))
+                    .or_default()
+                    .entry(kind)
+                    .or_default() += added;
             }
             CAPTION_ACKS => {
-                *minute.acks.get_or_insert(0.0) += counters.added_since_last(point, line);
+                let added = counters.added_since_last(point, line);
+                *minute
+                    .channels
+                    .entry(channel_name(point))
+                    .or_default()
+                    .entry(ACKS_KIND.to_owned())
+                    .or_default() += added;
             }
             _ => {}
         }
@@ -392,20 +400,49 @@ fn mean_text(levels: &[f64]) -> String {
     format!("{:.1}", 10.0 * mean_power.log10())
 }
 
-fn frames_text(frames: &BTreeMap<(String, String), f64>) -> String {
-    if frames.is_empty() {
-        return "-".to_owned();
+/// A caption channel as the per-minute view names it: whose it is, its label and its id, such
+/// as `own captions_v2#6` or `meet captions_v2#125`. mc-meet's channels and Meet's own carry
+/// the same labels, so the label alone mixes them.
+fn channel_name(point: &MetricPoint) -> String {
+    let owner = match point.attributes.get("mc.caption.channel.is_own") {
+        Some(Value::Bool(true)) => "own",
+        Some(Value::Bool(false)) => "meet",
+        _ => "?",
+    };
+    let label = point
+        .attribute("mc.caption.channel.label")
+        .unwrap_or_else(|| "?".to_owned());
+    let id = point
+        .attribute("mc.caption.channel.id")
+        .unwrap_or_else(|| "?".to_owned());
+    format!("{owner} {label}#{id}")
+}
+
+/// Each channel that counted anything in the minute, with its counts in a fixed order. A
+/// channel with no new frame and no ack is left out.
+fn channels_text(channels: &BTreeMap<String, BTreeMap<String, f64>>) -> String {
+    let shown = channels
+        .iter()
+        .filter(|(_, counts)| counts.values().any(|count| *count > 0.0))
+        .map(|(channel, counts)| {
+            let ordered = COUNT_KINDS
+                .iter()
+                .map(|kind| (*kind, counts.get(*kind).copied().unwrap_or_default()));
+            let others = counts
+                .iter()
+                .filter(|(kind, _)| !COUNT_KINDS.contains(&kind.as_str()))
+                .map(|(kind, count)| (kind.as_str(), *count));
+            let counts_text = ordered
+                .chain(others)
+                .map(|(kind, count)| format!("{kind} {count:.0}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("{channel}: {counts_text}")
+        })
+        .collect::<Vec<_>>();
+    if shown.is_empty() {
+        "-".to_owned()
+    } else {
+        shown.join("; ")
     }
-    let mut by_channel: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for ((channel, kind), count) in frames {
-        by_channel
-            .entry(channel)
-            .or_default()
-            .push(format!("{kind} {count:.0}"));
-    }
-    by_channel
-        .into_iter()
-        .map(|(channel, kinds)| format!("{channel} {}", kinds.join(" ")))
-        .collect::<Vec<_>>()
-        .join("; ")
 }

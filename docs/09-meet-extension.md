@@ -420,7 +420,8 @@ in `mc.meet.dropped_attribute_count`.
   attribute or role to read, only generated class names and an animation.
 - The app writes the row to the call's `debug/<call>/metrics.jsonl` with `service.name`
   `mc-meet` and the call's `trace_id`. It logs each event at INFO with target `mc_meet`,
-  `event.name`, `mc.meet.at` and the attributes as JSON in `mc.meet.attributes`.
+  `event.name`, `mc.meet.at` and the attributes as JSON in `mc.meet.attributes`. It also
+  appends each event to the call's `debug/<call>/events.jsonl` with the same fields.
 - Debug mode: the app sends `debug_mode` with its end time. The worker stores it in
   `chrome.storage.session` as `debugModeUntil`, removes the key when `until` is null or the
   native port closes, and tells each tab. Until then, the page hook also copies every caption
@@ -439,6 +440,7 @@ folders after 14 days.
 | --- | --- |
 | `frames.jsonl` | The first 20 `frame_failed` messages of the call, one per line, bytes included. In debug mode also every caption frame, as `raw_frame` lines, up to 50 MB. |
 | `metrics.jsonl` | mc-meet's metric rows, one per second. See "Telemetry". |
+| `events.jsonl` | mc-meet's events as `mc-meet` log lines, stamped with mc-meet's time. See "Telemetry". |
 | `lead-up.jsonl` | The last 2 minutes of mc-meet events before the call's first problem, written once. Kept in memory until then. |
 | `page-snapshots.jsonl` | Up to 5 page snapshots per call, one per problem. |
 

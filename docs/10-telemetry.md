@@ -43,8 +43,9 @@ app sends the helper's raw stderr, such as a runtime crash message, to `mc-captu
 mc-meet sends a `telemetry` message once a second while its tab is in a call. It carries each
 caption channel's counts as typed fields. The app builds a metric row from them and writes it into
 the call's `metrics.jsonl` with `service.name` `mc-meet`. It logs the message's events in the app
-log with target `mc_meet`. The [Meet extension design](09-meet-extension.md#telemetry)
-lists the rows and events.
+log with target `mc_meet`, and writes them to the call's `events.jsonl` as `mc-meet` log lines
+stamped with mc-meet's time. A debug folder alone then shows the presses and channel changes.
+The [Meet extension design](09-meet-extension.md#telemetry) lists the rows and events.
 
 ## The `telemetry` crate
 
@@ -341,12 +342,13 @@ key order: a process encodes each event once for its log file and its recorder. 
 five on stderr with the file and line, then prints how many it skipped. Reports saved before
 this format still read: their `tracing` lines become log lines and the call log's events become
 `mc-meet` lines. App log lines with scope `mc_meet` are mc-meet's events, so they count as
-service `mc-meet`.
+service `mc-meet`. An mc-meet event in both the app log and `events.jsonl` is kept once: the two
+lines match on session, mc-meet's time, name and attributes.
 
 | Command | Prints |
 |---|---|
 | `mc debug timeline <bundle>` | One row per line in IST: time, service, severity, then the body, a metric summary or the environment |
-| `mc debug timeline <bundle> --by-minute` | One row per minute: speech seconds from `mc.meet.self_speaking`, mean mic and remote dBFS over power, new caption frames per channel and kind, acks, caption presses, problems. Flags a minute with over 20 s of speech and no parsed frame |
+| `mc debug timeline <bundle> --by-minute` | One row per minute: speech seconds from `mc.meet.self_speaking`, mean mic and remote dBFS over power, new caption frames by kind and acks per caption channel, caption presses, problems. A channel is named by owner, label and id, such as `own captions_v2#6` or `meet captions_v2#125`, and is left out of a minute it counted nothing in. Flags a minute with over 20 s of speech and no parsed frame |
 | `mc debug timeline <bundle> --service <name>` | Only that service's lines, such as `app`, `mc-capture` or `mc-meet` |
 | `mc debug export-otlp <bundle> --out <file>` | OTLP/JSON for a Collector's `otlpjsonfile` receiver |
 

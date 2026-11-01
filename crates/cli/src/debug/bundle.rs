@@ -297,7 +297,13 @@ impl Reader {
                 Some(_) if !self.seen.insert(canonical_text(&fields)) => Ok(Parsed::Repeat),
                 Some(record) => record_kind(record)
                     .and_then(|kind| self.record_line(kind, fields))
-                    .map(|line| Parsed::Line(Box::new(line))),
+                    .map(|line| {
+                        if self.is_repeated_meet_event(&line) {
+                            Parsed::Repeat
+                        } else {
+                            Parsed::Line(Box::new(line))
+                        }
+                    }),
                 None => self.earlier_line(&file_name, fields),
             };
             match parsed {
@@ -314,6 +320,33 @@ impl Reader {
             }
         }
         Ok(())
+    }
+
+    /// Whether another file already held this mc-meet event. The app writes each event to its
+    /// log and to the call's `events.jsonl`; the two lines differ in time and process fields.
+    fn is_repeated_meet_event(&mut self, line: &BundleLine) -> bool {
+        let Entry::Log(log) = &line.entry else {
+            return false;
+        };
+        if line.service != MC_MEET_SERVICE {
+            return false;
+        }
+        let Some(sent_at) = log.attributes.get("mc.meet.at").and_then(Value::as_str) else {
+            return false;
+        };
+        let field = |key: &str| {
+            log.attributes
+                .get(key)
+                .map(Value::to_string)
+                .unwrap_or_default()
+        };
+        let key = format!(
+            "mc-meet event|{sent_at}|{}|{}|{}",
+            field("browser_call.session_id"),
+            log.body,
+            field("mc.meet.attributes"),
+        );
+        !self.seen.insert(key)
     }
 
     fn record_line(
