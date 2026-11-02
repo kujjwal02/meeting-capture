@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 pub mod finalize;
+pub mod report_lines;
 
 pub use sources::Platform;
 pub use stem_timing::{

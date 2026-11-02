@@ -1,7 +1,7 @@
 //! Runs the Slack huddle watcher, feeds what it reports to the call status board, and turns
 //! each finished huddle log into a meeting.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -60,6 +60,8 @@ pub(crate) fn start(app: &AppHandle, pipeline: &Arc<Pipeline>) {
         app: app.clone(),
         pipeline: Arc::clone(pipeline),
         notified: BTreeSet::new(),
+        logged_health: HashMap::new(),
+        logged_permission_missing: None,
     };
     if let Err(error) =
         huddle_captions::spawn(paths, settings, move |notice| reporter.report(notice))
@@ -73,6 +75,10 @@ struct Reporter {
     pipeline: Arc<Pipeline>,
     /// One notification per huddle and state, even when the state flips back and forth.
     notified: BTreeSet<(PathBuf, HuddleHealth)>,
+    /// The `huddle.health` each huddle last logged, so the line goes out on a change only.
+    logged_health: HashMap<PathBuf, HuddleHealth>,
+    /// The `huddle.permission` last logged.
+    logged_permission_missing: Option<bool>,
 }
 
 /// The hint video records the huddle window by. `None` while the watcher has not seen huddle
@@ -96,6 +102,7 @@ impl Reporter {
         match notice {
             Notice::PermissionMissing => {
                 self.calls().status().set_huddle_permission_missing(true);
+                self.log_permission_missing(true);
                 crate::tray::refresh(&self.app);
                 notify(
                     &self.app,
@@ -105,6 +112,7 @@ impl Reporter {
             }
             Notice::PermissionGranted => {
                 self.calls().status().set_huddle_permission_missing(false);
+                self.log_permission_missing(false);
                 crate::tray::refresh(&self.app);
             }
             Notice::HuddleStarted {
@@ -148,6 +156,7 @@ impl Reporter {
                     Observation::HuddleHealth(state),
                     Moment::now(),
                 );
+                self.log_health(&log_path, state);
                 crate::tray::refresh(&self.app);
                 // Captions off and an unreadable window stop the recording, so the status board
                 // announces them with the other "Not recording" notices.
@@ -167,6 +176,7 @@ impl Reporter {
                 self.calls().end(&log_path, CallEndReason::WindowClosed);
                 crate::tray::refresh(&self.app);
                 self.notified.retain(|(path, _)| *path != log_path);
+                self.logged_health.remove(&log_path);
                 let (app, pipeline) = (self.app.clone(), Arc::clone(&self.pipeline));
                 tauri::async_runtime::spawn_blocking(move || {
                     record_and_run(&app, &pipeline, &log_path);
@@ -176,8 +186,45 @@ impl Reporter {
         }
     }
 
+    fn log_health(&mut self, log_path: &Path, health: HuddleHealth) {
+        if self.logged_health.get(log_path) == Some(&health) {
+            return;
+        }
+        self.logged_health.insert(log_path.to_path_buf(), health);
+        tracing::info!(
+            event.name = "huddle.health",
+            call.id = %log_path.display(),
+            mc.huddle.health = health_code(health),
+            "huddle health changed"
+        );
+    }
+
+    fn log_permission_missing(&mut self, is_missing: bool) {
+        if self.logged_permission_missing == Some(is_missing) {
+            return;
+        }
+        self.logged_permission_missing = Some(is_missing);
+        tracing::info!(
+            event.name = "huddle.permission",
+            mc.huddle.is_permission_missing = is_missing,
+            "huddle permission changed"
+        );
+    }
+
     fn calls(&self) -> &crate::calls::Calls {
         &self.app.state::<AppState>().inner().calls
+    }
+}
+
+/// The `mc.huddle.health` code. Log codes are snake case; `HuddleHealth::as_str` is the
+/// kebab-case form the note's front matter uses.
+fn health_code(health: HuddleHealth) -> &'static str {
+    match health {
+        HuddleHealth::Healthy => "healthy",
+        HuddleHealth::Untested => "untested",
+        HuddleHealth::Degraded => "degraded",
+        HuddleHealth::CaptionsOff => "captions_off",
+        HuddleHealth::Broken => "broken",
     }
 }
 

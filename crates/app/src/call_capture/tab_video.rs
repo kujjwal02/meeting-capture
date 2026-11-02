@@ -316,6 +316,11 @@ impl TabVideoTask {
                 }
                 if !self.is_recorded {
                     self.is_recorded = true;
+                    tracing::info!(
+                        event.name = "call.tab_video_recorded",
+                        call.id = %self.call_id.display(),
+                        "tab video recorded its first fragment"
+                    );
                     self.state().calls.status().observe(
                         &self.call_id,
                         Observation::TabVideoRecorded,

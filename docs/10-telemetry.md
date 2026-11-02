@@ -127,6 +127,43 @@ with `call.id` outside any span gets the call's trace id and no span id.
 Span ids are W3C 8-byte ids, unique per process and seeded from the instance id. `tracing`
 reuses its own span ids, so they are not used.
 
+## Event lines
+
+A line a call detector reads carries an `event.name`. The names live in `telemetry::events`.
+A call site spells the literal, because a `tracing` macro needs one. Code that reads lines uses
+the constants. Values are closed codes, never free text.
+
+| `event.name` | Fields | Logged |
+|---|---|---|
+| `call.started`, `call.resumed`, `call.ended` | `call.id`, `call.platform`, `call.title` | When a call opens, reopens or ends |
+| `call.recording_stopped`, `call.recording_resumed` | `call.id` | When the user stops or resumes recording a call |
+| `call.captions` | `call.id`, `call.platform`, `call.caption_count`, `mc.caption.last_at`, `mc.caption.is_backlog` | At a board tick, when the call's caption count rose since its last `call.captions` line |
+| `meet.health` | `call.id`, `mc.meet.captions` (`on`, `off`, `unavailable`), `mc.meet.caption_source` (`channel`, `dom`, `none`), `mc.meet.is_caption_frames_failing` | When a Meet health report differs from the call's last one |
+| `meet.port_held` | `call.id`, `mc.meet.is_port_held` | When an mc-meet port starts or stops holding the call |
+| `meet.pages_away` | `call.id`, `mc.meet.is_pages_away` | When every Meet tab of the call goes away, or one comes back |
+| `extension.connection` | `browser.extension.is_connected` | When the first mc-meet port connects or the last one closes |
+| `huddle.health` | `call.id`, `mc.huddle.health` (`healthy`, `untested`, `degraded`, `captions_off`, `broken`) | When the huddle watcher's health for the call changes |
+| `huddle.permission` | `mc.huddle.is_permission_missing` | When the Accessibility permission for huddles goes missing or comes back |
+| `call.tab_video_recorded` | `call.id` | When the call's Meet tab video writes its first fragment |
+| `host.suspended` | `mc.host.suspended_ms` | When the wall clock moved over 5 s more than the monotonic clock between two board ticks |
+| `capture.audio.*` | The report's fields, with `audio.stream` where a stem applies | For each audio helper report: `recording`, `gap`, `rotated`, `segment_closed`, `device_changed`, `mic_unavailable`, `permission`, `sleep`, `wake`, `error` |
+| `capture.video.*` | The report's fields | For each video helper report: `recording`, `gap`, `window_changed`, `permission`, `segment_closed`, `error` |
+| `capture.process_failed` | `call.id`, `mc.capture.helper` (`audio`, `video`), `error.type`, `exception.message`, the restart fields | When a capture helper exits, hangs or does not start |
+
+The on-change lines are INFO. Each keeps its last value per call. A line with no call keeps one
+last value for the app. `capture_protocol::report_lines` turns a helper report into its line, so
+every process that reads reports logs them the same way. Helper heartbeats stay DEBUG with no
+`event.name`: detectors read the level rows instead.
+
+The board logs `call.captions` at most once per 5 s per call. It logs one at once when the call
+waited for its first caption or had a problem. `call.caption_count` counts distinct Meet caption
+lines, or the lines a huddle log holds. `mc.caption.last_at` is when the latest caption reached
+the app. A reopened log's earlier captions log one line with `mc.caption.is_backlog` true and no
+`mc.caption.last_at`.
+
+`extension.connection` and `host.suspended` belong to no call. A call's report keeps them when
+they fall in the call's time span.
+
 ## Flight recorder
 
 Each process keeps its last 10 minutes or 8 MB of lines in memory, whichever is less. It holds
@@ -347,7 +384,7 @@ and pass every file through the same redaction.
 | File in the bundle | Call | Meeting | Last 30 min |
 |---|---|---|---|
 | `call-status.json` | The call on the status board, and the files cut at the size cap | The `meeting.id`, its `mc.input.revision`, the window's start and end, and the files cut at the size cap | The window's start and end, and the files cut at the size cap |
-| `app-log.jsonl` | App lines with the call's id, trace id or session ids | App lines with the meeting's `meeting.id` or in the trace of one of its runs, from 1 minute before the job store took it to now | |
+| `app-log.jsonl` | App lines with the call's id, trace id or session ids, and the `extension.connection` and `host.suspended` lines in the call's time span | App lines with the meeting's `meeting.id` or in the trace of one of its runs, from 1 minute before the job store took it to now | |
 | `<service>-log.jsonl` | `mc-capture` lines of the call's trace or `call.id` in the call's time span, 1 minute wider on each side, with the untraced lines of those helpers | `mc` lines picked like the app lines | Every service's lines in the window |
 | The call log | Whole | | |
 | `audio.json`, `video.json`, `finalize.json` | From the call folder, when present | | |

@@ -13,6 +13,7 @@ serde_json.workspace = true
 sources.workspace = true
 stem-timing.workspace = true
 stem-writer.workspace = true
+tracing.workspace = true
 video-capture.workspace = true
 
 [lints]
