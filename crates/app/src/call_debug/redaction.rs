@@ -197,6 +197,7 @@ const WORKSPACE_CRATES: &[&str] = &[
     "call_folder",
     "capture",
     "capture_protocol",
+    "detectors",
     "huddle_captions",
     "jobs",
     "mc",

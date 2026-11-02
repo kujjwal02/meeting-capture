@@ -106,6 +106,7 @@ pub const PERMISSION_SERVICE: &str = "permission.service";
 pub const PERMISSION_STATE: &str = "permission.state";
 pub const ERROR_TYPE: &str = "error.type";
 pub const CAPTURE_HELPER: &str = "mc.capture.helper";
+pub const CAPTURE_IS_FAILING: &str = "capture.is_failing";
 pub const PROBLEM_LAYER: &str = "mc.problem.layer";
 pub const PROBLEM_DETECTOR: &str = "mc.problem.detector";
 pub const PROBLEM_EVIDENCE: &str = "mc.problem.evidence";
