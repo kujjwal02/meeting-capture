@@ -124,41 +124,51 @@ flowchart LR
 ### Call status
 
 The app tracks each open Meet call and huddle in one status board
-(`crates/app/src/call_status.rs`), and ticks it once a second.
+(`crates/app/src/call_status.rs`), and ticks it once a second. The rules that judge a call live
+in the `detectors` crate and read the app's own event lines and call metric rows.
+[Telemetry](10-telemetry.md) has the detectors, the problems and their layers.
 
 - States: waiting (no caption since the call opened or resumed), recording, problem with a
   reason, stopped by the user, and ended with a caption count and length. A stopped call has no
-  problem until the user resumes it. Each call keeps its start time, caption
-  count, last caption time and its last 3 problems. A Meet call the app reopens after a restart
-  counts the caption lines its log already holds.
-- Reasons: captions off, Meet captions unavailable (Google), caption frames fail to decode, no
-  caption for 2 minutes while captions are on, no caption for 2 minutes with the caption state
-  unknown (a huddle with no health verdict yet), mc-meet disconnected, the Meet tab closed or
-  reloaded, Slack huddle captions unreadable. A Meet call checks the reasons after 20 s without a
-  caption, except a disconnect, which counts at once. Captions off counts until mc-meet reports
-  its caption channels as the source: mc-meet hides Meet's captions only after a caption arrived
-  on them, and they keep streaming.
-- The tray icon is a grey dot when idle, red while recording and amber at a problem or a missing
-  huddle permission. Audio that records turns an idle dot red. Audio that keeps failing, a call
-  recording without the user's mic, or a refused microphone or system audio permission, turns
-  it amber. So does a huddle's video that keeps failing or has no Screen Recording grant.
+  problem until the user resumes it. Each call keeps its start time, caption count, last caption
+  time and its problem history. A Meet call the app reopens after a restart counts the caption
+  lines its log already holds.
+- Caption reasons: captions off, Meet captions unavailable (Google), caption frames fail to
+  decode, no caption for 2 minutes while captions are on, no caption for 2 minutes with the
+  caption state unknown (a huddle with no health verdict yet), mc-meet disconnected, the Meet tab
+  closed or reloaded, Slack huddle captions unreadable. A Meet call checks the reasons after 20 s
+  without a caption, except a disconnect, which counts at once. Captions off counts until mc-meet
+  reports its caption channels as the source: mc-meet hides Meet's captions only after a caption
+  arrived on them, and they keep streaming.
+- Capture problems sit beside the caption state: a lost or silent mic, lost or silent call
+  sound, a refused permission, a helper that is down, audio that did not restart after sleep,
+  and a lost window video. Sleep itself is no problem.
+- The tray icon is a grey dot when idle, red while recording and amber at a caption or capture
+  problem or a missing huddle permission. Audio that records turns an idle dot red. A refused
+  microphone, system audio or Screen Recording permission, or a failed Meet tab video, turns it
+  amber.
 - On macOS only, each open call has an audio row, and a huddle that records video has a video
-  row. Each open call has "Stop recording this call". A stopped call shows "Resume recording"
-  instead. The tooltip and the menu hold one status line per call, with times in the settings
-  time zone. "Recent calls" lists the last 5 calls that ended in this run. The menu is rebuilt
-  only when a call opens or ends; the status tick changes the text of its call lines in place,
-  so an open menu stays open. On Windows the tooltip is cut to 127 UTF-16 units.
-- Notifications: "Recording" once per call at its first caption. "Not recording" after a problem
-  lasts 30 s, once per reason in one outage. "Recording again" at the first caption after it,
-  which ends the outage, so a later outage is announced again. "No transcript captured" when a
-  call ends with no caption. A Meet tab that closed or reloaded gets no "Not recording", since
+  row. Each capture problem adds a row under its call, such as "Audio problem: your mic is lost,
+  since 10:35 IST". Each open call has "Stop recording this call". A stopped call shows "Resume
+  recording" instead. The tooltip and the menu hold one status line per call, with times in the
+  settings time zone. "Recent calls" lists the last 5 calls that ended in this run. The menu is
+  rebuilt only when a call opens or ends or a capture problem starts or clears; the status tick
+  changes the text of its call lines in place, so an open menu stays open. On Windows the
+  tooltip is cut to 127 UTF-16 units.
+- Notifications: "Recording" once per call at its first caption. "Not recording" after a caption
+  problem lasts 30 s, once per reason in one outage. "Recording again" at the first caption after
+  it, which ends the outage, so a later outage is announced again. "No transcript captured" when
+  a call ends with no caption. A Meet tab that closed or reloaded gets no "Not recording", since
   mc-meet ends the call in 5 minutes unless the tab comes back. "mc-meet disconnected" gets one
-  only while another mc-meet port is connected: with none, the browser quit.
+  only while another mc-meet port is connected: with none, the browser quit. "Audio problem" or
+  "Video problem" after a capture problem lasts 30 s, and "Audio back" or "Video back" when it
+  clears.
 - mc-meet gets the status of its calls as `call_status` messages and shows it on its toolbar
-  icon. At a Meet call's first problem the app writes the lead-up and asks for a page snapshot.
-  [mc-meet](09-meet-extension.md) has the debug material and the debug report.
-- At every call problem start, Meet or huddle, the app and the audio helper dump their flight
-  recorders into the call's debug folder. [Telemetry](10-telemetry.md) has the triggers.
+  icon. At a Meet call's first caption problem the app writes the lead-up and asks for a page
+  snapshot. [mc-meet](09-meet-extension.md) has the debug material and the debug report.
+- At every problem start, caption or capture, Meet or huddle, the app and the capture helpers
+  dump their flight recorders into the call's debug folder. One detector dumps at most once a
+  minute per call. [Telemetry](10-telemetry.md) has the triggers.
 
 ### Audio and video (phases 2, 3, 3b, 3c, 5)
 

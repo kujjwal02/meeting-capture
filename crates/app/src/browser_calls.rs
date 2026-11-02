@@ -30,13 +30,13 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tracing::Instrument as _;
 
 pub(crate) use self::call_book::InvalidSessionId;
-use self::call_book::{CallBook, EventError, Logged, Now, OpenedCall, check_session_id};
+use self::call_book::{
+    CallBook, EventError, Logged, MeetFact, MeetHealth, Now, OpenedCall, check_session_id,
+};
 use self::log_folder::LogFolder;
 use crate::AppState;
 use crate::call_debug::{FailedFrame, FrameChannel};
-use crate::call_status::{
-    BoardView, CallBoard, CallState, MeetCaptions, Moment, Observation, ProblemReason, clock,
-};
+use crate::call_status::{BoardView, CallBoard, CallState, Moment, Observation, Problem, clock};
 use crate::calls::{CallEndReason, CallPlatform};
 use crate::finished_logs::{self, LogSource};
 
@@ -85,16 +85,9 @@ struct MeetChangeLines {
 
 #[derive(Default)]
 struct LoggedMeetCall {
-    health: Option<LoggedMeetHealth>,
+    health: Option<MeetHealth>,
     is_port_held: Option<bool>,
     is_pages_away: Option<bool>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct LoggedMeetHealth {
-    captions: MeetCaptions,
-    source: HealthSource,
-    is_caption_frames_failing: bool,
 }
 
 impl MeetChangeLines {
@@ -138,27 +131,8 @@ impl MeetChangeLines {
         );
     }
 
-    /// Logs `meet.health` when the observation is a changed health report.
-    fn log_health(&mut self, call_id: &Path, observation: &Observation) {
-        let health = match observation {
-            Observation::MeetHealth {
-                source,
-                captions,
-                is_caption_frames_failing,
-            } => LoggedMeetHealth {
-                captions: *captions,
-                source: *source,
-                is_caption_frames_failing: *is_caption_frames_failing,
-            },
-            Observation::MeetCaption { .. }
-            | Observation::MeetPortHeld(_)
-            | Observation::MeetPagesAway(_)
-            | Observation::MeetLoggedCaptions(_)
-            | Observation::HuddleCaptionLines(_)
-            | Observation::HuddleHealth(_)
-            | Observation::RecordingStopped(_)
-            | Observation::TabVideoRecorded => return,
-        };
+    /// Logs `meet.health` when the report differs from the call's last one.
+    fn log_health(&mut self, call_id: &Path, health: MeetHealth) {
         let call = self.calls.entry(call_id.to_path_buf()).or_default();
         if call.health == Some(health) {
             return;
@@ -486,11 +460,12 @@ impl BrowserCalls {
 
     /// Logs the on-change lines one Meet event of the call brings: a port holds the call, and
     /// the event's health report.
-    fn log_meet_event(&self, call_id: &Path, observation: Option<&Observation>) {
+    fn log_meet_event(&self, call_id: &Path, fact: Option<&MeetFact>) {
         let mut change_lines = self.lock_change_lines();
         change_lines.log_port_held(call_id, true);
-        if let Some(observation) = observation {
-            change_lines.log_health(call_id, observation);
+        match fact {
+            Some(MeetFact::Health(health)) => change_lines.log_health(call_id, *health),
+            Some(MeetFact::Caption { .. }) | None => {}
         }
     }
 
@@ -759,7 +734,8 @@ struct MeetCallStatus {
     session_ids: Vec<String>,
     title: Option<String>,
     state: StatusWord,
-    reason: Option<ProblemReason>,
+    /// The problem's code, such as `captions_off`.
+    reason: Option<&'static str>,
     reason_text: Option<&'static str>,
     started_at: Timestamp,
     started_at_label: String,
@@ -794,7 +770,7 @@ enum CaptionSourceWord {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct ProblemStatus {
-    reason: ProblemReason,
+    reason: &'static str,
     reason_text: &'static str,
     at: Timestamp,
     at_label: String,
@@ -821,8 +797,8 @@ impl MeetCallStatus {
             session_ids,
             title: call.title.clone(),
             state,
-            reason,
-            reason_text: reason.map(ProblemReason::describe),
+            reason: reason.map(Problem::code),
+            reason_text: reason.map(Problem::describe),
             started_at: call.started_at,
             started_at_label: clock(call.started_at, time_zone),
             recording_since_label: call.recording_since.map(|at| clock(at, time_zone)),
@@ -833,8 +809,8 @@ impl MeetCallStatus {
                 .problems
                 .iter()
                 .map(|problem| ProblemStatus {
-                    reason: problem.reason,
-                    reason_text: problem.reason.describe(),
+                    reason: problem.problem.code(),
+                    reason_text: problem.problem.describe(),
                     at: problem.at,
                     at_label: clock(problem.at, time_zone),
                 })
@@ -985,10 +961,6 @@ impl Port {
             (book.close_port(self.id), book.is_extension_connected())
         };
         let state = self.app.state::<AppState>();
-        state
-            .calls
-            .status()
-            .set_extension_connected(is_extension_connected);
         let mut change_lines = self.calls().lock_change_lines();
         change_lines.log_extension_connected(is_extension_connected);
         for call_id in &unheld {
@@ -996,10 +968,6 @@ impl Port {
         }
         drop(change_lines);
         for call_id in &unheld {
-            state
-                .calls
-                .status()
-                .observe(call_id, Observation::MeetPortHeld(false), Moment::now());
             state
                 .call_debug
                 .remember(call_id, serde_json::json!({ "type": "port_closed" }));
@@ -1139,11 +1107,6 @@ impl Port {
             self.calls()
                 .lock()
                 .greet(self.id, protocol, worker_sessions);
-        let board = self.app.state::<AppState>().inner().calls.status();
-        board.set_extension_connected(true);
-        for call_id in &held_calls {
-            board.observe(call_id, Observation::MeetPortHeld(true), Moment::now());
-        }
         let mut change_lines = self.calls().lock_change_lines();
         change_lines.log_extension_connected(true);
         for call_id in &held_calls {
@@ -1166,13 +1129,6 @@ impl Port {
             .calls()
             .lock()
             .note_away_sessions(self.id, session_ids.into_iter().collect::<HashSet<_>>());
-        let (board, now) = (
-            self.app.state::<AppState>().inner().calls.status(),
-            Moment::now(),
-        );
-        for (call_id, is_away) in &calls {
-            board.observe(call_id, Observation::MeetPagesAway(*is_away), now);
-        }
         let mut change_lines = self.calls().lock_change_lines();
         for (call_id, is_away) in &calls {
             change_lines.log_pages_away(call_id, *is_away);
@@ -1327,28 +1283,28 @@ impl Port {
         let board = state.calls.status();
         match &logged {
             Ok(
-                Logged::Appended {
-                    log_path,
-                    observation,
-                }
+                Logged::Appended { log_path, fact }
                 | Logged::Opened {
                     opened: OpenedCall { log_path, .. },
-                    observation,
+                    fact,
                 },
             ) => {
-                let now = Moment::now();
-                board.observe(log_path, Observation::MeetPortHeld(true), now);
-                if let Some(observation) = observation {
-                    board.observe(log_path, observation.clone(), now);
+                if let Some(MeetFact::Caption { line_key }) = fact {
+                    board.observe(
+                        log_path,
+                        Observation::MeetCaption {
+                            line_key: line_key.clone(),
+                        },
+                        Moment::now(),
+                    );
                 }
-                self.calls().log_meet_event(log_path, observation.as_ref());
+                self.calls().log_meet_event(log_path, fact.as_ref());
                 state.call_debug.remember(log_path, lead_up_line);
             }
             // Its caption text stays out of the lead-up: the user stopped recording.
             Ok(Logged::Withheld {
                 opened: Some(OpenedCall { log_path, .. }),
             }) => {
-                board.observe(log_path, Observation::MeetPortHeld(true), Moment::now());
                 self.calls().log_meet_event(log_path, None);
             }
             Ok(Logged::Ended { log_path, .. }) => {

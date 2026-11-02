@@ -167,6 +167,9 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let app_dirs = AppDirs::locate()?;
     app_dirs.create()?;
     let file_level = init_logging(&app_dirs)?;
+    // The status board reads its detectors' lines from the log itself.
+    let detector_lines = Arc::new(detectors::LineQueue::new());
+    telemetry::install_line_tap(detector_lines.clone());
     remove_plain_text_logs(&app_dirs);
 
     let settings_store = Arc::new(SettingsStore::new(app_dirs));
@@ -187,7 +190,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         pipeline_error,
         settings: settings_store,
         browser_calls,
-        calls: calls::Calls::new(),
+        calls: calls::Calls::new(detector_lines),
         call_capture: call_capture::CallCapture::new(),
         call_debug,
         debug_mode: debug_mode::AppDebugMode::new(file_level),

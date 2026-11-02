@@ -151,11 +151,7 @@ impl Reporter {
                 state,
                 reason,
             } => {
-                self.calls().status().observe(
-                    &log_path,
-                    Observation::HuddleHealth(state),
-                    Moment::now(),
-                );
+                // The status board reads the health from the `huddle.health` line.
                 self.log_health(&log_path, state);
                 crate::tray::refresh(&self.app);
                 // Captions off and an unreadable window stop the recording, so the status board

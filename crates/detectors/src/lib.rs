@@ -27,7 +27,7 @@ pub use capture::{AudioHelper, Mic, RemoteAudio, Video};
 pub use context::{CallContext, CallFacts, GlobalContext, Platform, SuspendedSpan};
 pub use host::{
     CallNotice, CallSnapshot, CaptionState, Change, Edge, Evidence, Host, HostOutput, Notice,
-    ProblemSpan, TraceKey,
+    OpenProblem, ProblemSpan, TraceKey,
 };
 pub use problem::{Layer, Problem};
 pub use queue::LineQueue;

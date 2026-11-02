@@ -4,7 +4,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use capture_protocol::WindowHint;
 use sources::browser_call::EndReason;
@@ -79,11 +79,12 @@ struct CallTally {
 }
 
 impl Calls {
-    pub fn new() -> Self {
+    /// `detector_lines` is the queue the telemetry tap fills for the status board.
+    pub fn new(detector_lines: Arc<detectors::LineQueue>) -> Self {
         Self {
             tally: Mutex::new(CallTally::default()),
             sender: broadcast::channel(EVENT_BACKLOG).0,
-            status: CallBoard::new(),
+            status: CallBoard::new(detector_lines),
         }
     }
 

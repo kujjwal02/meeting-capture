@@ -441,7 +441,7 @@ folders after 14 days.
 | `frames.jsonl` | The first 20 `frame_failed` messages of the call, one per line, bytes included. In debug mode also every caption frame, as `raw_frame` lines, up to 50 MB. |
 | `metrics.jsonl` | mc-meet's metric rows, one per second. See "Telemetry". |
 | `events.jsonl` | mc-meet's events as `mc-meet` log lines, stamped with mc-meet's time. See "Telemetry". |
-| `lead-up.jsonl` | The last 2 minutes of mc-meet events before the call's first problem, written once. Kept in memory until then. |
+| `lead-up.jsonl` | The last 2 minutes of mc-meet events before the call's first caption problem, written once. Kept in memory until then. |
 | `page-snapshots.jsonl` | Up to 5 page snapshots per call, one per problem. |
 
 A page snapshot holds the captions button state and the last "captions unavailable" text Meet

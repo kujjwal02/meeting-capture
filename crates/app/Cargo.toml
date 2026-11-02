@@ -14,6 +14,7 @@ base64.workspace = true
 browser-shortcut.workspace = true
 call-folder.workspace = true
 capture-protocol.workspace = true
+detectors.workspace = true
 huddle-captions.workspace = true
 jiff.workspace = true
 jobs.workspace = true
