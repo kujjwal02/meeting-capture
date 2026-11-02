@@ -15,6 +15,7 @@ mod calls;
 mod debug_mode;
 mod finished_logs;
 mod host_metrics;
+mod host_power;
 mod huddles;
 mod launch;
 mod media_links;

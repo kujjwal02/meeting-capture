@@ -1,8 +1,9 @@
-//! Host gauges every 10 s: CPU and memory of the app and of each capture helper, and free space
-//! on the data folder's disk. Rows go to the day's metrics file, and into the call's rows while a
+//! Host gauges every 10 s: CPU and memory of the app and of each capture helper, free space on
+//! the data folder's disk, and the machine's power. Rows go to the day's metrics file, and into the call's rows while a
 //! call records. Also writes the environment row at app start.
 //!
-//! `sysinfo` reads the same numbers on Mac and Windows, so neither needs code of its own here.
+//! `sysinfo` reads CPU, memory and disk the same way on Mac and Windows. Power needs OS calls,
+//! which live in `host_power`.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -220,6 +221,7 @@ impl HostProbe {
                 value: bytes_value(disk.available_space()),
             });
         }
+        samples.extend(crate::host_power::power_samples());
         samples
     }
 }

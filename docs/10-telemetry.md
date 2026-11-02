@@ -11,7 +11,7 @@ marked as such below.
 |---|---|---|
 | 1. Core | The `telemetry` crate in every binary, correlation ids, the flight recorder with its triggers, daily log files | Built |
 | 2. Debug mode | A tray toggle that turns every process's log file to DEBUG for 24 h. mc-meet follows over native messaging | Built |
-| 3. Metrics and environment | Gauges every 10 s, or every 1 s in a call: audio levels and routes, caption channel series, video fps, host CPU and memory, pipeline decisions. `env.jsonl` with devices, permissions and versions | Built |
+| 3. Metrics and environment | Gauges every 10 s, or every 1 s in a call: audio levels and routes, caption channel series, video fps, host CPU, memory, disk and power, pipeline decisions. `env.jsonl` with devices, permissions and versions | Built |
 | 4. Report and tools | A report bundle for a call with its job, for a meeting without a call, or for the last 30 minutes. `mc debug timeline` and `mc debug export-otlp` | Built |
 | 5. The 0.8.0 caption bug | One call in debug mode on the caption bug. It checks for missing acks on Meet's channel, captions hidden in `control` frames, and throttling in hidden-box mode | Planned |
 | 6. Detectors | One trait for every invariant over metrics and events. A firing raises a named problem and dumps every recorder. `mc debug replay` runs them over a saved bundle | Planned |
@@ -209,6 +209,10 @@ that closes joins its sampler on a blocking thread, off the async runtime.
 | `process.cpu.utilization` | 1 | `service.name`, and `process.command` for a helper | The app, every 10 s, from a process's second sample on |
 | `process.memory.usage` | By | The same | The app, every 10 s |
 | `system.filesystem.free` | By | None | The app, every 10 s, for the data folder's disk |
+| `mc.host.power.source` | 1 | `mc.host.power.source`: `ac` or `battery` | The app, every 10 s. The value is always 1 |
+| `hw.battery.charge` | 1 | `hw.battery.state`: `charging` or `discharging`, absent on AC with the battery held full | The app, every 10 s, on a machine with an internal battery. 0 to 1 |
+| `mc.host.power.low_power_mode` | 1 | None | The app, every 10 s. 1 when Low Power Mode or Windows battery saver is on |
+| `mc.host.thermal.state` | 1 | None | The app, every 10 s, on a Mac. 0 nominal, 1 fair, 2 serious, 3 critical |
 | `mc.captions.frames` | {frame} | `mc.caption.channel.label`, `mc.caption.channel.id`, `mc.caption.channel.serial`, `mc.caption.channel.is_own`, `mc.caption.frame.kind`: `raw`, `parsed`, `control` or `rejected` | mc-meet, every 1 s |
 | `mc.captions.acks` | {ack} | The channel attributes | mc-meet, every 1 s |
 
@@ -216,6 +220,11 @@ Host gauges go into the day's file and into the call's rows. In a call's rows th
 10th second. Samples sit on a fixed 10 s grid, half an interval after the day's scope opens, so
 each falls mid-row. A process's first sample has no CPU point: sysinfo has no earlier CPU time
 to measure from. A helper that exited leaves the probe at the next sample.
+
+Power metrics use OpenTelemetry's `hw.battery.*` names where they exist and `mc.host.*` names
+otherwise. A Mac reads them from IOKit power sources and `NSProcessInfo`. Windows reads them from
+`GetSystemPowerStatus`. A value the OS does not report leaves its gauge out of the row. A Mac on
+UPS power has no `mc.host.power.source` point.
 
 ### Audio levels
 
@@ -254,7 +263,7 @@ helper's heartbeat comes every 1 s too.
 
 The mic's `reason` is the mic rule's closed `MicPickReason`. The audio helper sends it in
 `recording` and `device_changed`, with the default input and output it read. Fields a probe
-cannot fill are absent. Power, lid, displays and browser versions have no probe yet.
+cannot fill are absent. Lid, displays and browser versions have no probe yet. Power is in the host metrics.
 
 ### Pipeline decisions
 

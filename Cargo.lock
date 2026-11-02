@@ -2862,6 +2862,9 @@ dependencies = [
  "jiff",
  "jobs",
  "native-host",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "objc2-io-kit",
  "pipeline",
  "serde",
  "serde_json",
@@ -2881,6 +2884,7 @@ dependencies = [
  "tokio",
  "tracing",
  "video-capture",
+ "windows",
 ]
 
 [[package]]
