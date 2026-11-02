@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 
 use super::bundle::{Bundle, BundleLine, Entry, LogEntry, MetricPoint, MetricRow};
 
-const SELF_SPEAKING: &str = "mc.meet.self_speaking";
+const SELF_SPEAKING: &str = "mc.audio.self_speaking";
 const LEVEL_RMS: &str = "mc.audio.level.rms";
 const CAPTION_FRAMES: &str = "mc.captions.frames";
 const CAPTION_ACKS: &str = "mc.captions.acks";

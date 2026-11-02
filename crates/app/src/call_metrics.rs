@@ -1,7 +1,8 @@
 //! The metrics and environment rows of the call that records now. Each audio heartbeat brings
 //! one second of stem levels, written as its own row stamped when it arrives. The call's scope
 //! samples the host gauges and video frame counts into `metrics.jsonl` in the call's debug
-//! folder, one row a second. The mic's first stream and each mic change write an `env.jsonl` row
+//! folder, one row a second. Each mic level also says whether the user spoke in its second. The
+//! mic's first stream and each mic change write an `env.jsonl` row
 //! with the route's reason.
 
 use std::path::{Path, PathBuf};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 use capture_protocol::{AudioReport, MicRoute, Stem, StemLevel, VideoReport};
 use jiff::Timestamp;
 use serde_json::Value;
+use stem_writer::SILENCE_DBFS;
 use tauri::{AppHandle, Manager as _};
 use telemetry::env::{AudioDevice, ChosenMic, EnvReason};
 use telemetry::metrics::{Counter, MetricsScope, RowPoints};
@@ -20,6 +22,13 @@ use crate::AppState;
 use crate::host_metrics::{HostGauges, HostSample};
 
 const CALL_INTERVAL_MS: u32 = 1_000;
+/// A mic second this far above the noise floor is the user speaking. On 2026-11-02 a 34-minute
+/// Meet call where the user mostly listened had 95% of its seconds within 6.7 dB of the floor,
+/// while a call where the user talked had half its seconds 19 dB or more above it.
+const SPEAKING_OVER_FLOOR_DB: f64 = 8.0;
+/// How fast the noise floor climbs each second it is not undercut, so it follows a room that got
+/// louder. 3 dB a minute keeps a minute of steady speech from lifting the floor to the voice.
+const FLOOR_RISE_DB_PER_S: f64 = 0.05;
 /// A rows-only scope no row used for this long is closed. mc-meet posts every second while its
 /// call is live, so a gap this long means the call is over.
 const ROWS_ONLY_IDLE: Duration = Duration::from_secs(120);
@@ -39,6 +48,35 @@ struct CallMetrics {
     host: HostGauges,
     /// The mic and route of the last environment row, `None` before the first.
     last_mic: Option<MicEnv>,
+    mic_floor: MicNoiseFloor,
+}
+
+/// The mic stem's background level, tracked as a minimum that rises slowly, to tell the user's
+/// speech from room noise on any mic and in any call app.
+#[derive(Default)]
+struct MicNoiseFloor {
+    /// `None` until the mic's first level that is not digital silence.
+    floor_dbfs: Option<f64>,
+}
+
+impl MicNoiseFloor {
+    /// Takes one second's mic RMS and says whether the user spoke in it.
+    fn is_speaking(&mut self, rms_dbfs: f64) -> bool {
+        // Digital silence is a gap the writer filled, not the room, so it moves no floor.
+        if rms_dbfs <= SILENCE_DBFS {
+            return false;
+        }
+        let floor_dbfs = self.floor_dbfs.map_or(rms_dbfs, |floor_dbfs| {
+            rms_dbfs.min(floor_dbfs + FLOOR_RISE_DB_PER_S)
+        });
+        self.floor_dbfs = Some(floor_dbfs);
+        rms_dbfs > floor_dbfs + SPEAKING_OVER_FLOOR_DB
+    }
+
+    /// Forgets the floor: another mic or segment has a background of its own.
+    fn reset(&mut self) {
+        self.floor_dbfs = None;
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -84,6 +122,7 @@ pub(crate) fn open_call(app: &AppHandle, call_id: &Path) -> OpenCallMetrics {
         video: None,
         host: HostGauges::default(),
         last_mic: None,
+        mic_floor: MicNoiseFloor::default(),
     });
     OpenCallMetrics {
         call_id: call_id.to_path_buf(),
@@ -167,7 +206,7 @@ pub(crate) fn set_host_samples(samples: &[HostSample]) {
 }
 
 /// Takes the levels from a heartbeat, and writes an environment row when the mic starts or
-/// changes.
+/// changes. A new mic stream starts a new noise floor.
 pub(crate) fn take_audio_report(app: &AppHandle, call_id: &Path, report: &AudioReport) {
     let mic_env = match report {
         AudioReport::Heartbeat {
@@ -209,6 +248,9 @@ pub(crate) fn take_audio_report(app: &AppHandle, call_id: &Path, report: &AudioR
         | AudioReport::Error { .. } => None,
     };
     if let Some((device, route)) = mic_env {
+        if let Some(call) = lock().iter_mut().find(|call| call.call_id == call_id) {
+            call.mic_floor.reset();
+        }
         let mic = MicEnv {
             device: device.map(str::to_owned),
             route: route.cloned(),
@@ -217,13 +259,32 @@ pub(crate) fn take_audio_report(app: &AppHandle, call_id: &Path, report: &AudioR
     }
 }
 
-/// One row of the heartbeat's levels, stamped when it arrives. Gauges sampled on the scope's own
-/// grid would drop or double a level whenever a heartbeat lands near a row's edge.
+/// One row of the heartbeat's levels, and whether the user spoke, stamped when it arrives. Gauges
+/// sampled on the scope's own grid would drop or double a level whenever a heartbeat lands near
+/// a row's edge.
 fn write_levels(call_id: &Path, mic: Option<&StemLevel>, remote: Option<&StemLevel>) {
-    let Some(scope) = call_scope(call_id) else {
+    let Some((scope, is_speaking)) =
+        lock()
+            .iter_mut()
+            .find(|call| call.call_id == call_id)
+            .map(|call| {
+                let is_speaking = mic.map(|level| call.mic_floor.is_speaking(level.rms_dbfs));
+                (Arc::clone(&call.scope), is_speaking)
+            })
+    else {
         return;
     };
     let mut points = RowPoints::default();
+    // A 0 or 1 gauge per second: the timeline sums it over the row's interval, with no counter
+    // baseline to carry across rows.
+    if let Some(is_speaking) = is_speaking {
+        points.gauge(
+            "mc.audio.self_speaking",
+            "1",
+            &[],
+            if is_speaking { 1.0 } else { 0.0 },
+        );
+    }
     for (stem, level) in [(Stem::Mic, mic), (Stem::Remote, remote)] {
         let Some(level) = level else {
             continue;
