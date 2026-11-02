@@ -136,6 +136,17 @@ pub(crate) struct ReportRequest {
     pub job: Option<JobRecord>,
 }
 
+/// What a debug report of a meeting without a call covers.
+pub(crate) struct MeetingReportRequest {
+    pub job: JobRecord,
+    /// When the job store took the meeting. No run of it logs earlier.
+    pub created_at: Timestamp,
+    /// Keep caption and chat text. Without it, each text is replaced by its length.
+    pub is_with_text: bool,
+    /// RFC 3339 UTC while debug mode is on.
+    pub debug_mode_until: Option<String>,
+}
+
 /// One meeting's row in the job store, as the report writes it.
 pub(crate) struct JobRecord {
     pub meeting_id: jobs::MeetingId,
@@ -518,7 +529,7 @@ impl CallDebug {
             &window.files_of(helper_logs),
             &folder.join(service_log_file(telemetry::Service::McCapture)),
             window,
-            Some(&call),
+            LineOwner::Call(&call),
         )?;
 
         if let Some(file_name) = request.call_id.file_name() {
@@ -535,17 +546,7 @@ impl CallDebug {
         }
 
         if let Some(job) = &request.job {
-            output.write_json_document(&folder.join(JOB_FILE), job.row.clone())?;
-            let meeting_folder = self
-                .call_folders_dir
-                .join(format!("meeting-{}", job.meeting_id));
-            // A failed run's dump holds every line the recorder kept, other calls' too.
-            let meeting_lines = RecorderLines::of_meeting(job.meeting_id, job.input_revision);
-            output.copy_debug_folder(
-                &meeting_folder,
-                &folder.join(format!("debug-meeting-{}", job.meeting_id)),
-                |line| meeting_lines.holds(line),
-            )?;
+            self.copy_job(&mut output, job, &folder)?;
         }
 
         // Into the call's folder, so the copy below redacts it like every other debug file.
@@ -591,7 +592,7 @@ impl CallDebug {
                 &window.files_of(logs),
                 &folder.join(service_log_file(service)),
                 window,
-                None,
+                LineOwner::Anyone,
             )?;
         }
         for (prefix, file_name) in [
@@ -633,6 +634,91 @@ impl CallDebug {
         output.write_status(&folder, status)?;
         tracing::info!(file.directory = %folder.display(), "saved a debug report of the last 30 min");
         Ok(folder)
+    }
+
+    /// Gathers a meeting's evidence into one new folder and returns the folder: the job row, the
+    /// meeting's debug folder after a new app recorder dump, and the app and `mc` log lines of
+    /// the meeting from its creation to now. It needs no call: for a dropped-in transcript or a
+    /// meeting whose call log is gone.
+    pub(crate) fn save_meeting_report(
+        &self,
+        request: &MeetingReportRequest,
+    ) -> std::io::Result<PathBuf> {
+        let job = &request.job;
+        let saved_at = Timestamp::now();
+        let window = TimeWindow {
+            start: request.created_at - CALL_WINDOW_MARGIN,
+            end: saved_at,
+        };
+        let (folder, mut output) = self.new_report_folder(
+            &format!("meeting-{}", job.meeting_id),
+            saved_at,
+            request.is_with_text,
+        )?;
+
+        // The pipeline runs in the app, and in `mc` when run by hand.
+        let meeting = MeetingMatch::new(job.meeting_id, job.input_revision);
+        for service in [telemetry::Service::App, telemetry::Service::Mc] {
+            let logs = telemetry::daily_log_files(&self.log_dir, service)?;
+            output.copy_process_lines(
+                &window.files_of(logs),
+                &folder.join(service_log_file(service)),
+                window,
+                LineOwner::Meeting(&meeting),
+            )?;
+        }
+
+        // Into the meeting's folder, so the copy below redacts it like every other debug file.
+        let meeting_folder = self.meeting_folder(job.meeting_id);
+        if let Err(error) =
+            telemetry::dump_recorder_into(&meeting_folder, telemetry::DumpReason::DebugReport)
+        {
+            tracing::warn!(
+                meeting.id = job.meeting_id.as_i64(),
+                exception.message = %error,
+                "could not dump the flight recorder"
+            );
+        }
+        self.copy_job(&mut output, job, &folder)?;
+
+        let status = serde_json::json!({
+            "saved_at": saved_at,
+            "is_with_text": request.is_with_text,
+            "app_version": env!("CARGO_PKG_VERSION"),
+            "debug_mode_until": request.debug_mode_until,
+            "meeting.id": job.meeting_id.as_i64(),
+            "mc.input.revision": job.input_revision,
+            "started_at": window.start,
+            "ended_at": window.end,
+        });
+        output.write_status(&folder, status)?;
+        tracing::info!(
+            meeting.id = job.meeting_id.as_i64(),
+            file.directory = %folder.display(),
+            "saved a debug report of a meeting"
+        );
+        Ok(folder)
+    }
+
+    fn meeting_folder(&self, meeting_id: jobs::MeetingId) -> PathBuf {
+        self.call_folders_dir.join(format!("meeting-{meeting_id}"))
+    }
+
+    // Writes `job.json` and copies the meeting's debug folder into `debug-meeting-<id>/`.
+    fn copy_job(
+        &self,
+        output: &mut ReportOutput,
+        job: &JobRecord,
+        folder: &Path,
+    ) -> std::io::Result<()> {
+        output.write_json_document(&folder.join(JOB_FILE), job.row.clone())?;
+        // A failed run's dump holds every line the recorder kept, other calls' too.
+        let meeting_lines = RecorderLines::of_meeting(job.meeting_id, job.input_revision);
+        output.copy_debug_folder(
+            &self.meeting_folder(job.meeting_id),
+            &folder.join(format!("debug-meeting-{}", job.meeting_id)),
+            |line| meeting_lines.holds(line),
+        )
     }
 
     fn new_report_folder(
@@ -696,6 +782,10 @@ pub(crate) fn start(app: &AppHandle) {
 pub(crate) enum ReportError {
     #[error("no call to report on since the app started")]
     NoCall,
+    #[error("the pipeline is not running, so the meeting cannot be read")]
+    NoPipeline,
+    #[error("could not read the meeting: {0}")]
+    JobStore(#[from] jobs::StoreError),
     #[error("could not write the debug report: {0}")]
     Write(#[from] std::io::Error),
     #[error(transparent)]
@@ -754,6 +844,38 @@ pub(crate) fn save_recent_debug_report(
     Ok(folder)
 }
 
+/// Saves a debug report of the meeting `meeting_id`, which has no call to report on, and shows
+/// it in Finder or Explorer.
+pub(crate) fn save_meeting_debug_report(
+    app: &AppHandle,
+    meeting_id: jobs::MeetingId,
+    is_with_text: bool,
+) -> Result<PathBuf, ReportError> {
+    let state = app.state::<AppState>();
+    let pipeline = state.pipeline.as_ref().ok_or(ReportError::NoPipeline)?;
+    let meeting = pipeline.store().get(meeting_id)?;
+    let request = MeetingReportRequest {
+        job: job_record_of(&meeting),
+        created_at: meeting.created_at,
+        is_with_text,
+        debug_mode_until: state.debug_mode.mode().at(Timestamp::now()).enabled_until(),
+    };
+    let folder = state.call_debug.save_meeting_report(&request)?;
+    launch(app, &LaunchTarget::RevealFile(&folder));
+    Ok(folder)
+}
+
+/// Whether the meeting has a call log to report on. A dropped-in transcript never has one, and a
+/// call log can be deleted or set aside after the run.
+pub(crate) fn has_call_log(meeting: &jobs::Meeting) -> bool {
+    match meeting.input_kind {
+        jobs::InputKind::TranscriptonicPayload => false,
+        jobs::InputKind::SlackHuddleLog | jobs::InputKind::BrowserCallLog => {
+            meeting.input_path.is_file()
+        }
+    }
+}
+
 /// How many recent meetings the report searches for the call's: a call ends up among the newest.
 const RECENT_MEETINGS_SEARCHED: u32 = 50;
 
@@ -770,6 +892,10 @@ fn job_record(pipeline: &pipeline::Pipeline, call_id: &Path) -> Option<JobRecord
     let meeting = meetings
         .into_iter()
         .find(|meeting| meeting.input_path == call_id)?;
+    Some(job_record_of(&meeting))
+}
+
+fn job_record_of(meeting: &jobs::Meeting) -> JobRecord {
     let state = meeting.state();
     let failure = match &state {
         jobs::JobState::Failed { cause } => Some(cause.message.clone()),
@@ -794,11 +920,11 @@ fn job_record(pipeline: &pipeline::Pipeline, call_id: &Path) -> Option<JobRecord
         "created_at": meeting.created_at,
         "updated_at": meeting.updated_at,
     });
-    Some(JobRecord {
+    JobRecord {
         meeting_id: meeting.id,
         input_revision: meeting.input_revision,
         row,
-    })
+    }
 }
 
 enum Redaction {
@@ -876,22 +1002,21 @@ impl ReportOutput {
         }
     }
 
-    // Copies a service's log lines in `window`, and the `resource` line of each process that
-    // has one there. With `call`, a process belongs only when it has a line of the call, and
-    // a line of another trace is left out.
+    // Copies a service's log lines in `window` that `owner` keeps, and the `resource` line of
+    // each process that has one of them. With a call, a line of another trace is left out.
     fn copy_process_lines(
         &mut self,
         from: &[PathBuf],
         to: &Path,
         window: TimeWindow,
-        call: Option<&CallMatch>,
+        owner: LineOwner<'_>,
     ) -> std::io::Result<()> {
         let mut processes: HashSet<String> = HashSet::new();
         for_each_line_facts(from, |facts| {
             if let Some(instance_id) = &facts.instance_id
                 && facts.record != Some(LineRecord::Resource)
                 && window.holds(facts.at)
-                && call.is_none_or(|call| call.holds(&facts))
+                && owner.owns(&facts)
             {
                 processes.insert(instance_id.clone());
             }
@@ -905,11 +1030,11 @@ impl ReportOutput {
             if facts.record == Some(LineRecord::Resource) {
                 return is_process_kept;
             }
-            let is_call_line = match call {
-                None => true,
-                Some(call) => call.holds(&facts) || (facts.trace_id.is_none() && is_process_kept),
-            };
-            window.holds(facts.at) && is_call_line
+            let is_owned = owner.owns(&facts)
+                || (owner.takes_untraced_process_lines()
+                    && facts.trace_id.is_none()
+                    && is_process_kept);
+            window.holds(facts.at) && is_owned
         })
     }
 
@@ -1060,6 +1185,8 @@ struct LineFacts {
     instance_id: Option<String>,
     trace_id: Option<String>,
     call_id: Option<String>,
+    /// As text: the pipeline logs it as a number or a string.
+    meeting_id: Option<String>,
 }
 
 /// The `record` kinds the filters tell apart.
@@ -1080,6 +1207,11 @@ impl LineFacts {
             value.and_then(serde_json::Value::as_str).map(str::to_owned)
         };
         let resource = fields.get("resource");
+        let attribute = |name: &str| {
+            fields
+                .get("attributes")
+                .and_then(|attributes| attributes.get(name))
+        };
         Self {
             record: text(fields.get("record")).map(|record| {
                 if record == "resource" {
@@ -1096,11 +1228,15 @@ impl LineFacts {
                 )
             }),
             trace_id: text(fields.get(telemetry::fields::TRACE_ID)),
-            call_id: text(
-                fields
-                    .get("attributes")
-                    .and_then(|attributes| attributes.get(telemetry::fields::CALL_ID)),
-            ),
+            call_id: text(attribute(telemetry::fields::CALL_ID)),
+            meeting_id: attribute(telemetry::fields::MEETING_ID).and_then(|id| match id {
+                serde_json::Value::String(id) => Some(id.clone()),
+                serde_json::Value::Number(id) => Some(id.to_string()),
+                serde_json::Value::Null
+                | serde_json::Value::Bool(_)
+                | serde_json::Value::Array(_)
+                | serde_json::Value::Object(_) => None,
+            }),
         }
     }
 }
@@ -1130,6 +1266,66 @@ impl CallMatch {
     fn holds(&self, facts: &LineFacts) -> bool {
         facts.trace_id.as_deref() == Some(self.trace_id.as_str())
             || facts.call_id.as_deref() == Some(self.call_id.as_str())
+    }
+}
+
+/// A meeting as its lines name it: its `meeting.id`, or the trace of a run on one of its input
+/// revisions so far.
+struct MeetingMatch {
+    meeting_id: String,
+    run_trace_ids: HashSet<String>,
+}
+
+impl MeetingMatch {
+    fn new(meeting_id: jobs::MeetingId, input_revision: i64) -> Self {
+        let meeting_id = meeting_id.to_string();
+        let run_trace_ids = (0..=input_revision)
+            .map(|revision| {
+                telemetry::trace::TraceId::for_pipeline_run(&meeting_id, &revision.to_string())
+                    .to_string()
+            })
+            .collect();
+        Self {
+            meeting_id,
+            run_trace_ids,
+        }
+    }
+
+    fn holds(&self, facts: &LineFacts) -> bool {
+        facts.meeting_id.as_deref() == Some(self.meeting_id.as_str())
+            || facts
+                .trace_id
+                .as_ref()
+                .is_some_and(|trace_id| self.run_trace_ids.contains(trace_id))
+    }
+}
+
+/// Whose lines a service log copy keeps.
+#[derive(Clone, Copy)]
+enum LineOwner<'a> {
+    /// Every line in the window.
+    Anyone,
+    /// The call's lines, and the untraced lines of the processes that have one.
+    Call(&'a CallMatch),
+    /// The meeting's lines only: an app process has many untraced lines of other work.
+    Meeting(&'a MeetingMatch),
+}
+
+impl LineOwner<'_> {
+    fn owns(self, facts: &LineFacts) -> bool {
+        match self {
+            LineOwner::Anyone => true,
+            LineOwner::Call(call) => call.holds(facts),
+            LineOwner::Meeting(meeting) => meeting.holds(facts),
+        }
+    }
+
+    // Whether an unowned line of a process that has an owned line comes along.
+    fn takes_untraced_process_lines(self) -> bool {
+        match self {
+            LineOwner::Anyone | LineOwner::Call(_) => true,
+            LineOwner::Meeting(_) => false,
+        }
     }
 }
 
