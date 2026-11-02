@@ -48,6 +48,7 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use call_folder::FolderLock;
+use call_folder::media::{PURGE_RECORD_FILE_NAME, PURGE_RECORD_SCHEMA_VERSION, PurgeRecord};
 use capture_protocol::finalize::{KeepReason, KeptCall, MediaPurge, PurgedCall};
 use video_capture::{VideoManifest, VideoSegmentState};
 
@@ -56,9 +57,6 @@ use crate::{FinalizeError, LOCK_FILE_NAME, OUTPUT_FILE_NAME, SkipReason};
 
 /// How long a call's video stays after the call ends. Phase 7 moves it to Drive first.
 pub const MEDIA_RETENTION_DAYS: u64 = 90;
-
-/// In each purged call folder.
-pub const PURGE_RECORD_FILE_NAME: &str = "media-purge.json";
 
 /// In each call folder with video: when a purge run first saw it.
 pub const FIRST_SEEN_FILE_NAME: &str = "media-first-seen.json";
@@ -72,18 +70,8 @@ const MAX_CLOCK_STEP: Duration = Duration::from_hours(48);
 /// A purge clock further behind the wall clock than this is logged.
 const CLOCK_LAG_WARNING: Duration = Duration::from_hours(1);
 
-/// Raised when the layout changes in a way an older reader would misread.
-const PURGE_RECORD_SCHEMA_VERSION: u32 = 1;
-
 /// Version 1 stored the last run's wall time alone.
 const PURGE_RUN_SCHEMA_VERSION: u32 = 2;
-
-#[derive(Debug, Serialize, Deserialize)]
-struct PurgeRecord {
-    schema_version: u32,
-    purged_at: Timestamp,
-    call_ended_at: Timestamp,
-}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct FirstSeenRecord {

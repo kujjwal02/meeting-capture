@@ -184,6 +184,31 @@ impl JobStore {
     pub fn run<E: StepError>(
         &self,
         id: MeetingId,
+        steps: impl FnMut(&LeasedRun<'_>) -> Result<(), E>,
+    ) -> Result<RunOutcome, E> {
+        self.run_with(id, StepFailure::Recorded, steps)
+    }
+
+    /// Runs `steps` under the meeting's lease like `JobStore::run`, but a returned error or a
+    /// panic is only returned. For work on a finished meeting, such as a note rewrite, whose
+    /// failure must not turn the meeting into a failed one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the error that stopped the run: a step's, or a store error around the steps.
+    /// Returns `StoreError::NotFound` for an unknown id.
+    pub fn run_unrecorded<E: StepError>(
+        &self,
+        id: MeetingId,
+        steps: impl FnMut(&LeasedRun<'_>) -> Result<(), E>,
+    ) -> Result<RunOutcome, E> {
+        self.run_with(id, StepFailure::Returned, steps)
+    }
+
+    fn run_with<E: StepError>(
+        &self,
+        id: MeetingId,
+        failure: StepFailure,
         mut steps: impl FnMut(&LeasedRun<'_>) -> Result<(), E>,
     ) -> Result<RunOutcome, E> {
         let Some(lease) = self.lease_run(id)? else {
@@ -198,7 +223,7 @@ impl JobStore {
         };
         std::thread::scope(|scope| {
             scope.spawn(move || self.keep_lease_alive(&renewed_lease, &is_run_over));
-            let outcome = self.run_leased(&mut held, &mut steps);
+            let outcome = self.run_leased(&mut held, failure, &mut steps);
             drop(stop_renewing);
             outcome
         })
@@ -207,6 +232,7 @@ impl JobStore {
     fn run_leased<E: StepError>(
         &self,
         held: &mut HeldLease<'_>,
+        failure: StepFailure,
         steps: &mut impl FnMut(&LeasedRun<'_>) -> Result<(), E>,
     ) -> Result<RunOutcome, E> {
         let id = held.lease().id;
@@ -234,6 +260,17 @@ impl JobStore {
                 Err(error) => match run.stop.get() {
                     Some(LeaseStop::Superseded) => continue,
                     Some(LeaseStop::LeaseLost) => return Err(error),
+                    None if failure == StepFailure::Returned => {
+                        match run.release() {
+                            Ok(LeaseRelease::Released) => held.released(),
+                            Ok(LeaseRelease::Superseded) => continue,
+                            Err(store_error) => tracing::error!(
+                                exception.message = %store_error,
+                                "could not give back the run lease"
+                            ),
+                        }
+                        return Err(error);
+                    }
                     None => {
                         tracing::error!(exception.message = %error, "pipeline run failed");
                         match run.fail(&error.to_string()) {
@@ -323,6 +360,13 @@ impl JobStore {
         )?;
         Ok(())
     }
+}
+
+// Whether a step's error becomes the meeting's recorded failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepFailure {
+    Recorded,
+    Returned,
 }
 
 // Proof that this process runs the steps for one meeting. A clone lets a second thread keep the

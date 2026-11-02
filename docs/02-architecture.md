@@ -417,6 +417,20 @@ flowchart LR
 - If extraction fails, the note is still written with the transcript and the tag
   `status/needs-extraction`. The job retries after 5 minutes, 30 minutes and 2 hours.
 - LLM settings apply to the next run without a restart. The pipeline reads them per run.
+- A note of a captured call gets a Recording section after its attendees. It links the call's
+  `call.mp4`, each segment's mic and remote stems, and the call folder through
+  `meetingcapture://call/<folder>/{video|mic/<n>|remote/<n>|folder}` URLs. A link names the
+  folder, not a path, so a note synced to another machine keeps working links there. The app
+  registers the scheme through `tauri-plugin-deep-link`. On Windows a click reaches the running
+  app through `tauri-plugin-single-instance`. A click opens the file in its default app. When
+  the file is gone, the app shows why in a notification and opens the call folder. A purged
+  video shows its purge date instead of a link.
+- The app rewrites the Recording section when the call folder changes: at launch after
+  finalize, after a call's finalize, and for each folder the purge emptied. The rewrite uses the
+  stored notes and never calls the LLM, and a failed rewrite never marks the meeting failed. A
+  meeting that owes a step gets its own run instead. In a note the user edited, only the
+  Recording section is replaced, and the note still counts as edited. The rewrite skips a note
+  whose Recording section the user deleted or edited.
 - `pipeline` also owns the settings file. The app and `mc` load settings through it, so both read
   the same TOML with the same validation.
 
@@ -439,7 +453,7 @@ flowchart TB
 
 Later crates attach in their phase: the app depends on `detect`, `capture-protocol`,
 `stem-writer`, `video-capture` and `browser-shortcut`; `mc-capture` on `capture`, `stem-writer`,
-`video-capture` and `call-finalize`;
+`video-capture` and `call-finalize`; `pipeline` on `call-folder`;
 `sources` depends on `stt`. The app, `mc-capture`, `cli` and `pipeline` depend on `telemetry`.
 
 - The two binaries own the wiring. Library crates never depend on `meeting-capture` or `cli`.
@@ -455,11 +469,11 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 | pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `minijinja`, `toml`, `directories` |
 | jobs | 1 | One row per meeting with a closed state enum and the extraction retry schedule. Runs a meeting's steps under its lease: one run per meeting across processes, renewed from a second thread, given back however the run ends | `rusqlite`, `tracing` |
 | cli | 1 | `mc`: rerun any job step or ingest a file, without Tauri | `clap` |
-| app | 1 | Tray, call status, debug reports, settings, notifications, permission prompts, review of extracted commitments | Tauri 2, plugin `notification` 2 |
+| app | 1 | Tray, call status, debug reports, settings, notifications, permission prompts, review of extracted commitments, media links in notes | Tauri 2, plugins `notification` 2 and `deep-link` 2 |
 | detect | 3b | Emit "call started" and "call ended" when an app takes or releases the mic | Vendored from Anarlog `crates/detect` (MIT) |
 | capture | 3, 5 | One `CallAudioSource` trait; per-OS adapters emit timestamped PCM frames | Mac: Core Audio tap via `cidre`. Windows: WASAPI process loopback via `wasapi`. Mic: `cpal`. Adapted from Anarlog `crates/audio-actual` |
 | stem-timing | 3 | The types `capture` and `stem-writer` share: stem, buffer stamp, ring losses, clock reading. Portable, no audio API | `serde` |
-| call-folder | 3 | The per-process lock on a call folder and the walk over `calls/`, shared by every capture process and repair | std file locks |
+| call-folder | 3 | The per-process lock on a call folder and the walk over `calls/`, shared by every capture process and repair. The media a person opens in a folder, the purge record, and the `meetingcapture://` media links the note writer builds and the app opens | std file locks, `serde` |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV placed by host time, fsynced every 4.5 s, and `audio.json` | `rubato` |
 | call-finalize | 3c | Place a call's video parts and stems on one timeline, mix the stems, write `call.mp4`. Purge call video after 90 days. The planning, mixing and purge are portable | Mac: AVFoundation via `cidre` |
 | stt | 4 | VAD, Parakeet TDT 0.6B v3 int8, diarization of the remote stem | `sherpa-onnx` |

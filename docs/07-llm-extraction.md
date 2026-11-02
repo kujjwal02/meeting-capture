@@ -187,9 +187,10 @@ reading view.
 %% mc:end action-items %%
 ```
 
-- Sections, in order: `details`, `summary`, `decisions`, `action-items`, `open-questions`,
-  `my-commitments`, `caption-fixes`, `transcript`. A note without notes keeps all markers, with
-  empty sections.
+- Sections, in order: `details`, `recording`, `summary`, `decisions`, `action-items`,
+  `open-questions`, `my-commitments`, `caption-fixes`, `transcript`. A note without notes keeps
+  all markers, with empty sections. `recording` is empty when this machine has no call folder
+  for the meeting.
 - Each transcript paragraph ends in a block id `^s<n>`. Citations link to it as
   `[[#^s<n>|mm:ss]]`.
 - My commitments are tasks (`- [ ]`). The strength shows unless it is "committed".

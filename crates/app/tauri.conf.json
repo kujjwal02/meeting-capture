@@ -41,6 +41,11 @@
         "https://github.com/kujjwal02/meeting-capture/releases/latest/download/latest.json"
       ],
       "requireSignedVersion": true
+    },
+    "deep-link": {
+      "desktop": {
+        "schemes": ["meetingcapture"]
+      }
     }
   }
 }

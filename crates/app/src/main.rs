@@ -17,6 +17,7 @@ mod finished_logs;
 mod host_metrics;
 mod huddles;
 mod launch;
+mod media_links;
 mod meet_extension;
 mod meet_telemetry;
 mod meetings;
@@ -104,12 +105,20 @@ fn run_host_mode(origin: &str) -> ExitCode {
 fn run_tray_app() -> tauri::Result<()> {
     let mut builder = tauri::Builder::default();
     if std::env::var_os(HOME_OVERRIDE_VAR).is_none() {
-        // Registered first, so a second launch exits before it binds the socket.
-        builder = builder.plugin(tauri_plugin_single_instance::init(|_, _, _| {
-            tracing::info!("a second launch was refused; the tray app is already running");
+        // Registered first, so a second launch exits before it binds the socket. On Windows a
+        // clicked media link arrives this way too, and the plugin hands it to the deep-link
+        // plugin before this callback runs.
+        builder = builder.plugin(tauri_plugin_single_instance::init(|_, args, _| {
+            let is_link = args
+                .iter()
+                .any(|arg| arg.starts_with(&format!("{}:", call_folder::media::LINK_SCHEME)));
+            if !is_link {
+                tracing::info!("a second launch was refused; the tray app is already running");
+            }
         }));
     }
     let app = builder
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
             None,
@@ -186,6 +195,7 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     // Before the tray and the helpers, so they start in the stored mode.
     debug_mode::start(app.handle());
     tray::create(app.handle())?;
+    media_links::start(app.handle());
     updates::start(app.handle());
     meet_extension::start(app.handle());
     call_status::start(app.handle());

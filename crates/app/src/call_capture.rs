@@ -538,6 +538,7 @@ pub(crate) fn start(app: &AppHandle) {
     let app_dirs = state.settings.app_dirs();
     let calls_dir = app_dirs.calls_dir();
     let helper_logs = HelperLogs::new(app_dirs);
+    let launch_app = app.clone();
     tauri::async_runtime::spawn(async move {
         let repair_dir = calls_dir.clone();
         if let Err(error) =
@@ -550,8 +551,20 @@ pub(crate) fn start(app: &AppHandle) {
         // to finalize or purge.
         if cfg!(target_os = "macos") {
             finalize_pending(&calls_dir, &helper_logs).await;
+        }
+        // After finalize, so each note links the `call.mp4` written at this launch. Also adds
+        // the section to notes written before it existed.
+        match call_folder::call_folders(&calls_dir) {
+            Ok(folders) => refresh_note_recordings(&launch_app, folders).await,
+            Err(error) => tracing::error!(
+                file.directory = %calls_dir.display(),
+                exception.message = %error,
+                "refresh.calls_unreadable"
+            ),
+        }
+        if cfg!(target_os = "macos") {
             // After finalize, so a folder that waited for its `call.mp4` has it by now.
-            purge_media_daily(&calls_dir, &helper_logs).await;
+            purge_media_daily(&launch_app, &calls_dir, &helper_logs).await;
         }
     });
     let stop_changes = state
@@ -669,10 +682,14 @@ async fn finalize_pending(calls_dir: &Path, helper_logs: &HelperLogs) {
     }
 }
 
-/// Runs the purge now, then whenever a day has passed on the wall clock. Never returns.
-async fn purge_media_daily(calls_dir: &Path, helper_logs: &HelperLogs) {
+/// Runs the purge now, then whenever a day has passed on the wall clock, and marks the purged
+/// video in each call's note. Never returns.
+async fn purge_media_daily(app: &AppHandle, calls_dir: &Path, helper_logs: &HelperLogs) {
     loop {
-        purge_media(calls_dir, helper_logs).await;
+        let purged_folders = purge_media(calls_dir, helper_logs).await;
+        if !purged_folders.is_empty() {
+            refresh_note_recordings(app, purged_folders).await;
+        }
         let last_run = SystemTime::now();
         loop {
             tokio::time::sleep(PURGE_CHECK_INTERVAL).await;
@@ -687,9 +704,10 @@ async fn purge_media_daily(calls_dir: &Path, helper_logs: &HelperLogs) {
     }
 }
 
-/// Deletes the video of calls past the retention through the helper's `purge-media`. The helper
-/// logs each deletion in the helper log; the app logs the totals.
-async fn purge_media(calls_dir: &Path, helper_logs: &HelperLogs) {
+/// Deletes the video of calls past the retention through the helper's `purge-media`, and
+/// returns the purged call folders. The helper logs each deletion in the helper log; the app
+/// logs the totals.
+async fn purge_media(calls_dir: &Path, helper_logs: &HelperLogs) -> Vec<PathBuf> {
     let run = run_helper(
         &[
             "purge-media".as_ref(),
@@ -701,7 +719,8 @@ async fn purge_media(calls_dir: &Path, helper_logs: &HelperLogs) {
     )
     .await;
     match run.map(|stdout| serde_json::from_str::<MediaPurge>(stdout.trim())) {
-        Ok(Ok(purge)) => tracing::info!(
+        Ok(Ok(purge)) => {
+            tracing::info!(
             file.directory = %calls_dir.display(),
             purge.trusted_now = purge.trusted_now.map(|at| at.to_string()),
             purge.first_seen_count = purge.first_seen_count,
@@ -714,11 +733,34 @@ async fn purge_media(calls_dir: &Path, helper_logs: &HelperLogs) {
                 .sum::<u64>(),
             purge.deleted_bytes = purge.purged.iter().map(|call| call.deleted_bytes).sum::<u64>(),
             "purge.finished"
-        ),
+            );
+            purge.purged.into_iter().map(|call| call.folder).collect()
+        }
         Ok(Err(error)) => {
             tracing::error!(exception.message = %error, "purge.unreadable");
+            Vec::new()
         }
-        Err(reason) => tracing::error!(exception.message = reason, "purge.helper_failed"),
+        Err(reason) => {
+            tracing::error!(exception.message = reason, "purge.helper_failed");
+            Vec::new()
+        }
+    }
+}
+
+/// Rewrites the Recording section of the notes of `folders` where their media changed. Off
+/// the async runtime, since the rewrite reads and writes files.
+async fn refresh_note_recordings(app: &AppHandle, folders: Vec<PathBuf>) {
+    let Some(pipeline) = app.state::<AppState>().pipeline.clone() else {
+        return;
+    };
+    let refresh =
+        tauri::async_runtime::spawn_blocking(move || pipeline.refresh_recordings(&folders)).await;
+    match refresh {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::error!(exception.message = %error, "refresh.failed");
+        }
+        Err(error) => tracing::error!(exception.message = %error, "refresh.task_failed"),
     }
 }
 
@@ -732,6 +774,13 @@ async fn finalize_call(folder: PathBuf, helper_logs: HelperLogs) {
         }
         tokio::time::sleep(RECORDING_RETRY_DELAY).await;
     }
+}
+
+/// Finalizes a call that just ended, then links its `call.mp4` in the note if the note was
+/// written first.
+async fn finalize_ended_call(app: AppHandle, folder: PathBuf, helper_logs: HelperLogs) {
+    finalize_call(folder.clone(), helper_logs).await;
+    refresh_note_recordings(&app, vec![folder]).await;
 }
 
 async fn finalize_once(folder: &Path, helper_logs: &HelperLogs) -> Option<FinalizeOutcome> {
@@ -1121,7 +1170,11 @@ impl Supervisor {
             // Its processes have stopped, so their segments are closed. Its own task, because a
             // long call takes minutes to write and the next call must not wait for it.
             let folder = self.calls_dir.join(call_folder_name(call_id));
-            tauri::async_runtime::spawn(finalize_call(folder, self.helper_logs.clone()));
+            tauri::async_runtime::spawn(finalize_ended_call(
+                self.app.clone(),
+                folder,
+                self.helper_logs.clone(),
+            ));
         }
     }
 

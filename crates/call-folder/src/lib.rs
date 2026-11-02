@@ -1,5 +1,5 @@
 //! What every capture process shares about a call folder: the lock that says which process may
-//! write its media, and the walk over the app's `calls/` folder.
+//! write its media, the walk over the app's `calls/` folder, and the media a person opens in it.
 //!
 //! Each capture process has its own lock file, such as `audio.lock` and later `video.lock`. A
 //! recording holds it for its whole life and repair holds it while it works, so repair never
@@ -11,6 +11,8 @@
 //! stays in the folder: deleting it while another process waits on it would let two holders in.
 //! It holds the holder's pid for people reading the folder. Only Unix lets them read it while it
 //! is held: `LockFileEx` also blocks other processes' reads.
+
+pub mod media;
 
 use std::fs::{File, TryLockError};
 use std::io::Write as _;

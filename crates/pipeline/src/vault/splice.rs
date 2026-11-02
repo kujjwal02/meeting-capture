@@ -34,6 +34,32 @@ pub(super) fn section_sha256s(note: &str) -> Result<BTreeMap<String, String>, St
         .collect())
 }
 
+/// Which of the render's sections a splice puts into the note.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum SectionsToReplace<'a> {
+    All,
+    /// Only this one. Every other section stays as it is on disk, edited or not.
+    One(&'a str),
+}
+
+impl SectionsToReplace<'_> {
+    fn includes(self, name: &str) -> bool {
+        match self {
+            SectionsToReplace::All => true,
+            SectionsToReplace::One(only) => only == name,
+        }
+    }
+}
+
+/// The note with the line endings and start the app writes. Editors on Windows and git's
+/// autocrlf write CRLF, some with a BOM. The app writes LF.
+pub(super) fn as_written_by_app(on_disk: &str) -> String {
+    on_disk
+        .strip_prefix('\u{feff}')
+        .unwrap_or(on_disk)
+        .replace("\r\n", "\n")
+}
+
 /// The note with `rendered`'s sections and frontmatter keys put into `on_disk`. `written` holds
 /// the hash of each section the app last wrote, by name.
 ///
@@ -44,12 +70,9 @@ pub(super) fn splice(
     on_disk: &str,
     rendered: &str,
     written: &BTreeMap<String, String>,
+    sections_to_replace: SectionsToReplace<'_>,
 ) -> Result<String, String> {
-    // Editors on Windows and git's autocrlf write CRLF, some with a BOM. The app writes LF.
-    let on_disk = on_disk
-        .strip_prefix('\u{feff}')
-        .unwrap_or(on_disk)
-        .replace("\r\n", "\n");
+    let on_disk = as_written_by_app(on_disk);
     let (disk_frontmatter, disk_body) = split_frontmatter(&on_disk);
     if disk_frontmatter.is_none() && on_disk.starts_with("---") {
         return Err("the note's frontmatter has no closing --- line".to_owned());
@@ -77,19 +100,15 @@ pub(super) fn splice(
     // Only sections the render replaces need to be as the app wrote them.
     let edited: Vec<&str> = disk_sections
         .iter()
-        .filter(|(name, content)| rendered_content(name).is_some() && !is_as_written(name, content))
+        .filter(|(name, content)| {
+            sections_to_replace.includes(name)
+                && rendered_content(name).is_some()
+                && !is_as_written(name, content)
+        })
         .map(|(name, _)| *name)
         .collect();
     if !edited.is_empty() {
-        return Err(format!(
-            "the {} {} edited, and the app does not overwrite your edits there",
-            edited.join(", "),
-            if edited.len() == 1 {
-                "section was"
-            } else {
-                "sections were"
-            }
-        ));
+        return Err(edited_sections_reason(&edited));
     }
 
     // A section missing from the note with a stored hash was deleted by the user, markers and
@@ -98,7 +117,8 @@ pub(super) fn splice(
     let mut new_sections = rendered_sections
         .iter()
         .filter(|(name, _)| {
-            !written.contains_key(*name)
+            sections_to_replace.includes(name)
+                && !written.contains_key(*name)
                 && !disk_sections.iter().any(|(disk_name, _)| disk_name == name)
         })
         .peekable();
@@ -121,6 +141,9 @@ pub(super) fn splice(
                 body.push_str(text.strip_prefix('\n').unwrap_or(text));
             }
             Piece::Text(text) => body.push_str(text),
+            Piece::Section { name, content } if !sections_to_replace.includes(name) => {
+                write_section(&mut body, name, content);
+            }
             Piece::Section { name, content } => match rendered_content(name) {
                 Some(rendered) => {
                     let position = template_position(name);
@@ -156,6 +179,18 @@ pub(super) fn splice(
         (_, None) => return Err("the template writes no frontmatter".to_owned()),
     };
     Ok(format!("---\n{frontmatter}---\n{body}"))
+}
+
+fn edited_sections_reason(edited: &[&str]) -> String {
+    format!(
+        "the {} {} edited, and the app does not overwrite your edits there",
+        edited.join(", "),
+        if edited.len() == 1 {
+            "section was"
+        } else {
+            "sections were"
+        }
+    )
 }
 
 /// Each marked section's name and contents, in order.

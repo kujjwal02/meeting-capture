@@ -17,7 +17,8 @@ tauri-plugin-autostart = "2.7"
 # 3.0 is alpha.
 tauri-plugin-notification = "2.7"
 tauri-plugin-opener = "2.7"
-tauri-plugin-single-instance = "2.5"
+tauri-plugin-deep-link = "2.6"
+tauri-plugin-single-instance = { version = "2.5", features = ["deep-link"] }
 # No "zip": it only reads Tauri v1 Windows bundles. native-tls matches the other HTTP clients.
 tauri-plugin-updater = { version = "2.14", default-features = false, features = [
   "native-tls",

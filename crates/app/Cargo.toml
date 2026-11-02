@@ -30,6 +30,7 @@ telemetry.workspace = true
 tauri-plugin-autostart.workspace = true
 tauri-plugin-notification.workspace = true
 tauri-plugin-opener.workspace = true
+tauri-plugin-deep-link.workspace = true
 tauri-plugin-single-instance.workspace = true
 tauri-plugin-updater.workspace = true
 thiserror.workspace = true

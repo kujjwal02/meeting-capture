@@ -23,18 +23,18 @@ pub mod plan;
 mod purge;
 mod record;
 
+pub use call_folder::media::PURGE_RECORD_FILE_NAME;
 pub use plan::{
     CallTimeline, InputTrack, PartStart, PlacedPart, PlacedStem, SkipReason, SkippedInput,
     StemChunk, VideoPartInput, plan, plan_folder,
 };
 pub use purge::{
-    FIRST_SEEN_FILE_NAME, MEDIA_RETENTION_DAYS, PURGE_RECORD_FILE_NAME, PURGE_RUN_FILE_NAME,
-    purge_expired_media,
+    FIRST_SEEN_FILE_NAME, MEDIA_RETENTION_DAYS, PURGE_RUN_FILE_NAME, purge_expired_media,
 };
 pub use record::{FINALIZE_RECORD_FILE_NAME, needs_finalize};
 
 /// The call's playable file, in its call folder.
-pub const OUTPUT_FILE_NAME: &str = "call.mp4";
+pub const OUTPUT_FILE_NAME: &str = call_folder::media::VIDEO_FILE_NAME;
 
 /// Held while finalize works, so the app's call-end run and its launch run never write the same
 /// file at once.

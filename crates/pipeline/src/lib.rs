@@ -12,13 +12,15 @@ mod vault;
 
 pub use vault::has_user_edits;
 
-use std::path::PathBuf;
+use std::cell::Cell;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use call_folder::media::{CallMedia, MediaLink, MediaTarget};
 use jobs::{
-    ErrorPersistence, Extraction, ExtractionAtWrite, ExtractionFailure, JobStore, LeasedRun,
-    MeetingId, RunOutcome, Step, StepError, StoreError,
+    ErrorPersistence, Extraction, ExtractionAtWrite, ExtractionFailure, InputKind, JobState,
+    JobStore, LeasedRun, Meeting, MeetingId, RunOutcome, Step, StepError, StoreError,
 };
 use sources::Transcript;
 
@@ -27,9 +29,9 @@ use crate::extraction::{CheckedNotes, Prompt};
 use crate::google::GoogleError;
 use crate::intake::read_transcript;
 use crate::llm::{ExtractionError, Provider};
-use crate::render::NoteInput;
+use crate::render::{CallRecording, NoteInput};
 use crate::settings::{AppDirs, LlmSettings, Settings, SettingsError, SettingsStore};
-use crate::vault::Vault;
+use crate::vault::{SectionWrite, Vault};
 
 pub use crate::intake::{InputError, Intake, IntakeError, MergeError};
 
@@ -78,6 +80,8 @@ pub enum PipelineError {
     MissingCalendarMatch(MeetingId),
     #[error("note template failed: {0}")]
     Template(#[from] minijinja::Error),
+    #[error("the note template's mc:begin/mc:end markers do not line up: {0}")]
+    TemplateMarkers(String),
     #[error("could not write note frontmatter: {0}")]
     Frontmatter(String),
     #[error("every note name for this meeting is taken by another file in the vault")]
@@ -195,7 +199,9 @@ impl Pipeline {
     /// Returns the error that stopped the run.
     pub fn run(&self, id: MeetingId) -> Result<RunOutcome, PipelineError> {
         let _span = tracing::info_span!("pipeline.run", meeting.id = %id).entered();
-        let outcome = self.store.run(id, |run| self.run_steps(run));
+        let outcome = self.store.run(id, |run| {
+            self.run_steps(run, WriteTrigger::StepsOwed).map(drop)
+        });
         if outcome.is_err() {
             // The recorder holds the steps' DEBUG lines, which the log file does not.
             let folder = self.app_dirs.call_debug_dir().join(format!("meeting-{id}"));
@@ -223,38 +229,135 @@ impl Pipeline {
         self.run(id)
     }
 
-    fn run_steps(&self, run: &LeasedRun<'_>) -> Result<(), PipelineError> {
+    /// Rewrites the Recording section of each finished note whose call folder, among
+    /// `call_folders`, changed since the note was written: a new `call.mp4`, a purge, or a note
+    /// written before the section existed. Uses the stored notes, so it never calls the LLM. A
+    /// meeting that still owes a step, or failed, is left to its own run.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineError::Store` when the meetings cannot be listed.
+    pub fn refresh_recordings(
+        &self,
+        call_folders: &[PathBuf],
+    ) -> Result<RecordingRefresh, PipelineError> {
+        let _span = tracing::info_span!("pipeline.refresh_recordings").entered();
+        let mut refresh = RecordingRefresh::default();
+        let folder_names: Vec<&str> = call_folders
+            .iter()
+            .filter_map(|folder| folder.file_name()?.to_str())
+            .collect();
+        for meeting in self.store.written()? {
+            let Some(folder_name) = call_folder_name(&meeting) else {
+                continue;
+            };
+            if !folder_names.contains(&folder_name.as_str()) || !is_settled(&meeting) {
+                continue;
+            }
+            let outcome = Cell::new(RecordingWrite::Unchanged);
+            // Unrecorded: a rewrite that fails leaves the finished meeting as it was.
+            let run = self.store.run_unrecorded(meeting.id, |run| {
+                match self.run_steps(run, WriteTrigger::RecordingChanged) {
+                    Ok(write) => {
+                        outcome.set(write);
+                        Ok(())
+                    }
+                    // The user edited the Recording section itself. Their edit wins.
+                    Err(PipelineError::NoteEdited { reason, .. }) => {
+                        tracing::warn!(
+                            meeting.id = %meeting.id,
+                            exception.message = reason,
+                            "recording section not refreshed"
+                        );
+                        outcome.set(RecordingWrite::KeptUserEdits);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            });
+            match run {
+                Ok(_) => match outcome.get() {
+                    RecordingWrite::Unchanged => {}
+                    RecordingWrite::Written => refresh.written_count += 1,
+                    RecordingWrite::KeptUserEdits => refresh.kept_edits_count += 1,
+                    // A capture, a rewind or a merge arrived since the listing. Its run
+                    // would have been refused while the refresh held the lease, so run it
+                    // here; the run renders the Recording section too.
+                    RecordingWrite::StepsOwed => {
+                        if let Err(error) = self.run(meeting.id) {
+                            tracing::error!(
+                                meeting.id = %meeting.id,
+                                exception.message = %error,
+                                "run after refresh failed"
+                            );
+                        }
+                    }
+                },
+                Err(error) => {
+                    tracing::error!(
+                        meeting.id = %meeting.id,
+                        exception.message = %error,
+                        "recording section refresh failed"
+                    );
+                    refresh.failed_count += 1;
+                }
+            }
+        }
+        tracing::info!(
+            note.written_count = refresh.written_count,
+            note.kept_edits_count = refresh.kept_edits_count,
+            note.failed_count = refresh.failed_count,
+            "recording sections refreshed"
+        );
+        Ok(refresh)
+    }
+
+    // The meeting's call folder on this machine, with what it holds. `None` when the source has
+    // no call folder or the folder is not here.
+    fn call_recording(&self, meeting: &Meeting) -> Option<CallRecording> {
+        let folder_name = call_folder_name(meeting)?;
+        let folder_link = match MediaLink::new(&folder_name, MediaTarget::Folder) {
+            Ok(folder_link) => folder_link,
+            Err(error) => {
+                tracing::warn!(
+                    meeting.id = %meeting.id,
+                    exception.message = %error,
+                    "call folder cannot be linked"
+                );
+                return None;
+            }
+        };
+        let folder = folder_link.folder_in(&self.app_dirs.calls_dir());
+        match CallMedia::scan(&folder) {
+            Ok(media) => Some(CallRecording { folder_link, media }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                tracing::warn!(
+                    file.directory = %folder.display(),
+                    exception.message = %error,
+                    "call folder unreadable; the note gets no recording links"
+                );
+                None
+            }
+        }
+    }
+
+    fn run_steps(
+        &self,
+        run: &LeasedRun<'_>,
+        trigger: WriteTrigger,
+    ) -> Result<RecordingWrite, PipelineError> {
         let meeting = run.meeting();
         let id = meeting.id;
+        // Read again under the lease: a capture or a failure since the listing makes the
+        // meeting's own run the one to write.
+        if trigger == WriteTrigger::RecordingChanged && !is_settled(meeting) {
+            return Ok(RecordingWrite::StepsOwed);
+        }
         let transcript = read_transcript(meeting.input_kind, &meeting.input_path)?;
         log_source_decision(&transcript);
 
-        let calendar_match = if meeting.finished_step < Step::Matched {
-            let _span = tracing::info_span!(
-                "pipeline.match",
-                meeting.id = %id,
-                job.step = Step::Matched.as_str()
-            )
-            .entered();
-            let calendar_match = self.settings_store.google().match_event(&transcript)?;
-            let title = calendar_match
-                .event
-                .as_ref()
-                .and_then(|event| event.title.as_deref())
-                .or(transcript.title.as_deref());
-            run.record_match(title, &serde_json::to_string(&calendar_match)?)?;
-            tracing::info!(
-                is_matched = calendar_match.event.is_some(),
-                "calendar match done"
-            );
-            calendar_match
-        } else {
-            let stored = meeting
-                .calendar_match_json
-                .as_deref()
-                .ok_or(PipelineError::MissingCalendarMatch(id))?;
-            serde_json::from_str(stored)?
-        };
+        let calendar_match = self.match_step(run, &transcript)?;
 
         let needs_extraction = meeting.is_extraction_owed();
         let extraction = if needs_extraction {
@@ -273,13 +376,15 @@ impl Pipeline {
             ExtractOutcome::NoNotes | ExtractOutcome::Failed { .. } => (None, None),
         };
 
-        if meeting.finished_step < Step::Written || needs_extraction {
+        let is_write_owed = meeting.finished_step < Step::Written || needs_extraction;
+        if is_write_owed || trigger == WriteTrigger::RecordingChanged {
             let _span = tracing::info_span!(
                 "pipeline.write",
                 meeting.id = %id,
                 job.step = Step::Written.as_str()
             )
             .entered();
+            let recording = self.call_recording(meeting);
             let note = NoteInput {
                 meeting_id: id,
                 transcript: &transcript,
@@ -288,8 +393,24 @@ impl Pipeline {
                 extraction_provider,
                 my_name: self.settings.my_name.as_deref(),
                 time_zone: &self.settings.time_zone,
+                recording: recording.as_ref(),
             };
             let rendered = render::note(&note, &self.app_dirs.note_template_file())?;
+            if !is_write_owed {
+                match vault::section_write(&meeting.note, &rendered, RECORDING_SECTION)? {
+                    SectionWrite::Needed => {}
+                    SectionWrite::Current | SectionWrite::DeletedByUser | SectionWrite::NoNote => {
+                        return Ok(RecordingWrite::Unchanged);
+                    }
+                }
+                // Edits in other sections stay: only this section is replaced.
+                if vault::has_user_edits(&meeting.note) {
+                    self.vault
+                        .write_section(run, &rendered, RECORDING_SECTION)?;
+                    tracing::info!("recording section written into an edited note");
+                    return Ok(RecordingWrite::Written);
+                }
+            }
             let extraction_at_write = match &extraction {
                 ExtractOutcome::Notes { .. } | ExtractOutcome::NoNotes => {
                     ExtractionAtWrite::Recorded
@@ -314,8 +435,45 @@ impl Pipeline {
             // `note.path`, not `file.path`: the file name is the meeting's title, which a
             // debug report without text shortens to its length.
             tracing::info!(note.path = %note_path.display(), "note written");
+            return Ok(RecordingWrite::Written);
         }
-        Ok(())
+        Ok(RecordingWrite::Unchanged)
+    }
+
+    // The calendar match, run now or read from the store.
+    fn match_step(
+        &self,
+        run: &LeasedRun<'_>,
+        transcript: &Transcript,
+    ) -> Result<CalendarMatch, PipelineError> {
+        let meeting = run.meeting();
+        let id = meeting.id;
+        if meeting.finished_step < Step::Matched {
+            let _span = tracing::info_span!(
+                "pipeline.match",
+                meeting.id = %id,
+                job.step = Step::Matched.as_str()
+            )
+            .entered();
+            let calendar_match = self.settings_store.google().match_event(transcript)?;
+            let title = calendar_match
+                .event
+                .as_ref()
+                .and_then(|event| event.title.as_deref())
+                .or(transcript.title.as_deref());
+            run.record_match(title, &serde_json::to_string(&calendar_match)?)?;
+            tracing::info!(
+                is_matched = calendar_match.event.is_some(),
+                "calendar match done"
+            );
+            Ok(calendar_match)
+        } else {
+            let stored = meeting
+                .calendar_match_json
+                .as_deref()
+                .ok_or(PipelineError::MissingCalendarMatch(id))?;
+            Ok(serde_json::from_str(stored)?)
+        }
     }
 
     // Runs the LLM and records the notes. A failure is returned, not recorded: the note write
@@ -397,6 +555,54 @@ impl Pipeline {
             .map_err(|error| (label.clone(), error))?;
         Ok(Some((notes, label)))
     }
+}
+
+/// The note section that links the call's media.
+const RECORDING_SECTION: &str = "recording";
+
+/// What `Pipeline::refresh_recordings` did.
+#[derive(Debug, Default)]
+pub struct RecordingRefresh {
+    pub written_count: usize,
+    /// Notes the user edited in a section the rewrite would change.
+    pub kept_edits_count: usize,
+    pub failed_count: usize,
+}
+
+// Why `run_steps` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteTrigger {
+    /// The sweep, a capture or a retry: run each step still owed.
+    StepsOwed,
+    /// The call folder changed: rewrite the note if its Recording section is out of date.
+    RecordingChanged,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RecordingWrite {
+    Unchanged,
+    Written,
+    KeptUserEdits,
+    /// The meeting owes a step again; its own run writes the note.
+    StepsOwed,
+}
+
+/// Written, not failed, and owing no extraction: nothing but a rewrite would touch the note.
+fn is_settled(meeting: &Meeting) -> bool {
+    matches!(meeting.state(), JobState::Written { .. }) && !meeting.is_extraction_owed()
+}
+
+/// The call folder a meeting's capture wrote, named after the meeting's input log. Sources
+/// without a capture have none.
+fn call_folder_name(meeting: &Meeting) -> Option<String> {
+    match meeting.input_kind {
+        InputKind::TranscriptonicPayload => None,
+        InputKind::SlackHuddleLog | InputKind::BrowserCallLog => input_stem(&meeting.input_path),
+    }
+}
+
+fn input_stem(input_path: &Path) -> Option<String> {
+    Some(input_path.file_stem()?.to_str()?.to_owned())
 }
 
 enum ExtractOutcome {

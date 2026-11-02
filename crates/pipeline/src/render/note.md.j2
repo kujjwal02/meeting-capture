@@ -29,6 +29,23 @@
 {% endif %}
 %% mc:end details %%
 
+%% mc:begin recording %%
+{% if recording %}
+## Recording
+
+{% if recording.video_url %}
+- [Video]({{ recording.video_url }}) ({{ recording.video_length }})
+{% elif recording.video_purged_on %}
+- Video: purged {{ recording.video_purged_on }} (audio kept)
+{% endif %}
+{% for part in recording.parts %}
+- {% if part.label %}{{ part.label }}: {% endif %}{% if part.mic_url %}[My mic]({{ part.mic_url }}){% endif %}{% if part.mic_url and part.remote_url %} · {% endif %}{% if part.remote_url %}[Remote]({{ part.remote_url }}){% endif %}
+
+{% endfor %}
+- [Call folder]({{ recording.folder_url }})
+{% endif %}
+%% mc:end recording %%
+
 %% mc:begin summary %%
 {% if notes %}
 ## Summary

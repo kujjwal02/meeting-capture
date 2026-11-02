@@ -3,6 +3,7 @@
 
 use std::path::Path;
 
+use call_folder::media::{CallMedia, CallVideo, MediaLink, MediaTarget, StemSide};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 use jobs::MeetingId;
@@ -30,6 +31,15 @@ pub(crate) struct NoteInput<'a> {
     pub extraction_provider: Option<&'a str>,
     pub my_name: Option<&'a str>,
     pub time_zone: &'a TimeZone,
+    /// `None` when the meeting has no call folder on this machine.
+    pub recording: Option<&'a CallRecording>,
+}
+
+/// A meeting's call folder and the media in it.
+pub(crate) struct CallRecording {
+    /// The link to the folder itself; each file's link is built from it.
+    pub folder_link: MediaLink,
+    pub media: CallMedia,
 }
 
 impl NoteInput<'_> {
@@ -196,6 +206,9 @@ pub(crate) fn note(
         .collect();
 
     let notes = note.notes.map(notes_view);
+    let recording = note
+        .recording
+        .map(|recording| recording_view(note, recording));
 
     let mut environment = minijinja::Environment::new();
     environment.set_syntax(
@@ -215,6 +228,7 @@ pub(crate) fn note(
             huddle => minijinja::value::Serde(transcript.slack_huddle.as_ref().map(|huddle| huddle_view(transcript, huddle))),
             meeting_url => transcript.meeting_url.as_deref(),
             attendees => attendees.iter().map(|attendee| inline_markdown(attendee)).collect::<Vec<_>>(),
+            recording => minijinja::value::Serde(&recording),
             segments => minijinja::value::Serde(&segments),
             notes => minijinja::value::Serde(&notes),
             chat_messages => minijinja::value::Serde(&chat_messages),
@@ -314,6 +328,83 @@ fn huddle_view(transcript: &Transcript, huddle: &SlackHuddle) -> HuddleView {
         place: inline_markdown(&place),
         duration: format!("{} min", duration_min(transcript)),
         captions_warning,
+    }
+}
+
+#[derive(Serialize)]
+struct RecordingView {
+    video_url: Option<String>,
+    /// "24 min, 69 MB".
+    video_length: Option<String>,
+    /// The purge's date in the user's time zone.
+    video_purged_on: Option<String>,
+    parts: Vec<RecordingPartView>,
+    folder_url: String,
+}
+
+#[derive(Serialize)]
+struct RecordingPartView {
+    /// "Part 2", set only when the call has more than one segment.
+    label: Option<String>,
+    mic_url: Option<String>,
+    remote_url: Option<String>,
+}
+
+fn recording_view(note: &NoteInput<'_>, recording: &CallRecording) -> RecordingView {
+    let url = |target: MediaTarget| recording.folder_link.with_target(target).url();
+    let (video_url, video_length, video_purged_on) = match recording.media.video {
+        CallVideo::Kept { bytes } => (
+            Some(url(MediaTarget::Video)),
+            Some(format!(
+                "{} min, {}",
+                duration_min(note.transcript),
+                file_size_label(bytes)
+            )),
+            None,
+        ),
+        CallVideo::Purged { purged_at } => (
+            None,
+            None,
+            Some(
+                purged_at
+                    .to_zoned(note.time_zone.clone())
+                    .strftime("%Y-%m-%d")
+                    .to_string(),
+            ),
+        ),
+        CallVideo::Missing => (None, None, None),
+    };
+    let has_parts = recording.media.audio_segments.len() > 1;
+    let stem_url = |number: u32, side: StemSide, is_present: bool| {
+        is_present.then(|| url(MediaTarget::Stem { number, side }))
+    };
+    let parts = recording
+        .media
+        .audio_segments
+        .iter()
+        .map(|segment| RecordingPartView {
+            label: has_parts.then(|| format!("Part {}", segment.number)),
+            mic_url: stem_url(segment.number, StemSide::Mic, segment.has_mic),
+            remote_url: stem_url(segment.number, StemSide::Remote, segment.has_remote),
+        })
+        .collect();
+    RecordingView {
+        video_url,
+        video_length,
+        video_purged_on,
+        parts,
+        folder_url: recording.folder_link.url(),
+    }
+}
+
+// Decimal units, as Finder and Explorer show sizes.
+fn file_size_label(bytes: u64) -> String {
+    const MB: u64 = 1_000_000;
+    const GB: u64 = 1_000 * MB;
+    if bytes >= GB {
+        format!("{}.{} GB", bytes / GB, bytes % GB / (GB / 10))
+    } else {
+        format!("{} MB", (bytes + MB / 2) / MB)
     }
 }
 

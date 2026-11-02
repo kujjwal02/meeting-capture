@@ -70,6 +70,113 @@ impl Vault {
         run.mark_written(&note_sha256, &section_sha256s, extraction)?;
         Ok(note_path)
     }
+
+    /// Puts `rendered`'s section `name` into the run's note, which the user edited, and leaves
+    /// every other section as it is on disk. Only that section's hash is recorded: the note
+    /// still counts as edited, so a later full rerun still refuses to overwrite the edits.
+    ///
+    /// # Errors
+    ///
+    /// Returns `PipelineError::NoteEdited` when the user edited section `name` too,
+    /// `PipelineError::TemplateMarkers` when the template's markers do not line up,
+    /// `PipelineError::ReadFile` or `PipelineError::WriteNote` for a failed read or write, and a
+    /// store error when the run lost its lease or a new capture superseded it.
+    pub(crate) fn write_section(
+        &self,
+        run: &LeasedRun<'_>,
+        rendered: &str,
+        name: &str,
+    ) -> Result<(), PipelineError> {
+        let ownership = &run.meeting().note;
+        let Some(note_path) = ownership.path() else {
+            return Ok(());
+        };
+        splice::section_sha256s(rendered).map_err(PipelineError::TemplateMarkers)?;
+        let on_disk =
+            std::fs::read_to_string(note_path).map_err(|source| PipelineError::ReadFile {
+                path: note_path.to_path_buf(),
+                source,
+            })?;
+        let note_edited = |reason: String| PipelineError::NoteEdited {
+            path: note_path.to_path_buf(),
+            reason,
+        };
+        let spliced = splice::splice(
+            &on_disk,
+            rendered,
+            ownership.section_sha256s(),
+            splice::SectionsToReplace::One(name),
+        )
+        .map_err(note_edited)?;
+        let section_sha256 = splice::section_sha256s(&spliced)
+            .map_err(|reason| note_edited(format!("in the spliced note, {reason}")))?
+            .remove(name);
+        let edited_sha256 = note_sha256(on_disk.as_bytes());
+        durable_write::write(&self.staging_dir, note_path, &spliced, || {
+            run.confirm_current_input()?;
+            check_note_unchanged(note_path, ownership, Some(&edited_sha256))
+        })?;
+        if let Some(section_sha256) = section_sha256 {
+            run.mark_section_written(name, &section_sha256)?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether a rerun that changes nothing but one section has to write the note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SectionWrite {
+    /// The note's section differs from the render, or the note predates the section.
+    Needed,
+    Current,
+    /// The user removed the section, markers and all. It stays removed.
+    DeletedByUser,
+    /// The note is gone from the vault, or the template has no such section.
+    NoNote,
+}
+
+/// Whether the note on disk needs `rendered`'s section `name`. A user's edit inside the section
+/// counts as needing the write, and the splice then refuses it.
+///
+/// # Errors
+///
+/// Returns `PipelineError::ReadFile` when the note cannot be read.
+pub(crate) fn section_write(
+    ownership: &NoteOwnership,
+    rendered: &str,
+    name: &str,
+) -> Result<SectionWrite, PipelineError> {
+    let Some(note_path) = ownership.path() else {
+        return Ok(SectionWrite::NoNote);
+    };
+    let Some(rendered_sha256) = splice::section_sha256s(rendered)
+        .ok()
+        .and_then(|sections| sections.get(name).cloned())
+    else {
+        return Ok(SectionWrite::NoNote);
+    };
+    let on_disk = match std::fs::read_to_string(note_path) {
+        Ok(on_disk) => on_disk,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SectionWrite::NoNote);
+        }
+        Err(source) => {
+            return Err(PipelineError::ReadFile {
+                path: note_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    // A note whose markers do not line up goes to the write, whose splice says why.
+    let Ok(on_disk_sections) = splice::section_sha256s(&splice::as_written_by_app(&on_disk)) else {
+        return Ok(SectionWrite::Needed);
+    };
+    let written = ownership.section_sha256s().get(name);
+    Ok(match (on_disk_sections.get(name), written) {
+        (None, Some(_)) => SectionWrite::DeletedByUser,
+        (Some(on_disk), _) if *on_disk == rendered_sha256 => SectionWrite::Current,
+        _ => SectionWrite::Needed,
+    })
 }
 
 /// Whether the meeting's note differs from every write the pipeline made, so a rerun has to
@@ -104,8 +211,8 @@ fn fit_to_note(
         path: note_path.to_path_buf(),
         reason,
     };
-    let rendered_section_sha256s = splice::section_sha256s(rendered)
-        .map_err(|reason| note_edited(format!("in the template, {reason}")))?;
+    let rendered_section_sha256s =
+        splice::section_sha256s(rendered).map_err(PipelineError::TemplateMarkers)?;
     let as_rendered = |section_sha256s: BTreeMap<String, String>| FittedNote {
         contents: rendered.to_owned(),
         edited_sha256: None,
@@ -153,7 +260,8 @@ fn fit_to_note(
         // crashed before the store recorded its section hashes.
         written.extend(on_disk_section_sha256s);
     }
-    let spliced = splice::splice(&on_disk, rendered, &written).map_err(note_edited)?;
+    let spliced = splice::splice(&on_disk, rendered, &written, splice::SectionsToReplace::All)
+        .map_err(note_edited)?;
     let mut section_sha256s = splice::section_sha256s(&spliced)
         .map_err(|reason| note_edited(format!("in the spliced note, {reason}")))?;
     // A section the user deleted keeps its hash, so later reruns leave it out too.

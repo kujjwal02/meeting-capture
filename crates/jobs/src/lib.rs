@@ -405,6 +405,22 @@ impl JobStore {
         rows.map(|row| row?).collect()
     }
 
+    /// Meetings whose note is written and whose last run did not fail, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError` when the query fails or a row is invalid.
+    pub fn written(&self) -> Result<Vec<Meeting>, StoreError> {
+        let connection = self.connection();
+        let mut statement = connection.prepare(&format!(
+            "SELECT {MEETING_COLUMNS} FROM meetings
+             WHERE failure IS NULL AND finished_step = ?1
+             ORDER BY started_at"
+        ))?;
+        let rows = statement.query_map(params![Step::Written.as_str()], read_meeting)?;
+        rows.map(|row| row?).collect()
+    }
+
     /// Meetings whose last run failed, oldest first.
     ///
     /// # Errors
@@ -529,6 +545,15 @@ impl JobStore {
 
 // The note half of `LeasedRun::mark_written`, shared so the note records the same way whatever
 // the extraction outcome.
+// One "<section> <sha256>" line per section, as `note_section_sha256s` stores them.
+fn section_lines(section_sha256s: &BTreeMap<String, String>) -> String {
+    section_sha256s
+        .iter()
+        .map(|(section, sha256)| format!("{section} {sha256}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 const NOTE_WRITTEN: &str = "finished_step = ?6, note_sha256 = ?7, pending_note_sha256s = NULL,
     note_section_sha256s = ?8";
 
@@ -602,6 +627,22 @@ impl LeasedRun<'_> {
         }
     }
 
+    /// Records the hash of one section the app rewrote in a note the user edited elsewhere. The
+    /// note's own hash stays unknown, so the note still counts as edited, and the other
+    /// sections keep the hashes of the app's last full write.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
+    pub fn mark_section_written(&self, section: &str, sha256: &str) -> Result<(), StoreError> {
+        let mut section_sha256s = self.meeting().note.section_sha256s().clone();
+        section_sha256s.insert(section.to_owned(), sha256.to_owned());
+        self.update(
+            "note_section_sha256s = ?6",
+            &[&section_lines(&section_sha256s)],
+        )
+    }
+
     /// Adds the hash of a note about to be written, before the write. Earlier pending hashes stay
     /// until `mark_written`, since any of them may be the note on disk.
     ///
@@ -631,11 +672,7 @@ impl LeasedRun<'_> {
         section_sha256s: &BTreeMap<String, String>,
         extraction: ExtractionAtWrite<'_>,
     ) -> Result<(), StoreError> {
-        let section_lines = section_sha256s
-            .iter()
-            .map(|(section, sha256)| format!("{section} {sha256}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let section_lines = section_lines(section_sha256s);
         let written = Step::Written.as_str();
         match extraction {
             ExtractionAtWrite::Recorded => self.update(
