@@ -3,6 +3,7 @@
 
 mod bundle;
 mod otlp;
+mod replay;
 mod timeline;
 
 use std::path::PathBuf;
@@ -21,6 +22,18 @@ pub(crate) enum DebugCommand {
         /// Only lines of this service, such as `app`, `mc-capture` or `mc-meet`.
         #[arg(long)]
         service: Option<String>,
+    },
+    /// Run the call detectors over a report's lines and print each call's problems and failing
+    /// layer, in IST, beside what the app logged live.
+    Replay {
+        /// A debug report folder, a debug folder or one `.jsonl` file.
+        bundle: PathBuf,
+        /// Only this call: its trace id or its call folder name.
+        #[arg(long)]
+        call: Option<String>,
+        /// One JSON object per firing, then one per verdict.
+        #[arg(long)]
+        json: bool,
     },
     /// Write the report as OTLP/JSON lines for an OpenTelemetry Collector's `otlpjsonfile`
     /// receiver.
@@ -49,6 +62,17 @@ pub(crate) fn run(command: DebugCommand) -> anyhow::Result<()> {
             };
             match printed {
                 // A pager or `head` that stops reading has all it wanted.
+                Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
+                other => other?,
+            }
+        }
+        DebugCommand::Replay { bundle, call, json } => {
+            let bundle = bundle::Bundle::read(&bundle)?;
+            let options = replay::ReplayOptions {
+                call: call.as_deref(),
+                is_json: json,
+            };
+            match replay::print_replay(&bundle, &options, std::io::stdout().lock()) {
                 Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => {}
                 other => other?,
             }

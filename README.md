@@ -103,6 +103,7 @@ after a change.
 | `mc reprocess <id>` | Reruns every step. It keeps a note you edited; `--discard-edits` overwrites it. |
 | `mc debug timeline <report>` | Prints a saved debug report on one IST clock. `--by-minute` sums each minute. |
 | `mc debug export-otlp <report> --out <file>` | Writes the report as OTLP/JSON lines for an OpenTelemetry Collector. |
+| `mc debug replay <report>` | Runs the app's call detectors over a saved debug report and names the failing layer. |
 
 ## Build from source
 

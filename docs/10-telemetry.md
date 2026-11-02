@@ -486,6 +486,18 @@ lines match on session, mc-meet's time, name and attributes.
 | `mc debug timeline <bundle> --by-minute` | One row per minute: speech seconds from `mc.audio.self_speaking`, mean mic and remote dBFS over power, new caption frames by kind and acks per caption channel, caption presses, problems. A channel is named by owner, label and id, such as `own captions_v2#6` or `meet captions_v2#125`, and is left out of a minute it counted nothing in. Flags a minute with over 20 s of speech and no parsed frame |
 | `mc debug timeline <bundle> --service <name>` | Only that service's lines, such as `app`, `mc-capture` or `mc-meet` |
 | `mc debug export-otlp <bundle> --out <file>` | OTLP/JSON for a Collector's `otlpjsonfile` receiver |
+| `mc debug replay <bundle>` | Per call: each problem the detectors raise, notify and clear, in IST, then the failing layer |
+| `mc debug replay <bundle> --call <id>` | Only the call whose trace id or call folder name is `<id>` |
+| `mc debug replay <bundle> --json` | One JSON object per firing and per verdict |
+
+Replay feeds the detectors the same lines the live tap does: detector events and call metric
+rows, from every service but mc-meet. It advances time to the bundle's last line and invents
+none past it. A firing reads `logged` when the app logged the same kind and problem live
+within 2 s of it, else `not logged`. A live line with no replayed twin reads `logged only`. A
+bundle saved before the
+detectors existed still replays: its calls show the problems its lines support, and no live
+line to compare. A metrics cap in the call folder shows as `metrics capped at`, since rules on
+levels see no rows after it. Replay exits 1 when the bundle cannot be read.
 
 A bundle with no `mc.audio.self_speaking` point in a minute, such as one saved before the app
 wrote it, shows `-` in that minute's speech column and flags nothing.
