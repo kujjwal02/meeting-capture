@@ -1158,6 +1158,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "detectors"
+version = "0.10.0"
+dependencies = [
+ "jiff",
+ "serde_json",
+ "telemetry",
+]
+
+[[package]]
 name = "deunicode"
 version = "1.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
