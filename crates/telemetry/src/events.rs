@@ -84,7 +84,7 @@ pub const GLOBAL_DETECTOR_EVENTS: &[&str] = &[EXTENSION_CONNECTION, HOST_SUSPEND
 /// The board's own verdict lines. `mc debug replay` compares its firings with them.
 pub const PROBLEM_EVENTS: &[&str] = &[CALL_PROBLEM, CALL_RECOVERED, CALL_PROBLEM_NOTICED];
 
-pub const EVENT_NAME: &str = "event.name";
+pub const EVENT_NAME: &str = crate::fields::EVENT_NAME;
 pub const CALL_ID: &str = "call.id";
 pub const CALL_PLATFORM: &str = "call.platform";
 pub const CALL_CAPTION_COUNT: &str = "call.caption_count";

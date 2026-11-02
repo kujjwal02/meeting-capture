@@ -17,6 +17,8 @@ pub enum Service {
     McCapture,
     /// The CLI.
     Mc,
+    /// The check that runs each capture fault through a helper and the app's detectors.
+    CaptureCheck,
 }
 
 impl Service {
@@ -27,6 +29,7 @@ impl Service {
             Self::NativeHost => "native-host",
             Self::McCapture => "mc-capture",
             Self::Mc => "mc",
+            Self::CaptureCheck => "capture-check",
         }
     }
 

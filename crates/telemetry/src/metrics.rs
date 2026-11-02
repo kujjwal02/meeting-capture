@@ -499,6 +499,13 @@ impl ScopeShared {
         let Some(line) = encode(&row) else {
             return;
         };
+        // Before the budget check, so live detectors still see a full folder's rows. The tap
+        // must not log: the log layer calls the same tap, which may hold its own lock then.
+        if trace_id.is_some()
+            && let Some(tap) = crate::tap::installed_tap()
+        {
+            tap.take(&line);
+        }
         let written = match &self.target {
             RowTarget::DebugFolder(folder) => {
                 if !self.has_room(folder, line.len()) {

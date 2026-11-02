@@ -60,6 +60,7 @@ Portable: no Tauri and no OS calls. It builds on Windows.
 | `debug_mode` | The closed `DebugMode`, `Off` or `On { until }`, and the switch that sets the file level from it |
 | `metrics` | `MetricsScope`, its gauges and counters, the sampler thread that writes `metric` rows, and `RowPoints` for a source that times its own rows |
 | `env` | `EnvSnapshot` and its writer. The OS probes stay in the crates that own them and fill it |
+| `tap` | Hands chosen log lines and call metric rows to one in-process reader, the app's detectors |
 
 Only the app's own crates log at DEBUG into the recorder. Dependencies stay at INFO: their
 DEBUG output (HTTP, TLS, the webview) would fill the ring in seconds. An event is the app's own
