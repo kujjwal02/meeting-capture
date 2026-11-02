@@ -240,6 +240,7 @@ pub(crate) fn take_audio_report(app: &AppHandle, call_id: &Path, report: &AudioR
             ..
         }
         | AudioReport::Gap { .. }
+        | AudioReport::StreamLost { .. }
         | AudioReport::Rotated { .. }
         | AudioReport::Permission { .. }
         | AudioReport::SystemSleep { .. }
@@ -372,6 +373,7 @@ pub(crate) fn take_video_report(call_id: &Path, report: &VideoReport) {
         }
         VideoReport::Recording { .. }
         | VideoReport::Gap { .. }
+        | VideoReport::StreamLost { .. }
         | VideoReport::WindowChanged { .. }
         | VideoReport::Permission { .. }
         | VideoReport::Stopped { .. }

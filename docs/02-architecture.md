@@ -195,6 +195,17 @@ flowchart LR
 - The app's `call_capture` module supervises `mc-capture audio` over JSON lines on stdin and
   stdout. The `capture-protocol` crate holds the line types. [Phase 3
   detail](03-roadmap.md#phase-3-detail) has the messages and the restart rules.
+- The audio helper reports `stream_lost` with the stream and the cause when a stream stops
+  delivering. It sends one per loss, before it starts the replacement. A later `device_changed`
+  or `recording` on that stream ends the loss. A `mic_unavailable` means no replacement exists.
+  A mic swap for a better pick sends no `stream_lost`, since the old stream records until the new
+  one is ready.
+- The video process reports `stream_lost` with a rebuild cause before each stream rebuild. The
+  causes are `stream_stopped`, `resize_failed`, `stalled` and `start_failed`. A `gap` with cause
+  `stream_restart` or a `recording` ends the loss. A rebuild ends a gap of another cause that is
+  open, such as `window_hidden`, so every loss gets its `stream_restart` gap.
+- The app logs each `stream_lost` as a WARN line with `event.name` `capture.audio.stream_lost`
+  or `capture.video.stream_lost`.
 - Call folders live in the app data folder under `calls/`, one per call, named after the
   call log. They never go in the vault.
 - `capture` and `stem-writer` both depend on `stem-timing`, which holds the types they share:

@@ -64,6 +64,11 @@ pub fn log_audio_report(call_id: &str, report: &AudioReport) {
             "audio segment closed"
         ),
         AudioReport::DeviceChanged { .. } => log_device_changed(call_id, report),
+        AudioReport::StreamLost {
+            segment,
+            stream,
+            cause,
+        } => log_audio_stream_lost(call_id, *segment, *stream, *cause),
         AudioReport::MicUnavailable {
             segment,
             old_device,
@@ -126,6 +131,17 @@ fn log_device_changed(call_id: &str, report: &AudioReport) {
     );
 }
 
+fn log_audio_stream_lost(call_id: &str, segment: u32, stream: Stem, cause: DeviceChangeCause) {
+    tracing::warn!(
+        event.name = "capture.audio.stream_lost",
+        call.id = call_id,
+        segment.number = segment,
+        audio.stream = %stream,
+        audio.change_cause = %cause,
+        "audio stream lost"
+    );
+}
+
 fn log_mic_unavailable(
     call_id: &str,
     segment: u32,
@@ -178,6 +194,13 @@ pub fn log_video_report(call_id: &str, report: &VideoReport) {
             video.gap_length_ms = length_ms,
             error.type = %cause,
             "video gap"
+        ),
+        VideoReport::StreamLost { segment, cause } => tracing::warn!(
+            event.name = "capture.video.stream_lost",
+            call.id = call_id,
+            segment.number = segment,
+            video.rebuild_cause = %cause,
+            "video stream lost"
         ),
         VideoReport::WindowChanged {
             segment,
