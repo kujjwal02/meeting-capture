@@ -208,6 +208,12 @@ Progress is tracked in the [checklist](05-checklist.md).
 - Debug builds of the helper read `MC_CAPTURE_INJECT`, a timetable such as
   `5:mic-lost,12:tap-stall,30:sleep,32:wake`, so the device and sleep paths run without touching
   real devices. Release builds leave the timetable and its test hooks out.
+- `just inject-check` runs each fault through a debug helper on the Mac. The `capture-check`
+  driver answers the helper as the app's supervisor does and feeds the detectors as the status
+  board does. Each case checks its problem's raise and clear times, the recorder dumps, the
+  helper's inject line, and that `mc debug replay` fires what the live run logged. Output goes
+  to `target/inject-check/<UTC time>/`. The terminal needs the Microphone, Audio Capture and
+  Screen Recording grants.
 - Every native open runs on its own thread with a 5 s timeout. On timeout the helper exits and the
   app restarts it. Teardown stops the device and waits for running callbacks before it frees
   anything.

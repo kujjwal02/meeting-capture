@@ -222,6 +222,32 @@ A raise dumps every recorder of the call. One detector dumps at most once a minu
 Meet caption problem also writes the lead-up at the call's first caption problem and asks for a page
 snapshot.
 
+### The inject check
+
+`just inject-check [case...]` checks the capture detectors against real faults on a Mac. The
+`capture-check` crate runs a debug `mc-capture` with an `MC_CAPTURE_INJECT` timetable per case,
+answers it as the app's supervisor does, and runs the detectors on its own lines once a second.
+A case passes when its problem is raised and cleared inside its window, both recorders dumped,
+the helper's dump holds the injected event, and `mc debug replay` over the case's lines fires
+exactly what the live run logged. A case with no problem passes when nothing is raised and
+nothing dumped. On other systems `capture-check` prints that it runs on macOS only.
+
+| Case | Fault | Expected |
+|---|---|---|
+| `mic-lost` | The mic's device goes away | `mic_lost`, cleared at the swap |
+| `mic-unavailable` | The mic goes away and no new mic delivers | `mic_lost` until the helper drops the mic |
+| `mic-zeros` | The mic sends zeros for 22 s | `mic_digital_silence` after 10 s |
+| `tap-silent-open` | The first tap sends nothing | `remote_lost` |
+| `tap-stall` | The tap stops as the output route changes | `remote_lost` |
+| `tap-stall-quiet` | The tap stops with no route change | `remote_lost` after 5 s |
+| `tap-dead` | The tap's aggregate dies | `remote_lost` |
+| `routine` | Default device, device list and format changes, lid closed and open | No problem |
+| `sleep-wake` | The Mac sleeps and wakes | No problem |
+| `wake-no-start` | The Mac wakes and the driver sends no `start` | `audio_not_resumed` 20 s after the wake |
+| `video-stall` | The window stream stops for 17 s | `video_stream_lost` |
+| `video-still` | The window stops changing | No problem |
+| `screen-recording-refused` | Screen Recording reads denied for 15 s | `screen_recording_refused` |
+
 ### The failing layer
 
 A call's verdict names one failing layer from its problem history. Overlapping problems form
