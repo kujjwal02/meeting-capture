@@ -13,6 +13,7 @@ mod capture;
 mod context;
 mod host;
 mod problem;
+pub mod problem_lines;
 mod queue;
 mod reading;
 mod verdict;

@@ -603,6 +603,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "capture-check"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "capture-protocol",
+ "clap",
+ "detectors",
+ "jiff",
+ "serde",
+ "serde_json",
+ "telemetry",
+ "tracing",
+]
+
+[[package]]
 name = "capture-protocol"
 version = "0.10.0"
 dependencies = [
@@ -1165,6 +1180,7 @@ dependencies = [
  "jiff",
  "serde_json",
  "telemetry",
+ "tracing",
 ]
 
 [[package]]

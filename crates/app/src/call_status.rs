@@ -298,73 +298,28 @@ impl CaptionsLine {
 
 /// One line about a problem edge or notice, logged after the board lock is released.
 enum ProblemLine {
-    Raised {
+    Edge {
+        edge: Edge,
         call_id: String,
         platform: CallPlatform,
-        problem: Problem,
-        detector: DetectorKind,
-        evidence: String,
-        evidence_at: Timestamp,
     },
-    Cleared {
+    Notice {
+        notice: Notice,
         call_id: String,
-        platform: CallPlatform,
-        problem: Problem,
-    },
-    Noticed {
-        call_id: String,
-        problem: Problem,
     },
 }
 
 impl ProblemLine {
     fn log(&self) {
         match self {
-            Self::Raised {
+            Self::Edge {
+                edge,
                 call_id,
                 platform,
-                problem,
-                detector,
-                evidence,
-                evidence_at,
-            } => {
-                let heading = if problem.layer().is_capture() {
-                    "call capture problem"
-                } else {
-                    "call not recording"
-                };
-                tracing::warn!(
-                    event.name = "call.problem",
-                    call.id = call_id,
-                    call.platform = platform.as_str(),
-                    error.type = problem.code(),
-                    mc.problem.layer = problem.layer().code(),
-                    mc.problem.detector = detector.code(),
-                    mc.problem.evidence = evidence,
-                    mc.problem.evidence_at = %evidence_at,
-                    "{heading}: {}",
-                    problem.describe()
-                );
+            } => detectors::problem_lines::log_edge(edge, call_id, Some(platform.as_str())),
+            Self::Notice { notice, call_id } => {
+                detectors::problem_lines::log_notice(*notice, call_id);
             }
-            Self::Cleared {
-                call_id,
-                platform,
-                problem,
-            } => tracing::info!(
-                event.name = "call.recovered",
-                call.id = call_id,
-                call.platform = platform.as_str(),
-                error.type = problem.code(),
-                mc.problem.layer = problem.layer().code(),
-                "call problem cleared"
-            ),
-            Self::Noticed { call_id, problem } => tracing::info!(
-                event.name = "call.problem_noticed",
-                call.id = call_id,
-                error.type = problem.code(),
-                mc.problem.layer = problem.layer().code(),
-                "call problem notified"
-            ),
         }
     }
 }
@@ -632,37 +587,22 @@ impl Board {
         let Some(call) = self.call_mut(&edge.call) else {
             return;
         };
-        let call_id = call.id.display().to_string();
         let platform = call.platform;
-        let (cleared, raised) = match edge.change {
-            Change::Raised(problem) => (None, Some(problem)),
-            Change::Changed { from, to } => (Some(from), Some(to)),
-            Change::Cleared(problem) => (Some(problem), None),
-        };
-        if let Some(problem) = cleared {
-            output.problem_lines.push(ProblemLine::Cleared {
-                call_id: call_id.clone(),
-                platform,
-                problem,
-            });
-        }
-        let Some(problem) = raised else {
-            return;
+        output.problem_lines.push(ProblemLine::Edge {
+            edge: edge.clone(),
+            call_id: call.id.display().to_string(),
+            platform,
+        });
+        let raised = match edge.change {
+            Change::Raised(problem) | Change::Changed { to: problem, .. } => problem,
+            Change::Cleared(_) => return,
         };
         // A capture problem says nothing about the page, so it leaves the lead-up for the first
         // caption problem.
-        let is_caption_problem = !problem.layer().is_capture();
+        let is_caption_problem = !raised.layer().is_capture();
         let is_first_caption_problem = is_caption_problem && !call.has_had_caption_problem;
         call.has_had_caption_problem |= is_caption_problem;
         let id = call.id.clone();
-        output.problem_lines.push(ProblemLine::Raised {
-            call_id,
-            platform,
-            problem,
-            detector: edge.detector,
-            evidence: edge.evidence.event.clone(),
-            evidence_at: edge.evidence.at,
-        });
         let dump_key = (id.clone(), edge.detector);
         let is_dump_due = self
             .dumped_at
@@ -673,7 +613,7 @@ impl Board {
             output.tick.problem_starts.push(ProblemStart {
                 call_id: id,
                 platform,
-                problem,
+                problem: raised,
                 is_first_caption_problem,
             });
         }
@@ -683,18 +623,10 @@ impl Board {
         let Some(call) = self.call_mut(&notice.call) else {
             return;
         };
-        match notice.notice {
-            Notice::NotRecording(problem) | Notice::CaptureTrouble(problem) => {
-                output.problem_lines.push(ProblemLine::Noticed {
-                    call_id: call.id.display().to_string(),
-                    problem,
-                });
-            }
-            Notice::Recording
-            | Notice::RecordingAgain
-            | Notice::NoTranscript
-            | Notice::CaptureBack(_) => {}
-        }
+        output.problem_lines.push(ProblemLine::Notice {
+            notice: notice.notice,
+            call_id: call.id.display().to_string(),
+        });
         output.tick.announcements.push(Announced {
             platform: call.platform,
             title: call.title.clone(),

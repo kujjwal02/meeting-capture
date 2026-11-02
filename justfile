@@ -35,6 +35,13 @@ meet-e2e:
     cargo build -p meeting-capture -p mc-capture
     node tools/meet-e2e/run.mjs
 
+# Run each MC_CAPTURE_INJECT fault through a debug mc-capture and check its problem, dumps and
+# replay (Mac only). The terminal needs the Microphone, Audio Capture and Screen Recording grants.
+[macos]
+inject-check *cases:
+    cargo build -p mc-capture -p capture-check -p cli
+    target/debug/capture-check --helper target/debug/mc-capture --mc target/debug/mc --out "target/inject-check/$(date -u +%Y%m%dT%H%M%SZ)" {{cases}}
+
 # Replay failed Meet frames through the decoder. Takes a debug report folder, a call's debug
 # folder or a frames.jsonl.
 [no-cd]

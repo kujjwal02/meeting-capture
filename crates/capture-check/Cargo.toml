@@ -1,0 +1,21 @@
+[package]
+name = "capture-check"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+capture-protocol.workspace = true
+clap.workspace = true
+detectors.workspace = true
+jiff.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+telemetry.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
