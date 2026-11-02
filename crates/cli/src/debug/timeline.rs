@@ -27,7 +27,7 @@ const SPEECH_FLAG_MS: f64 = 20_000.0;
 /// What a metric row stands for when it does not say.
 const DEFAULT_INTERVAL_MS: u64 = 1_000;
 
-fn ist() -> TimeZone {
+pub(crate) fn ist() -> TimeZone {
     TimeZone::fixed(Offset::constant(5).saturating_add(SignedDuration::from_mins(30)))
 }
 
