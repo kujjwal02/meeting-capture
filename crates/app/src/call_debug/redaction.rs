@@ -43,6 +43,9 @@ const KEPT_KEYS: &[&str] = &[
     "mc.meet.at",
     "mc.caption.last_at",
     "mc.problem.evidence_at",
+    "raised_at",
+    "noticed_at",
+    "cleared_at",
     // Units of metric points, such as `dBFS` and `{frame}`.
     "unit",
     // Files the capture helpers named in their manifests.
@@ -145,6 +148,12 @@ const CODE_KEYS: &[&str] = &[
     "mc.problem.layer",
     "mc.problem.detector",
     "mc.problem.evidence",
+    // `call-status.json`'s problem history and failing layer.
+    "code",
+    "layer",
+    "detector",
+    "problem",
+    "capture_problems",
     "audio.change_cause",
     "video.rebuild_cause",
     "audio.stream",

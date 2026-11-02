@@ -176,6 +176,8 @@ struct CallMenuShape {
     /// Whether each open call has an audio line, whether it has a video line and the settings
     /// pane that line opens, and its stop or resume entry's label.
     recording_rows: Vec<(bool, Option<VideoRowKind>, &'static str)>,
+    /// Each open call's capture problem rows. A problem that starts or clears rebuilds the menu.
+    capture_problem_lines: Vec<Vec<String>>,
     recent_lines: Vec<String>,
     is_huddle_permission_missing: bool,
 }
@@ -198,6 +200,11 @@ impl CallMenuShape {
                         row.action_label,
                     )
                 })
+                .collect(),
+            capture_problem_lines: view
+                .calls
+                .iter()
+                .map(|call| call.capture_problem_lines(time_zone))
                 .collect(),
             recent_lines: view
                 .recent
@@ -352,7 +359,7 @@ pub(crate) fn refresh(app: &AppHandle) {
 // The icon follows the worst call state, and the tooltip carries each call's status line.
 fn show_look(app: &AppHandle, tray: &TrayIcon, view: &BoardView) -> tauri::Result<()> {
     let capture = &app.state::<AppState>().call_capture;
-    let look = if capture.has_problem() || !capture.refused_permissions().is_empty() {
+    let look = if capture.is_tab_video_failing() || !capture.refused_permissions().is_empty() {
         TrayLook::Problem
     } else {
         match view.tray_look() {
@@ -378,6 +385,7 @@ fn show_look(app: &AppHandle, tray: &TrayIcon, view: &BoardView) -> tauri::Resul
     let video_states = capture.video_states();
     for call in &view.calls {
         tooltip.push(call.status_line(&time_zone));
+        tooltip.extend(call.capture_problem_lines(&time_zone));
         if let Some(state) = audio_states.get(&call.id) {
             tooltip.push(state.label());
         }
@@ -563,6 +571,9 @@ fn append_calls(
     for call in &view.calls {
         let status = label_entry(app, &call.status_line(&time_zone))?;
         menu.append(&status)?;
+        for problem_line in call.capture_problem_lines(&time_zone) {
+            menu.append(&label_entry(app, &problem_line)?)?;
+        }
         let row = RecordingRow::of(call, &capture);
         let audio_entry = match &row.audio_line {
             Some(audio_line) => {

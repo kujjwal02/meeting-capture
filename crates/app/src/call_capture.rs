@@ -58,7 +58,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::Instrument as _;
 
-use self::restart_backoff::{FAILURES_SHOWN, Restart, RestartBackoff};
+use self::restart_backoff::{Restart, RestartBackoff};
 use crate::AppState;
 use crate::call_status::{Moment, display_time_zone};
 use crate::calls::{Call, CallEvent, CallPlatform};
@@ -397,24 +397,12 @@ impl CallCapture {
         })
     }
 
-    /// Whether any call fails to record, records without the user's mic, or has its video off
-    /// for a refused permission.
-    pub fn has_problem(&self) -> bool {
-        let is_audio_problem = self.lock().values().any(|state| {
-            matches!(
-                state,
-                AudioState::Failing | AudioState::RecordingWithoutMic { .. }
-            )
-        });
-        is_audio_problem
-            || self.lock_video().values().any(|state| {
-                matches!(
-                    state,
-                    VideoState::Failing
-                        | VideoState::ScreenRecordingRefused
-                        | VideoState::TabFailed
-                )
-            })
+    /// Whether any call's Meet tab video failed. The status board's detectors judge the audio
+    /// and window video helpers; mc-meet's tab capture reports to no detector.
+    pub fn is_tab_video_failing(&self) -> bool {
+        self.lock_video()
+            .values()
+            .any(|state| matches!(state, VideoState::TabFailed))
     }
 
     /// The video state of each open call that has one.
@@ -1876,17 +1864,8 @@ impl<P: CaptureProcess> Recording<P> {
             let restart = self
                 .backoff
                 .note_failure(Instant::now(), is_device_open_failed);
+            // The status board notifies: `capture.process_failed` raises a helper-down problem.
             self.log_failure(&reason, &restart);
-            if restart.is_newly_failing {
-                crate::notify(
-                    &self.app,
-                    "Recording failed",
-                    &format!(
-                        "The capture helper failed {FAILURES_SHOWN} times in a minute. It keeps \
-                         retrying. Last error: {reason}"
-                    ),
-                );
-            }
             let phase = if restart.is_failing {
                 ProcessPhase::Failing
             } else {

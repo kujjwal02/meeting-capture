@@ -9,12 +9,11 @@ use std::time::{Duration, Instant};
 
 use jiff::{SignedDuration, Timestamp};
 use serde::Deserialize as _;
-use sources::browser_call::{CallEvent, CallStart, EndReason};
+use sources::browser_call::{CallEvent, CallStart, EndReason, HealthSource};
 
 use super::call_log::{self, CallLog};
 use super::log_folder::LogFolder;
 use super::{BrowserCallStatus, PROTOCOL};
-use crate::call_status::{MeetCaptions, Observation};
 
 /// A call no extension port holds ends this long after its last event.
 const IDLE_CALL_END: Duration = Duration::from_mins(5);
@@ -85,12 +84,12 @@ impl Now {
 pub(super) enum Logged {
     Appended {
         log_path: PathBuf,
-        observation: Option<Observation>,
+        fact: Option<MeetFact>,
     },
     /// The call's first event written since it opened in this run, other than an end.
     Opened {
         opened: OpenedCall,
-        observation: Option<Observation>,
+        fact: Option<MeetFact>,
     },
     /// The log already had the event's `seq`.
     Duplicate,
@@ -295,17 +294,14 @@ impl CallBook {
         call.last_at = call.last_at.max(event.at());
         call.note_event(&event);
         let Some(reason) = end_reason else {
-            let observation = observation_of(&event);
+            let fact = fact_of(&event);
             if !call.is_reported {
                 return Ok(Logged::Opened {
                     opened: call.take_opened(&log_path),
-                    observation,
+                    fact,
                 });
             }
-            return Ok(Logged::Appended {
-                log_path,
-                observation,
-            });
+            return Ok(Logged::Appended { log_path, fact });
         };
         call.sessions.remove(session_id);
         self.open_sessions.remove(session_id);
@@ -313,7 +309,7 @@ impl CallBook {
             tracing::info!("browser call session ended; another session goes on");
             return Ok(Logged::Appended {
                 log_path,
-                observation: None,
+                fact: None,
             });
         }
         self.close_call(&log_path);
@@ -548,14 +544,50 @@ impl OpenCall {
     }
 }
 
-// What the status board learns from one event.
-fn observation_of(event: &CallEvent) -> Option<Observation> {
+/// What one mc-meet event says about its call.
+#[derive(Debug, Clone)]
+pub(super) enum MeetFact {
+    /// A caption event. Every version of one utterance has the same `line_key`.
+    Caption {
+        line_key: String,
+    },
+    Health(MeetHealth),
+}
+
+/// One mc-meet health report, as its `meet.health` line says it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MeetHealth {
+    pub captions: MeetCaptions,
+    pub source: HealthSource,
+    pub is_caption_frames_failing: bool,
+}
+
+/// What Meet's captions button says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MeetCaptions {
+    On,
+    Off,
+    /// Meet refuses captions: the button is disabled or says they are unavailable.
+    Unavailable,
+}
+
+impl MeetCaptions {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+fn fact_of(event: &CallEvent) -> Option<MeetFact> {
     match event {
         CallEvent::Caption {
             device_id,
             utterance_id,
             ..
-        } => Some(Observation::MeetCaption {
+        } => Some(MeetFact::Caption {
             line_key: caption_line_key(device_id, utterance_id),
         }),
         CallEvent::Health {
@@ -580,11 +612,11 @@ fn observation_of(event: &CallEvent) -> Option<Observation> {
                 (false, true) => MeetCaptions::On,
                 (false, false) => MeetCaptions::Off,
             };
-            Some(Observation::MeetHealth {
+            Some(MeetFact::Health(MeetHealth {
                 source: *source,
                 captions,
                 is_caption_frames_failing: *caption_frames_failing,
-            })
+            }))
         }
         CallEvent::CallStarted { .. }
         | CallEvent::Chat { .. }

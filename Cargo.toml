@@ -81,6 +81,7 @@ call-finalize = { path = "crates/call-finalize" }
 call-folder = { path = "crates/call-folder" }
 capture = { path = "crates/capture" }
 capture-protocol = { path = "crates/capture-protocol" }
+detectors = { path = "crates/detectors" }
 huddle-captions = { path = "crates/huddle-captions" }
 jobs = { path = "crates/jobs" }
 native-host = { path = "crates/native-host" }

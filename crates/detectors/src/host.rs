@@ -123,8 +123,16 @@ pub struct CallSnapshot {
     pub recording_since: Option<Timestamp>,
     pub caption_source: Option<CaptionSource>,
     pub huddle_health: Option<HuddleHealth>,
-    pub capture_problems: Vec<Problem>,
+    /// Capture problems in view, lowest layer first.
+    pub capture_problems: Vec<OpenProblem>,
     pub history: Vec<ProblemSpan>,
+}
+
+/// A problem in view, and when its detector's outage began.
+#[derive(Debug, Clone, Copy)]
+pub struct OpenProblem {
+    pub problem: Problem,
+    pub since: Timestamp,
 }
 
 enum Captions {
@@ -608,13 +616,16 @@ impl CallSlot {
             None => (None, None),
         };
         let tally = self.detectors.captions.as_ref().map(Captions::tally);
-        let mut capture_problems: Vec<(DetectorKind, Problem)> = self
+        let mut capture_problems: Vec<OpenProblem> = self
             .active
-            .iter()
-            .filter(|(_, active)| active.problem.layer().is_capture())
-            .map(|(kind, active)| (*kind, active.problem))
+            .values()
+            .filter(|active| active.problem.layer().is_capture())
+            .map(|active| OpenProblem {
+                problem: active.problem,
+                since: active.since,
+            })
             .collect();
-        capture_problems.sort_by_key(|(_, problem)| problem.layer());
+        capture_problems.sort_by_key(|open| open.problem.layer());
         CallSnapshot {
             call_id: self.call_id.clone(),
             platform: self.facts.platform,
@@ -626,10 +637,7 @@ impl CallSlot {
             recording_since: tally.and_then(|tally| tally.recording_since),
             caption_source,
             huddle_health,
-            capture_problems: capture_problems
-                .into_iter()
-                .map(|(_, problem)| problem)
-                .collect(),
+            capture_problems,
             history: self.history.clone(),
         }
     }

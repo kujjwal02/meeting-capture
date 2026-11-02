@@ -1,116 +1,54 @@
 //! What each call is doing now: waiting for its first caption, recording, or not recording and
-//! why. Meet calls and Slack huddles both feed it. The board decides each call's state from
-//! timestamped observations and says what to announce; the tray, the notifications and mc-meet
-//! only show it.
+//! why, and whether its capture has a problem. Meet calls and Slack huddles both feed it. The
+//! rules live in the `detectors` crate and read the app's own telemetry lines; the board feeds
+//! them each tick, keeps the caption tally and the titles, and says what to announce. The tray,
+//! the notifications and mc-meet only show it.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
+use detectors::{
+    CallNotice, CallSnapshot, CaptionSource, CaptionState, Change, DetectorKind, Edge, Host,
+    LineQueue, Notice, OpenProblem, ProblemSpan, TraceKey,
+};
 use huddle_captions::HuddleHealth;
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde::Serialize;
 use sources::browser_call::HealthSource;
 use tauri::{AppHandle, Manager as _};
+use telemetry::parsed::Line;
+use telemetry::trace::TraceId;
+
+pub(crate) use detectors::Problem;
 
 use crate::AppState;
 use crate::calls::CallPlatform;
 
 const TICK_INTERVAL: Duration = Duration::from_secs(1);
-/// With a cause in view, such as captions off, no caption for this long is a problem. The
-/// extension needs a few seconds to turn captions on at call start.
-const CAPTION_STALL: Duration = Duration::from_secs(20);
-/// No caption for this long while captions are on is a problem by itself. People can be silent
-/// for a minute, at the start of a call or during a screen share.
-const SILENCE_LIMIT: Duration = Duration::from_mins(2);
-/// A problem that lasts this long gets a notification. Shorter ones are reconnects and pauses.
-const PROBLEM_NOTICE_AFTER: Duration = Duration::from_secs(30);
+/// The caption problems mc-meet shows.
 const KEPT_PROBLEMS: usize = 3;
-/// A call whose caption count rose logs `call.captions` at most this often, unless it waits for
+/// A call whose captions moved on logs `call.captions` at most this often, unless it waits for
 /// a caption or has a problem.
 const CAPTION_LINE_INTERVAL: Duration = Duration::from_secs(5);
 /// A wall clock that moves this much more than the monotonic clock between two ticks means the
 /// host was suspended.
 const SUSPEND_LIMIT: Duration = Duration::from_secs(5);
+/// One detector's problems dump the recorders at most this often per call. A headset that
+/// reconnects every minute would otherwise dump every minute.
+const DUMP_INTERVAL: Duration = Duration::from_mins(1);
 const RECENT_CALLS: usize = 5;
 
-/// Why a call is not recording. One closed list for Meet and Slack huddles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ProblemReason {
-    /// Meet's or Slack's captions are off, so no caption arrives.
-    CaptionsOff,
-    /// Meet refuses captions: its captions button is disabled or says they are unavailable.
-    MeetCaptionsUnavailable,
-    /// Frames arrive on a caption channel, and none of them decode.
-    CaptionParseFailures,
-    /// Captions are on and nothing arrived for `SILENCE_LIMIT`.
-    CaptionsSilent,
-    /// Nothing arrived for `SILENCE_LIMIT`, and the source cannot tell whether captions are on.
-    NoCaptions,
-    /// No mc-meet port holds the call: the browser quit or crashed, or the extension stopped.
-    ExtensionDisconnected,
-    /// Every Meet tab of the call closed, reloaded or crashed, and none came back yet. mc-meet
-    /// ends the call if none comes back within 5 minutes.
-    MeetPageAway,
-    /// No layout profile can read the huddle window.
-    HuddleCaptionsUnreadable,
-}
-
-impl ProblemReason {
-    pub(crate) fn code(self) -> &'static str {
-        match self {
-            Self::CaptionsOff => "captions_off",
-            Self::MeetCaptionsUnavailable => "meet_captions_unavailable",
-            Self::CaptionParseFailures => "caption_parse_failures",
-            Self::CaptionsSilent => "captions_silent",
-            Self::NoCaptions => "no_captions",
-            Self::ExtensionDisconnected => "extension_disconnected",
-            Self::MeetPageAway => "meet_page_away",
-            Self::HuddleCaptionsUnreadable => "huddle_captions_unreadable",
-        }
-    }
-
-    pub(crate) fn describe(self) -> &'static str {
-        match self {
-            Self::CaptionsOff => "captions are off",
-            Self::MeetCaptionsUnavailable => "Meet captions unavailable (Google)",
-            Self::CaptionParseFailures => "captions arrive but cannot be read",
-            Self::CaptionsSilent => "no caption for 2 min while captions are on",
-            Self::NoCaptions => "no caption for 2 min",
-            Self::ExtensionDisconnected => "mc-meet disconnected",
-            Self::MeetPageAway => "the Meet tab closed or reloaded",
-            Self::HuddleCaptionsUnreadable => "the huddle window cannot be read",
-        }
-    }
-
-    // A tab that went away usually means the call ended, and mc-meet ends it in 5 minutes if no
-    // tab comes back. A disconnect with no mc-meet port left is a browser that quit; with one
-    // left, the extension lost the call while the browser runs.
-    fn deserves_notice(self, is_extension_connected: bool) -> bool {
-        match self {
-            Self::MeetPageAway => false,
-            Self::ExtensionDisconnected => is_extension_connected,
-            Self::CaptionsOff
-            | Self::MeetCaptionsUnavailable
-            | Self::CaptionParseFailures
-            | Self::CaptionsSilent
-            | Self::NoCaptions
-            | Self::HuddleCaptionsUnreadable => true,
-        }
-    }
-}
-
-/// An open call's state.
+/// An open call's state, from its captions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CallState {
     /// The call is open and no caption has arrived yet.
     Waiting,
-    /// A caption arrived, and no problem is in view.
+    /// A caption arrived, and no caption problem is in view.
     Recording,
-    Problem(ProblemReason),
+    Problem(Problem),
     /// The user stopped recording the call. No caption is expected and no problem counts until
     /// they resume.
     Stopped,
@@ -132,80 +70,38 @@ pub(crate) enum TrayLook {
     Problem,
 }
 
-/// What Meet's captions button says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MeetCaptions {
-    On,
-    Off,
-    /// Meet refuses captions: the button is disabled or says they are unavailable.
-    Unavailable,
-}
-
-impl MeetCaptions {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::On => "on",
-            Self::Off => "off",
-            Self::Unavailable => "unavailable",
-        }
-    }
-}
-
-/// One fact a source reports about an open call.
+/// One fact a source reports about an open call that no rule reads: the caption tally, the
+/// user's stop and the tab video.
 #[derive(Debug, Clone)]
 pub(crate) enum Observation {
     /// A Meet caption event. Every version of one utterance has the same `line_key`.
-    MeetCaption {
-        line_key: String,
-    },
-    MeetHealth {
-        source: HealthSource,
-        captions: MeetCaptions,
-        is_caption_frames_failing: bool,
-    },
-    /// Whether any mc-meet port holds the call.
-    MeetPortHeld(bool),
-    /// Whether every tab of the call went away and mc-meet waits for one to come back.
-    MeetPagesAway(bool),
+    MeetCaption { line_key: String },
     /// The caption lines a reopened log already holds, by line key. They count, but say nothing
     /// about whether captions arrive now.
     MeetLoggedCaptions(Vec<String>),
     /// Caption lines arrived or changed, and the huddle log holds this many.
     HuddleCaptionLines(u64),
-    HuddleHealth(HuddleHealth),
     /// The user stopped recording the call (`true`) or resumed it (`false`).
     RecordingStopped(bool),
     /// The call's Meet tab video wrote a fragment.
     TabVideoRecorded,
 }
 
-/// What the user hears about a call.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Announcement {
-    /// The first caption arrived.
-    Recording,
-    /// A problem lasted `PROBLEM_NOTICE_AFTER`. Once per reason in one outage.
-    NotRecording(ProblemReason),
-    /// A caption arrived after an announced problem. It ends the outage.
-    RecordingAgain,
-    /// The call ended with no caption.
-    NoTranscript,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct Announced {
     pub platform: CallPlatform,
     pub title: Option<String>,
-    pub announcement: Announcement,
+    pub notice: Notice,
 }
 
-/// A call whose problem started at this tick.
+/// A call whose problem started at this tick, and whose recorders are due a dump.
 #[derive(Debug, Clone)]
 pub(crate) struct ProblemStart {
     pub call_id: PathBuf,
     pub platform: CallPlatform,
-    /// The call's first problem in this run.
-    pub is_first: bool,
+    pub problem: Problem,
+    /// The call's first caption problem in this run.
+    pub is_first_caption_problem: bool,
 }
 
 #[derive(Debug, Default)]
@@ -234,9 +130,9 @@ impl Moment {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct ProblemRecord {
-    pub reason: ProblemReason,
+    pub problem: Problem,
     pub at: Timestamp,
 }
 
@@ -257,8 +153,10 @@ pub(crate) struct CallView {
     pub caption_source: Option<HealthSource>,
     /// Slack huddles only.
     pub huddle_health: Option<HuddleHealth>,
-    /// The last problems, oldest first.
+    /// The last caption problems, oldest first.
     pub problems: Vec<ProblemRecord>,
+    /// Capture problems in view, lowest layer first.
+    pub capture_problems: Vec<OpenProblem>,
 }
 
 /// An ended call for the recent calls list.
@@ -286,13 +184,16 @@ pub(crate) struct BoardView {
 
 impl BoardView {
     pub(crate) fn tray_look(&self) -> TrayLook {
-        let has_state =
-            |is_wanted: fn(CallState) -> bool| self.calls.iter().any(|call| is_wanted(call.state));
-        if self.is_huddle_permission_missing
-            || has_state(|state| matches!(state, CallState::Problem(_)))
-        {
+        let has_problem = self.calls.iter().any(|call| {
+            matches!(call.state, CallState::Problem(_)) || !call.capture_problems.is_empty()
+        });
+        if self.is_huddle_permission_missing || has_problem {
             TrayLook::Problem
-        } else if has_state(|state| matches!(state, CallState::Recording)) {
+        } else if self
+            .calls
+            .iter()
+            .any(|call| call.state == CallState::Recording)
+        {
             TrayLook::Recording
         } else {
             TrayLook::Idle
@@ -313,53 +214,56 @@ impl BoardView {
     }
 }
 
-/// The open calls, the last ended ones, and what was announced.
+/// The open calls, the last ended ones, and the detectors that judge them.
 pub(crate) struct CallBoard {
     board: Mutex<Board>,
+    /// The lines the telemetry tap hands over for the detectors.
+    lines: Arc<LineQueue>,
 }
 
-#[derive(Default)]
 struct Board {
     open: HashMap<PathBuf, TrackedCall>,
     /// Newest first.
     recent: VecDeque<EndedCall>,
     is_huddle_permission_missing: bool,
-    /// Whether any mc-meet port is connected.
-    is_extension_connected: bool,
-    /// Announcements made outside a tick, such as at a call end.
-    pending: Vec<Announced>,
     /// Calls that left `recent`, for the next tick.
     forgotten: Vec<PathBuf>,
+    host: Host,
+    /// When each call's detector last dumped the recorders.
+    dumped_at: HashMap<(PathBuf, DetectorKind), Instant>,
+    /// A line that fails to parse is logged once per run.
+    is_parse_failure_logged: bool,
 }
 
 struct TrackedCall {
     id: PathBuf,
+    trace: TraceKey,
     platform: CallPlatform,
     title: Option<String>,
     started_at: Timestamp,
-    /// Since when the call waits for a caption: its open, or its resume. Only a caption after
-    /// it shows the call as recording.
-    waiting_since: Instant,
     caption_count: u64,
     last_caption: Option<Moment>,
-    recording_since: Option<Timestamp>,
-    signals: Signals,
-    problem: Option<ActiveProblem>,
-    problems: VecDeque<ProblemRecord>,
-    notices: CallNotices,
+    /// Device and utterance of every Meet caption line, so revisions count once.
+    line_keys: HashSet<String>,
     /// "Stop recording this call" was chosen and "Resume recording" was not. A rejoin
     /// (`call.resumed`) keeps it.
     is_stopped_by_user: bool,
     /// The Meet tab video wrote a fragment. A rejoin keeps it.
     is_tab_video_recorded: bool,
+    /// A caption problem was raised in this run.
+    has_had_caption_problem: bool,
+    /// The detectors' caption verdict at the last tick.
+    caption_state: CaptionState,
     caption_lines: CaptionLines,
 }
 
 /// What the call's `call.captions` lines said so far, so a line goes out only when the count
-/// rose.
+/// rose or the last caption moved on.
 #[derive(Default)]
 struct CaptionLines {
     logged_count: u64,
+    /// The `mc.caption.last_at` of the last line. A revised caption moves it and not the count.
+    logged_last_caption_at: Option<Timestamp>,
     logged_at: Option<Instant>,
     /// The call waited for a caption or had a problem at the last tick, so a rise logs at once.
     /// The first caption ends the wait before the tick sees it.
@@ -392,16 +296,84 @@ impl CaptionsLine {
     }
 }
 
-/// What the call announced, so each notification goes out once, even when a state flips back
-/// and forth.
+/// One line about a problem edge or notice, logged after the board lock is released.
+enum ProblemLine {
+    Raised {
+        call_id: String,
+        platform: CallPlatform,
+        problem: Problem,
+        detector: DetectorKind,
+        evidence: String,
+        evidence_at: Timestamp,
+    },
+    Cleared {
+        call_id: String,
+        platform: CallPlatform,
+        problem: Problem,
+    },
+    Noticed {
+        call_id: String,
+        problem: Problem,
+    },
+}
+
+impl ProblemLine {
+    fn log(&self) {
+        match self {
+            Self::Raised {
+                call_id,
+                platform,
+                problem,
+                detector,
+                evidence,
+                evidence_at,
+            } => {
+                let heading = if problem.layer().is_capture() {
+                    "call capture problem"
+                } else {
+                    "call not recording"
+                };
+                tracing::warn!(
+                    event.name = "call.problem",
+                    call.id = call_id,
+                    call.platform = platform.as_str(),
+                    error.type = problem.code(),
+                    mc.problem.layer = problem.layer().code(),
+                    mc.problem.detector = detector.code(),
+                    mc.problem.evidence = evidence,
+                    mc.problem.evidence_at = %evidence_at,
+                    "{heading}: {}",
+                    problem.describe()
+                );
+            }
+            Self::Cleared {
+                call_id,
+                platform,
+                problem,
+            } => tracing::info!(
+                event.name = "call.recovered",
+                call.id = call_id,
+                call.platform = platform.as_str(),
+                error.type = problem.code(),
+                mc.problem.layer = problem.layer().code(),
+                "call problem cleared"
+            ),
+            Self::Noticed { call_id, problem } => tracing::info!(
+                event.name = "call.problem_noticed",
+                call.id = call_id,
+                error.type = problem.code(),
+                mc.problem.layer = problem.layer().code(),
+                "call problem notified"
+            ),
+        }
+    }
+}
+
+/// One tick's detector output, acted on once the lock is released.
 #[derive(Default)]
-struct CallNotices {
-    is_recording_announced: bool,
-    /// The reasons announced in the current outage. A "Recording again" ends the outage.
-    outage_reasons: HashSet<ProblemReason>,
-    /// When the last "Not recording" was announced. A caption after it is a recovery.
-    recovery_owed_since: Option<Instant>,
-    is_no_transcript_announced: bool,
+struct TickOutput {
+    tick: Tick,
+    problem_lines: Vec<ProblemLine>,
 }
 
 struct EndedCall {
@@ -409,36 +381,19 @@ struct EndedCall {
     ended_at: Timestamp,
 }
 
-struct ActiveProblem {
-    reason: ProblemReason,
-    /// When the call stopped recording, kept when the reason changes.
-    since: Instant,
-    is_announced: bool,
-}
-
-enum Signals {
-    Meet(MeetSignals),
-    Huddle(HuddleSignals),
-}
-
-struct MeetSignals {
-    is_port_held: bool,
-    is_pages_away: bool,
-    captions: MeetCaptions,
-    is_caption_frames_failing: bool,
-    caption_source: Option<HealthSource>,
-    /// Device and utterance of every caption line, so revisions count once.
-    line_keys: HashSet<String>,
-}
-
-struct HuddleSignals {
-    health: Option<HuddleHealth>,
-}
-
 impl CallBoard {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(lines: Arc<LineQueue>) -> Self {
         Self {
-            board: Mutex::new(Board::default()),
+            board: Mutex::new(Board {
+                open: HashMap::new(),
+                recent: VecDeque::new(),
+                is_huddle_permission_missing: false,
+                forgotten: Vec::new(),
+                host: Host::new(),
+                dumped_at: HashMap::new(),
+                is_parse_failure_logged: false,
+            }),
+            lines,
         }
     }
 
@@ -447,7 +402,8 @@ impl CallBoard {
     }
 
     /// A call opened, or one that ended in this run opened again and keeps its counts.
-    /// `is_stopped_by_user` comes from the call's log, so a stop survives a restart.
+    /// `is_stopped_by_user` comes from the call's log, so a stop survives a restart. The caller
+    /// logs `call.started` or `call.resumed` after this.
     pub(crate) fn open(
         &self,
         id: &Path,
@@ -456,53 +412,65 @@ impl CallBoard {
         is_stopped_by_user: bool,
         now: Moment,
     ) {
-        let mut board = self.lock();
-        if board.open.contains_key(id) {
-            return;
-        }
-        let resumed = board
-            .recent
-            .iter()
-            .position(|ended| ended.call.id == id)
-            .and_then(|index| board.recent.remove(index));
-        let mut call = match resumed {
-            Some(EndedCall { mut call, .. }) => {
-                call.resume(title, now);
-                call
+        let was_stopped_by_user = {
+            let mut board = self.lock();
+            if board.open.contains_key(id) {
+                return;
             }
-            None => TrackedCall::new(id, platform, title, now),
+            let resumed = board
+                .recent
+                .iter()
+                .position(|ended| ended.call.id == id)
+                .and_then(|index| board.recent.remove(index));
+            let mut call = match resumed {
+                Some(EndedCall { mut call, .. }) => {
+                    call.title = title.or(call.title.take());
+                    call.caption_state = CaptionState::Waiting;
+                    call
+                }
+                None => TrackedCall::new(id, platform, title, now),
+            };
+            let was_stopped_by_user = call.is_stopped_by_user;
+            call.is_stopped_by_user = is_stopped_by_user;
+            board.open.insert(id.to_path_buf(), call);
+            was_stopped_by_user
         };
-        call.is_stopped_by_user = is_stopped_by_user;
-        board.open.insert(id.to_path_buf(), call);
+        // The detectors and `mc debug replay` learn a stop only from its line. Before the open
+        // line, so no problem is raised between the two.
+        if is_stopped_by_user != was_stopped_by_user {
+            log_stop_from_call_log(id, is_stopped_by_user);
+        }
     }
 
-    /// A call ended. One with no caption gets a "No transcript captured" notification.
+    /// A call ended. The detectors hear it from the `call.ended` line, so the caption count
+    /// goes out first: a call whose last captions were not logged yet would read as silent.
     pub(crate) fn end(&self, id: &Path, now: Moment) {
-        let mut board = self.lock();
-        let Some(mut call) = board.open.remove(id) else {
-            return;
-        };
-        if call.caption_count == 0 && !call.notices.is_no_transcript_announced {
-            call.notices.is_no_transcript_announced = true;
-            board
-                .pending
-                .push(call.announced(Announcement::NoTranscript));
-        }
-        tracing::info!(
-            event.name = "call.status",
-            call.id = %call.id.display(),
-            call.caption_count = call.caption_count,
-            call.status = "ended",
-            "call status changed"
-        );
-        board.recent.push_front(EndedCall {
-            call,
-            ended_at: now.timestamp,
-        });
-        while board.recent.len() > RECENT_CALLS {
-            if let Some(dropped) = board.recent.pop_back() {
-                board.forgotten.push(dropped.call.id);
+        let final_line = {
+            let mut board = self.lock();
+            let Some(mut call) = board.open.remove(id) else {
+                return;
+            };
+            let final_line = call.take_final_caption_line(now);
+            tracing::info!(
+                event.name = "call.status",
+                call.id = %call.id.display(),
+                call.caption_count = call.caption_count,
+                call.status = "ended",
+                "call status changed"
+            );
+            board.recent.push_front(EndedCall {
+                call,
+                ended_at: now.timestamp,
+            });
+            while board.recent.len() > RECENT_CALLS {
+                if let Some(dropped) = board.recent.pop_back() {
+                    board.forgotten.push(dropped.call.id);
+                }
             }
+            final_line
+        };
+        if let Some(line) = final_line {
+            line.log();
         }
     }
 
@@ -536,45 +504,73 @@ impl CallBoard {
         self.lock().is_huddle_permission_missing = is_missing;
     }
 
-    pub(crate) fn set_extension_connected(&self, is_connected: bool) {
-        self.lock().is_extension_connected = is_connected;
-    }
-
-    /// Works out every open call's state at `now` and returns what to announce. Logs each
-    /// call's `call.captions` line that is due.
+    /// Logs each call's due `call.captions` line, runs the detectors over the lines since the
+    /// last tick up to `now`, and returns what to announce and which problems started.
     pub(crate) fn tick(&self, now: Moment) -> Tick {
-        let mut caption_lines = Vec::new();
-        let tick = {
+        let caption_lines: Vec<CaptionsLine> = {
             let mut board = self.lock();
-            let board = &mut *board;
-            let mut problem_starts = Vec::new();
+            let mut lines = Vec::new();
             for call in board.open.values_mut() {
-                problem_starts.extend(call.settle(
-                    now,
-                    board.is_extension_connected,
-                    &mut board.pending,
-                ));
-                call.take_caption_lines(now, &mut caption_lines);
+                call.take_caption_lines(now, &mut lines);
             }
-            Tick {
-                announcements: std::mem::take(&mut board.pending),
-                problem_starts,
-                forgotten_calls: std::mem::take(&mut board.forgotten),
-            }
+            lines
         };
+        // A logged line reaches the queue at once, so this tick's detectors read it.
         for line in &caption_lines {
             line.log();
         }
-        tick
+        let (raw_lines, dropped_count) = self.lines.drain();
+        if dropped_count > 0 {
+            tracing::warn!(
+                mc.detectors.dropped_lines = dropped_count,
+                "the detector queue was full and dropped lines"
+            );
+        }
+        let mut parse_failure = None;
+        let mut lines: Vec<Line> = raw_lines
+            .iter()
+            .filter_map(|raw| match telemetry::parsed::parse_line(raw) {
+                Ok(line) => Some(line),
+                Err(error) => {
+                    parse_failure = Some(error.to_string());
+                    None
+                }
+            })
+            .collect();
+        lines.sort_by_key(|line| line.at);
+        let (output, is_failure_new) = {
+            let mut board = self.lock();
+            let is_failure_new = parse_failure.is_some() && !board.is_parse_failure_logged;
+            board.is_parse_failure_logged |= is_failure_new;
+            (board.run_detectors(&lines, now), is_failure_new)
+        };
+        if let Some(error) = parse_failure.filter(|_| is_failure_new) {
+            tracing::warn!(
+                exception.message = error,
+                "a detector line did not parse; later ones are not logged"
+            );
+        }
+        for line in &output.problem_lines {
+            line.log();
+        }
+        output.tick
     }
 
     pub(crate) fn view(&self, now: Moment) -> BoardView {
         let board = self.lock();
-        let mut calls: Vec<CallView> = board.open.values().map(|call| call.view(now)).collect();
+        let mut calls: Vec<CallView> = board
+            .open
+            .values()
+            .map(|call| call.view(board.host.snapshot(&call.trace).as_ref(), now))
+            .collect();
         calls.sort_by_key(|call| call.started_at);
         BoardView {
             calls,
-            recent: board.recent.iter().map(EndedCall::view).collect(),
+            recent: board
+                .recent
+                .iter()
+                .map(|ended| ended.view(board.host.snapshot(&ended.call.trace).as_ref()))
+                .collect(),
             is_huddle_permission_missing: board.is_huddle_permission_missing,
         }
     }
@@ -582,374 +578,305 @@ impl CallBoard {
     /// The call's status for a debug report, open or recently ended.
     pub(crate) fn describe(&self, id: &Path, now: Moment) -> Option<serde_json::Value> {
         let board = self.lock();
-        if let Some(call) = board.open.get(id) {
-            return Some(call.describe(None, now));
-        }
-        board
-            .recent
-            .iter()
-            .find(|ended| ended.call.id == id)
-            .map(|ended| ended.call.describe(Some(ended.ended_at), now))
+        let (call, ended_at) = match board.open.get(id) {
+            Some(call) => (call, None),
+            None => board
+                .recent
+                .iter()
+                .find(|ended| ended.call.id == id)
+                .map(|ended| (&ended.call, Some(ended.ended_at)))?,
+        };
+        let snapshot = board.host.snapshot(&call.trace);
+        Some(call.describe(snapshot.as_ref(), ended_at, now))
     }
+}
+
+impl Board {
+    fn run_detectors(&mut self, lines: &[Line], now: Moment) -> TickOutput {
+        self.host.learn_suspended(lines);
+        for line in lines {
+            self.host.take_line(line);
+        }
+        self.host.advance_to(now.timestamp);
+        let detected = self.host.drain_output();
+        let mut output = TickOutput::default();
+        for edge in &detected.edges {
+            self.take_edge(edge, now, &mut output);
+        }
+        for notice in &detected.notices {
+            self.take_notice(notice, &mut output);
+        }
+        for call in self.open.values_mut() {
+            call.caption_state = self
+                .host
+                .snapshot(&call.trace)
+                .map_or(CaptionState::Waiting, |snapshot| snapshot.caption_state);
+        }
+        for call_id in std::mem::take(&mut self.forgotten) {
+            self.host.forget(&trace_of(&call_id));
+            self.dumped_at
+                .retain(|(dumped_call, _), _| *dumped_call != call_id);
+            output.tick.forgotten_calls.push(call_id);
+        }
+        output
+    }
+
+    fn call_mut(&mut self, trace: &TraceKey) -> Option<&mut TrackedCall> {
+        self.open
+            .values_mut()
+            .chain(self.recent.iter_mut().map(|ended| &mut ended.call))
+            .find(|call| call.trace == *trace)
+    }
+
+    fn take_edge(&mut self, edge: &Edge, now: Moment, output: &mut TickOutput) {
+        let Some(call) = self.call_mut(&edge.call) else {
+            return;
+        };
+        let call_id = call.id.display().to_string();
+        let platform = call.platform;
+        let (cleared, raised) = match edge.change {
+            Change::Raised(problem) => (None, Some(problem)),
+            Change::Changed { from, to } => (Some(from), Some(to)),
+            Change::Cleared(problem) => (Some(problem), None),
+        };
+        if let Some(problem) = cleared {
+            output.problem_lines.push(ProblemLine::Cleared {
+                call_id: call_id.clone(),
+                platform,
+                problem,
+            });
+        }
+        let Some(problem) = raised else {
+            return;
+        };
+        // A capture problem says nothing about the page, so it leaves the lead-up for the first
+        // caption problem.
+        let is_caption_problem = !problem.layer().is_capture();
+        let is_first_caption_problem = is_caption_problem && !call.has_had_caption_problem;
+        call.has_had_caption_problem |= is_caption_problem;
+        let id = call.id.clone();
+        output.problem_lines.push(ProblemLine::Raised {
+            call_id,
+            platform,
+            problem,
+            detector: edge.detector,
+            evidence: edge.evidence.event.clone(),
+            evidence_at: edge.evidence.at,
+        });
+        let dump_key = (id.clone(), edge.detector);
+        let is_dump_due = self
+            .dumped_at
+            .get(&dump_key)
+            .is_none_or(|at| now.instant.saturating_duration_since(*at) >= DUMP_INTERVAL);
+        if is_dump_due {
+            self.dumped_at.insert(dump_key, now.instant);
+            output.tick.problem_starts.push(ProblemStart {
+                call_id: id,
+                platform,
+                problem,
+                is_first_caption_problem,
+            });
+        }
+    }
+
+    fn take_notice(&mut self, notice: &CallNotice, output: &mut TickOutput) {
+        let Some(call) = self.call_mut(&notice.call) else {
+            return;
+        };
+        match notice.notice {
+            Notice::NotRecording(problem) | Notice::CaptureTrouble(problem) => {
+                output.problem_lines.push(ProblemLine::Noticed {
+                    call_id: call.id.display().to_string(),
+                    problem,
+                });
+            }
+            Notice::Recording
+            | Notice::RecordingAgain
+            | Notice::NoTranscript
+            | Notice::CaptureBack(_) => {}
+        }
+        output.tick.announcements.push(Announced {
+            platform: call.platform,
+            title: call.title.clone(),
+            notice: notice.notice,
+        });
+    }
+}
+
+/// Logs the stop or resume a reopened call's log holds.
+fn log_stop_from_call_log(id: &Path, is_stopped_by_user: bool) {
+    if is_stopped_by_user {
+        tracing::info!(
+            event.name = "call.recording_stopped",
+            call.id = %id.display(),
+            "recording stays stopped, as the call's log says"
+        );
+    } else {
+        tracing::info!(
+            event.name = "call.recording_resumed",
+            call.id = %id.display(),
+            "recording runs again, as the call's log says"
+        );
+    }
+}
+
+/// The trace a call's lines carry, which keys it in the detectors.
+fn trace_of(id: &Path) -> TraceKey {
+    TraceKey(TraceId::for_call(&id.display().to_string()).to_string())
 }
 
 impl TrackedCall {
     fn new(id: &Path, platform: CallPlatform, title: Option<String>, now: Moment) -> Self {
-        let signals = match platform {
-            CallPlatform::Meet => Signals::Meet(MeetSignals {
-                is_port_held: true,
-                is_pages_away: false,
-                captions: MeetCaptions::Off,
-                is_caption_frames_failing: false,
-                caption_source: None,
-                line_keys: HashSet::new(),
-            }),
-            CallPlatform::SlackHuddle => Signals::Huddle(HuddleSignals { health: None }),
-        };
         Self {
             id: id.to_path_buf(),
+            trace: trace_of(id),
             platform,
             title,
             started_at: now.timestamp,
-            waiting_since: now.instant,
             caption_count: 0,
             last_caption: None,
-            recording_since: None,
-            signals,
-            problem: None,
-            problems: VecDeque::new(),
-            notices: CallNotices::default(),
+            line_keys: HashSet::new(),
             is_stopped_by_user: false,
             is_tab_video_recorded: false,
+            has_had_caption_problem: false,
+            caption_state: CaptionState::Waiting,
             caption_lines: CaptionLines::default(),
         }
     }
 
-    /// The call opened again after it ended in this run: a rejoin, or late events after an
-    /// idle end. Its counts and problems stay; what the old page said about captions does not.
-    fn resume(&mut self, title: Option<String>, now: Moment) {
-        self.waiting_since = now.instant;
-        self.recording_since = None;
-        self.problem = None;
-        self.title = title.or(self.title.take());
-        self.notices.outage_reasons.clear();
-        self.notices.recovery_owed_since = None;
-        if let Signals::Meet(meet) = &mut self.signals {
-            meet.is_port_held = true;
-            meet.is_pages_away = false;
-            meet.captions = MeetCaptions::Off;
-            meet.is_caption_frames_failing = false;
-            meet.caption_source = None;
-        }
-    }
-
-    /// Whether a caption arrived since the call opened or resumed.
-    fn has_caption_since_wait(&self) -> bool {
-        self.last_caption
-            .is_some_and(|caption| caption.instant >= self.waiting_since)
-    }
-
-    fn announced(&self, announcement: Announcement) -> Announced {
-        Announced {
-            platform: self.platform,
-            title: self.title.clone(),
-            announcement,
-        }
-    }
-
     fn observe(&mut self, observation: Observation, now: Moment) {
-        match (observation, &mut self.signals) {
+        match (observation, self.platform) {
             (Observation::RecordingStopped(is_stopped), _) => {
-                // A resume waits for a fresh caption, as a rejoin does.
-                if self.is_stopped_by_user && !is_stopped {
-                    self.waiting_since = now.instant;
-                    self.recording_since = None;
-                }
                 self.is_stopped_by_user = is_stopped;
-                self.problem = None;
             }
-            (Observation::MeetCaption { line_key }, Signals::Meet(meet)) => {
-                meet.line_keys.insert(line_key);
-                let count = meet.line_keys.len() as u64;
+            (Observation::MeetCaption { line_key }, CallPlatform::Meet) => {
+                self.line_keys.insert(line_key);
+                let count = self.line_keys.len() as u64;
                 self.saw_captions(count, now);
             }
-            (
-                Observation::MeetHealth {
-                    source,
-                    captions,
-                    is_caption_frames_failing,
-                },
-                Signals::Meet(meet),
-            ) => {
-                meet.caption_source = Some(source);
-                meet.captions = captions;
-                meet.is_caption_frames_failing = is_caption_frames_failing;
-            }
-            (Observation::MeetPortHeld(is_held), Signals::Meet(meet)) => {
-                meet.is_port_held = is_held;
-            }
-            (Observation::MeetPagesAway(is_away), Signals::Meet(meet)) => {
-                meet.is_pages_away = is_away;
-            }
-            (Observation::MeetLoggedCaptions(line_keys), Signals::Meet(meet)) => {
-                meet.line_keys.extend(line_keys);
-                self.caption_count = self.caption_count.max(meet.line_keys.len() as u64);
+            (Observation::MeetLoggedCaptions(line_keys), CallPlatform::Meet) => {
+                self.line_keys.extend(line_keys);
+                self.caption_count = self.caption_count.max(self.line_keys.len() as u64);
                 self.caption_lines.pending_backlog_count = Some(self.caption_count);
             }
             // The watcher reads rows while stopped but logs none, so they are not captions.
-            (Observation::HuddleCaptionLines(count), Signals::Huddle(_)) => {
+            (Observation::HuddleCaptionLines(count), CallPlatform::SlackHuddle) => {
                 if !self.is_stopped_by_user {
                     self.saw_captions(count, now);
                 }
             }
-            (Observation::HuddleHealth(health), Signals::Huddle(huddle)) => {
-                huddle.health = Some(health);
-            }
-            (Observation::TabVideoRecorded, Signals::Meet(_)) => {
+            (Observation::TabVideoRecorded, CallPlatform::Meet) => {
                 self.is_tab_video_recorded = true;
             }
             // A source reports only on its own calls.
             (
                 Observation::MeetCaption { .. }
-                | Observation::MeetHealth { .. }
-                | Observation::MeetPortHeld(_)
-                | Observation::MeetPagesAway(_)
                 | Observation::MeetLoggedCaptions(_)
                 | Observation::TabVideoRecorded,
-                Signals::Huddle(_),
+                CallPlatform::SlackHuddle,
             )
-            | (
-                Observation::HuddleCaptionLines(_) | Observation::HuddleHealth(_),
-                Signals::Meet(_),
-            ) => {}
+            | (Observation::HuddleCaptionLines(_), CallPlatform::Meet) => {}
         }
-    }
-
-    /// Adds the call's due `call.captions` lines: a reopened log's backlog at once, then a
-    /// rise in the count once per `CAPTION_LINE_INTERVAL`, or at once while the call waits for
-    /// a caption or has a problem.
-    fn take_caption_lines(&mut self, now: Moment, lines: &mut Vec<CaptionsLine>) {
-        let is_awaiting_captions =
-            matches!(self.state(), CallState::Waiting | CallState::Problem(_));
-        let lines_state = &mut self.caption_lines;
-        if let Some(backlog_count) = lines_state.pending_backlog_count.take() {
-            lines.push(CaptionsLine {
-                call_id: self.id.clone(),
-                platform: self.platform,
-                caption_count: backlog_count,
-                last_at: None,
-                is_backlog: true,
-            });
-            lines_state.logged_count = lines_state.logged_count.max(backlog_count);
-            lines_state.logged_at = Some(now.instant);
-        }
-        let is_due = lines_state
-            .logged_at
-            .is_none_or(|at| now.instant.saturating_duration_since(at) >= CAPTION_LINE_INTERVAL)
-            || is_awaiting_captions
-            || lines_state.was_awaiting_captions;
-        if self.caption_count > lines_state.logged_count && is_due {
-            lines.push(CaptionsLine {
-                call_id: self.id.clone(),
-                platform: self.platform,
-                caption_count: self.caption_count,
-                last_at: self.last_caption.map(|caption| caption.timestamp),
-                is_backlog: false,
-            });
-            lines_state.logged_count = self.caption_count;
-            lines_state.logged_at = Some(now.instant);
-        }
-        lines_state.was_awaiting_captions = is_awaiting_captions;
     }
 
     fn saw_captions(&mut self, count: u64, now: Moment) {
-        if self.recording_since.is_none() || self.problem.is_some() {
-            self.recording_since = Some(now.timestamp);
-        }
         self.caption_count = self.caption_count.max(count);
         self.last_caption = Some(now);
     }
 
-    // How long the call has gone without a caption.
-    fn quiet_for(&self, now: Moment) -> Duration {
-        let since = self.last_caption.map_or(self.waiting_since, |caption| {
-            caption.instant.max(self.waiting_since)
-        });
-        now.instant.saturating_duration_since(since)
-    }
-
-    fn current_problem(&self, now: Moment) -> Option<ProblemReason> {
-        if self.is_stopped_by_user {
-            return None;
-        }
-        let quiet_for = self.quiet_for(now);
-        match &self.signals {
-            Signals::Meet(meet) => {
-                if !meet.is_port_held {
-                    return Some(ProblemReason::ExtensionDisconnected);
-                }
-                if quiet_for < CAPTION_STALL {
-                    return None;
-                }
-                if meet.is_pages_away {
-                    return Some(ProblemReason::MeetPageAway);
-                }
-                // mc-meet hides captions once a caption arrived on its own channels, which keep
-                // streaming. Only then is "off" no cause. mc-meet reports the channel source
-                // only after a caption on the channels the page has now.
-                let is_off_a_cause = meet.caption_source != Some(HealthSource::Channel);
-                // The DOM reader does not need the frames.
-                let is_frames_failing = meet.is_caption_frames_failing
-                    && meet.caption_source != Some(HealthSource::Dom);
-                // Meet's button can read "unavailable" while mc-meet's channels keep streaming
-                // captions, so it is a cause only when the channel is not the source.
-                match meet.captions {
-                    MeetCaptions::Unavailable if is_off_a_cause => {
-                        Some(ProblemReason::MeetCaptionsUnavailable)
-                    }
-                    MeetCaptions::On | MeetCaptions::Off | MeetCaptions::Unavailable
-                        if is_frames_failing =>
-                    {
-                        Some(ProblemReason::CaptionParseFailures)
-                    }
-                    MeetCaptions::Off if is_off_a_cause => Some(ProblemReason::CaptionsOff),
-                    MeetCaptions::On | MeetCaptions::Off | MeetCaptions::Unavailable => {
-                        (quiet_for >= SILENCE_LIMIT).then_some(ProblemReason::CaptionsSilent)
-                    }
-                }
-            }
-            Signals::Huddle(huddle) => match huddle.health {
-                Some(HuddleHealth::CaptionsOff) => Some(ProblemReason::CaptionsOff),
-                Some(HuddleHealth::Broken) => Some(ProblemReason::HuddleCaptionsUnreadable),
-                Some(HuddleHealth::Healthy | HuddleHealth::Degraded) => {
-                    (quiet_for >= SILENCE_LIMIT).then_some(ProblemReason::CaptionsSilent)
-                }
-                // No verdict on the window yet, or a Slack version no profile was tested on.
-                Some(HuddleHealth::Untested) | None => {
-                    (quiet_for >= SILENCE_LIMIT).then_some(ProblemReason::NoCaptions)
-                }
-            },
+    fn captions_line(&self) -> CaptionsLine {
+        CaptionsLine {
+            call_id: self.id.clone(),
+            platform: self.platform,
+            caption_count: self.caption_count,
+            last_at: self.last_caption.map(|caption| caption.timestamp),
+            is_backlog: false,
         }
     }
 
-    fn state(&self) -> CallState {
-        match &self.problem {
-            _ if self.is_stopped_by_user => CallState::Stopped,
-            Some(problem) => CallState::Problem(problem.reason),
-            None if self.has_caption_since_wait() => CallState::Recording,
-            None => CallState::Waiting,
-        }
-    }
-
-    /// Moves the call to its state at `now`. Returns a problem that started, and adds what to
-    /// announce to `announcements`.
-    fn settle(
-        &mut self,
-        now: Moment,
-        is_extension_connected: bool,
-        announcements: &mut Vec<Announced>,
-    ) -> Option<ProblemStart> {
-        let current = self.current_problem(now);
-        let mut start = None;
-        let mut wanted = None;
-        match (&mut self.problem, current) {
-            (None, None) => {}
-            (Some(problem), Some(reason)) if problem.reason == reason => {
-                let has_lasted =
-                    now.instant.saturating_duration_since(problem.since) >= PROBLEM_NOTICE_AFTER;
-                if has_lasted
-                    && !problem.is_announced
-                    && reason.deserves_notice(is_extension_connected)
-                {
-                    problem.is_announced = true;
-                    self.notices.recovery_owed_since = Some(now.instant);
-                    if self.notices.outage_reasons.insert(reason) {
-                        wanted = Some(Announcement::NotRecording(reason));
-                    }
-                }
-            }
-            (problem, Some(reason)) => {
-                let is_first = self.problems.is_empty();
-                let since = problem
-                    .as_ref()
-                    .map_or(now.instant, |problem| problem.since);
-                *problem = Some(ActiveProblem {
-                    reason,
-                    since,
-                    is_announced: false,
-                });
-                self.problems.push_back(ProblemRecord {
-                    reason,
-                    at: now.timestamp,
-                });
-                if self.problems.len() > KEPT_PROBLEMS {
-                    self.problems.pop_front();
-                }
-                tracing::warn!(
-                    event.name = "call.problem",
-                    call.id = %self.id.display(),
-                    call.platform = self.platform.as_str(),
-                    error.type = reason.code(),
-                    "call not recording: {}",
-                    reason.describe()
-                );
-                start = Some(ProblemStart {
-                    call_id: self.id.clone(),
-                    platform: self.platform,
-                    is_first,
-                });
-            }
-            (problem @ Some(_), None) => {
-                *problem = None;
-                tracing::info!(
-                    event.name = "call.recovered",
-                    call.id = %self.id.display(),
-                    call.platform = self.platform.as_str(),
-                    "call problem cleared"
-                );
-            }
-        }
-        if self.state() == CallState::Recording {
-            // The first "Recording" also tells of a recovery from a problem before it.
-            let is_recovered = self
-                .notices
-                .recovery_owed_since
-                .zip(self.last_caption)
-                .is_some_and(|(owed_since, caption)| caption.instant > owed_since);
-            if !self.notices.is_recording_announced {
-                self.notices.is_recording_announced = true;
-                self.end_outage();
-                wanted = Some(Announcement::Recording);
-            } else if is_recovered {
-                self.end_outage();
-                wanted = Some(Announcement::RecordingAgain);
-            }
-        }
-        if let Some(announcement) = wanted {
-            announcements.push(self.announced(announcement));
-        }
-        start
-    }
-
-    // A later outage, even with the same reason, is announced again. `PROBLEM_NOTICE_AFTER`
-    // keeps short flaps quiet.
-    fn end_outage(&mut self) {
-        self.notices.outage_reasons.clear();
-        self.notices.recovery_owed_since = None;
-    }
-
-    fn view(&self, now: Moment) -> CallView {
-        let (caption_source, huddle_health) = match &self.signals {
-            Signals::Meet(meet) => (meet.caption_source, None),
-            Signals::Huddle(huddle) => (None, huddle.health),
+    /// Adds the call's due `call.captions` lines: a reopened log's backlog at once, then a
+    /// rise in the count or a later last caption once per `CAPTION_LINE_INTERVAL`, or at once
+    /// while the call waits for a caption or has a problem. A revised caption counts: a long
+    /// huddle line revised for minutes is captions arriving.
+    fn take_caption_lines(&mut self, now: Moment, lines: &mut Vec<CaptionsLine>) {
+        let is_awaiting_captions = match self.caption_state {
+            CaptionState::Waiting | CaptionState::Problem(_) => true,
+            CaptionState::Recording | CaptionState::Stopped => false,
         };
+        if let Some(backlog_count) = self.caption_lines.pending_backlog_count.take() {
+            lines.push(CaptionsLine {
+                caption_count: backlog_count,
+                last_at: None,
+                is_backlog: true,
+                ..self.captions_line()
+            });
+            self.caption_lines.logged_count = self.caption_lines.logged_count.max(backlog_count);
+            self.caption_lines.logged_at = Some(now.instant);
+        }
+        let is_interval_over = self
+            .caption_lines
+            .logged_at
+            .is_none_or(|at| now.instant.saturating_duration_since(at) >= CAPTION_LINE_INTERVAL);
+        let is_due =
+            is_interval_over || is_awaiting_captions || self.caption_lines.was_awaiting_captions;
+        let last_caption_at = self.last_caption.map(|caption| caption.timestamp);
+        let has_new_captions = self.caption_count > self.caption_lines.logged_count
+            || last_caption_at > self.caption_lines.logged_last_caption_at;
+        if has_new_captions && is_due {
+            lines.push(self.captions_line());
+            self.caption_lines.logged_count = self.caption_count;
+            self.caption_lines.logged_last_caption_at = last_caption_at;
+            self.caption_lines.logged_at = Some(now.instant);
+        }
+        self.caption_lines.was_awaiting_captions = is_awaiting_captions;
+    }
+
+    /// The `call.captions` line the call still owes at its end.
+    fn take_final_caption_line(&mut self, now: Moment) -> Option<CaptionsLine> {
+        let mut lines = Vec::new();
+        self.caption_lines.logged_at = None;
+        self.take_caption_lines(now, &mut lines);
+        // A backlog line, if any, comes first; the count line covers it.
+        lines.pop()
+    }
+
+    fn state(&self, snapshot: Option<&CallSnapshot>) -> CallState {
+        if self.is_stopped_by_user {
+            return CallState::Stopped;
+        }
+        // Until the detectors read the call's first line, it waits.
+        match snapshot.map_or(CaptionState::Waiting, |snapshot| snapshot.caption_state) {
+            CaptionState::Waiting => CallState::Waiting,
+            CaptionState::Recording => CallState::Recording,
+            CaptionState::Problem(problem) => CallState::Problem(problem),
+            CaptionState::Stopped => CallState::Stopped,
+        }
+    }
+
+    fn view(&self, snapshot: Option<&CallSnapshot>, now: Moment) -> CallView {
+        let caption_source = snapshot
+            .and_then(|snapshot| snapshot.caption_source)
+            .map(|source| match source {
+                CaptionSource::Channel => HealthSource::Channel,
+                CaptionSource::Dom => HealthSource::Dom,
+                CaptionSource::None => HealthSource::None,
+            });
+        let huddle_health = snapshot
+            .and_then(|snapshot| snapshot.huddle_health)
+            .map(|health| match health {
+                detectors::HuddleHealth::Healthy => HuddleHealth::Healthy,
+                detectors::HuddleHealth::Degraded => HuddleHealth::Degraded,
+                detectors::HuddleHealth::CaptionsOff => HuddleHealth::CaptionsOff,
+                detectors::HuddleHealth::Broken => HuddleHealth::Broken,
+                detectors::HuddleHealth::Untested => HuddleHealth::Untested,
+            });
         CallView {
             id: self.id.clone(),
             platform: self.platform,
             title: self.title.clone(),
-            state: self.state(),
+            state: self.state(snapshot),
             started_at: self.started_at,
-            recording_since: self.recording_since,
+            recording_since: snapshot.and_then(|snapshot| snapshot.recording_since),
             caption_count: self.caption_count,
             last_caption_at: self.last_caption.map(|caption| caption.timestamp),
             last_caption_age: self
@@ -957,48 +884,121 @@ impl TrackedCall {
                 .map(|caption| now.instant.saturating_duration_since(caption.instant)),
             caption_source,
             huddle_health,
-            problems: self.problems.iter().copied().collect(),
+            problems: snapshot
+                .map_or_else(Vec::new, |snapshot| caption_problems(&snapshot.history)),
+            capture_problems: snapshot
+                .map_or_else(Vec::new, |snapshot| snapshot.capture_problems.clone()),
         }
     }
 
-    fn describe(&self, ended_at: Option<Timestamp>, now: Moment) -> serde_json::Value {
-        let state = match (ended_at, self.state()) {
+    fn describe(
+        &self,
+        snapshot: Option<&CallSnapshot>,
+        ended_at: Option<Timestamp>,
+        now: Moment,
+    ) -> serde_json::Value {
+        let state = self.state(snapshot);
+        let state_code = match (ended_at, state) {
             (Some(_), _) => "ended",
             (None, CallState::Waiting) => "waiting",
             (None, CallState::Recording) => "recording",
             (None, CallState::Problem(_)) => "problem",
             (None, CallState::Stopped) => "stopped",
         };
-        let reason = match self.state() {
-            CallState::Problem(reason) if ended_at.is_none() => Some(reason.code()),
+        let reason = match state {
+            CallState::Problem(problem) if ended_at.is_none() => Some(problem.code()),
             CallState::Problem(_)
             | CallState::Waiting
             | CallState::Recording
             | CallState::Stopped => None,
         };
+        let history = snapshot.map_or(&[][..], |snapshot| snapshot.history.as_slice());
+        let failing_layer =
+            detectors::verdict(history, ended_at.unwrap_or(now.timestamp)).map(|verdict| {
+                serde_json::json!({
+                    "layer": verdict.layer.code(),
+                    "problem": verdict.problem.code(),
+                    "raised_at": verdict.raised_at,
+                    "duration_s": verdict.duration.as_secs(),
+                    "is_noticed": verdict.is_noticed,
+                })
+            });
+        let capture_problems: Vec<&str> = snapshot.map_or_else(Vec::new, |snapshot| {
+            snapshot
+                .capture_problems
+                .iter()
+                .map(|open| open.problem.code())
+                .collect()
+        });
         serde_json::json!({
             "call_id": self.id,
             "platform": self.platform.as_str(),
-            "state": state,
+            "trace_id": self.trace.0,
+            "state": state_code,
             "reason": reason,
             "started_at": self.started_at,
             "ended_at": ended_at,
-            "recording_since": self.recording_since,
+            "recording_since": snapshot.and_then(|snapshot| snapshot.recording_since),
             "caption_count": self.caption_count,
             "last_caption_at": self.last_caption.map(|caption| caption.timestamp),
-            "problems": self.problems,
+            "problems": caption_problems(history)
+                .iter()
+                .map(|record| serde_json::json!({ "reason": record.problem.code(), "at": record.at }))
+                .collect::<Vec<_>>(),
+            "capture_problems": capture_problems,
+            "problem_history": history.iter().map(SpanRecord::of).collect::<Vec<_>>(),
+            "failing_layer": failing_layer,
             "described_at": now.timestamp,
         })
     }
 }
 
+/// The last caption problems, oldest first, as mc-meet shows them.
+fn caption_problems(history: &[ProblemSpan]) -> Vec<ProblemRecord> {
+    let records: Vec<ProblemRecord> = history
+        .iter()
+        .filter(|span| !span.problem.layer().is_capture())
+        .map(|span| ProblemRecord {
+            problem: span.problem,
+            at: span.raised_at,
+        })
+        .collect();
+    let skipped = records.len().saturating_sub(KEPT_PROBLEMS);
+    records.into_iter().skip(skipped).collect()
+}
+
+/// One problem span as a debug report shows it.
+#[derive(Serialize)]
+struct SpanRecord {
+    code: &'static str,
+    layer: &'static str,
+    detector: &'static str,
+    raised_at: Timestamp,
+    noticed_at: Option<Timestamp>,
+    cleared_at: Option<Timestamp>,
+}
+
+impl SpanRecord {
+    fn of(span: &ProblemSpan) -> Self {
+        Self {
+            code: span.problem.code(),
+            layer: span.problem.layer().code(),
+            detector: span.detector.code(),
+            raised_at: span.raised_at,
+            noticed_at: span.noticed_at,
+            cleared_at: span.cleared_at,
+        }
+    }
+}
+
 impl EndedCall {
-    fn view(&self) -> EndedCallView {
+    fn view(&self, snapshot: Option<&CallSnapshot>) -> EndedCallView {
         let call = &self.call;
-        let outcome = match (call.caption_count, call.problems.is_empty()) {
+        let has_problems = snapshot.is_some_and(|snapshot| !snapshot.history.is_empty());
+        let outcome = match (call.caption_count, has_problems) {
             (0, _) => CallOutcome::NoTranscript,
-            (_, true) => CallOutcome::Recorded,
-            (_, false) => CallOutcome::RecordedWithProblems,
+            (_, false) => CallOutcome::Recorded,
+            (_, true) => CallOutcome::RecordedWithProblems,
         };
         EndedCallView {
             id: call.id.clone(),
@@ -1044,12 +1044,40 @@ impl CallView {
                 "{name}: recording since {}, {captions}{source_note}",
                 clock(self.recording_since.unwrap_or(self.started_at), time_zone)
             ),
-            CallState::Problem(reason) => {
-                format!("{name}: not recording, {}; {captions}", reason.describe())
+            CallState::Problem(problem) => {
+                format!("{name}: not recording, {}; {captions}", problem.describe())
             }
             CallState::Stopped => format!("{name}: recording stopped by you; {captions}"),
         }
     }
+
+    /// One tray row per capture problem, such as "Audio problem: your mic is lost, since 10:35
+    /// IST".
+    pub(crate) fn capture_problem_lines(&self, time_zone: &TimeZone) -> Vec<String> {
+        self.capture_problems
+            .iter()
+            .map(|open| {
+                format!(
+                    "{}: {}, since {}",
+                    capture_heading(open.problem),
+                    open.problem.describe(),
+                    clock(open.since, time_zone)
+                )
+            })
+            .collect()
+    }
+}
+
+fn capture_medium(problem: Problem) -> &'static str {
+    if problem.layer().is_audio() {
+        "Audio"
+    } else {
+        "Video"
+    }
+}
+
+fn capture_heading(problem: Problem) -> String {
+    format!("{} problem", capture_medium(problem))
 }
 
 impl EndedCallView {
@@ -1182,24 +1210,26 @@ fn log_host_suspended(last: Moment, now: Moment) {
 
 fn report_problem_start(app: &AppHandle, start: &ProblemStart) {
     let state = app.state::<AppState>();
-    // Every platform: the recorders hold what the call's own log does not.
+    // Every platform and layer: the recorders hold what the call's own log does not.
     crate::call_debug::dump_recorder_in_background(
         app,
         start.call_id.clone(),
         telemetry::DumpReason::CallProblem,
     );
     state.call_capture.request_recorder_dumps(&start.call_id);
-    match start.platform {
-        CallPlatform::Meet => {
-            if start.is_first {
-                state.call_debug.write_lead_up(&start.call_id);
-            }
-            if state.call_debug.take_snapshot_turn(&start.call_id) {
-                state.browser_calls.request_page_snapshot(&start.call_id);
-            }
+    // The lead-up and the page snapshot show what the Meet page did about captions. The huddle
+    // log already holds every health change the watcher saw.
+    let is_meet_caption_problem = match start.platform {
+        CallPlatform::Meet => !start.problem.layer().is_capture(),
+        CallPlatform::SlackHuddle => false,
+    };
+    if is_meet_caption_problem {
+        if start.is_first_caption_problem {
+            state.call_debug.write_lead_up(&start.call_id);
         }
-        // The huddle log already holds every health change the watcher saw.
-        CallPlatform::SlackHuddle => {}
+        if state.call_debug.take_snapshot_turn(&start.call_id) {
+            state.browser_calls.request_page_snapshot(&start.call_id);
+        }
     }
 }
 
@@ -1209,25 +1239,40 @@ fn announce(app: &AppHandle, announced: &Announced) {
         CallPlatform::Meet => "the Meet call",
         CallPlatform::SlackHuddle => "the Slack huddle",
     };
-    let (heading, body) = match announced.announcement {
-        Announcement::Recording => (
+    let (heading, body) = match announced.notice {
+        Notice::Recording => (
             format!("Recording {name}"),
             format!("Captions arrive from {source}."),
         ),
-        Announcement::NotRecording(reason) => (
+        Notice::NotRecording(problem) => (
             format!("Not recording {name}"),
-            capitalise(reason.describe()),
+            capitalise(problem.describe()),
         ),
-        Announcement::RecordingAgain => (
+        Notice::RecordingAgain => (
             format!("Recording again {name}"),
             format!("Captions arrive from {source} again."),
         ),
-        Announcement::NoTranscript => (
+        Notice::NoTranscript => (
             format!("No transcript captured for {name}"),
             "The call ended with no caption. \"Save debug report\" in the tray keeps what \
              happened."
                 .to_owned(),
         ),
+        Notice::CaptureTrouble(problem) => (
+            format!("{} in {name}", capture_heading(problem)),
+            format!(
+                "{}. Captions still record. \"Save debug report\" in the tray keeps what \
+                 happened.",
+                capitalise(problem.describe())
+            ),
+        ),
+        Notice::CaptureBack(problem) => {
+            let medium = capture_medium(problem);
+            (
+                format!("{medium} back in {name}"),
+                format!("{medium} records again."),
+            )
+        }
     };
     crate::notify(app, &heading, &body);
 }

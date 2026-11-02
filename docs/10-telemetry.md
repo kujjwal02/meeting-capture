@@ -4,8 +4,7 @@ Every Rust process logs through one `telemetry` crate. The goal: one saved debug
 enough evidence to name the failing layer, with no second call to reproduce the bug. Nothing
 leaves the machine.
 
-Roadmap phase 3d runs in six steps. Steps 1 to 4 are built. Steps 5 and 6 are planned and
-marked as such below.
+Roadmap phase 3d runs in six steps. Steps 1 to 4 and step 6 are built. Step 5 is planned.
 
 | Step | Delivers | State |
 |---|---|---|
@@ -14,7 +13,7 @@ marked as such below.
 | 3. Metrics and environment | Gauges every 10 s, or every 1 s in a call: audio levels and routes, caption channel series, video fps, host CPU, memory, disk and power, pipeline decisions. `env.jsonl` with devices, permissions and versions | Built |
 | 4. Report and tools | A report bundle for a call with its job, for a meeting without a call, or for the last 30 minutes. `mc debug timeline` and `mc debug export-otlp` | Built |
 | 5. The 0.8.0 caption bug | One call in debug mode on the caption bug. It checks for missing acks on Meet's channel, captions hidden in `control` frames, and throttling in hidden-box mode | Planned |
-| 6. Detectors | One trait for every invariant over metrics and events. A firing raises a named problem and dumps every recorder. `mc debug replay` runs them over a saved bundle | Planned |
+| 6. Detectors | One trait for every invariant over metrics and events. A firing raises a named problem and dumps every recorder. `mc debug replay` runs them over a saved bundle | Built |
 
 ## Processes
 
@@ -137,8 +136,8 @@ the constants. Values are closed codes, never free text.
 | `event.name` | Fields | Logged |
 |---|---|---|
 | `call.started`, `call.resumed`, `call.ended` | `call.id`, `call.platform`, `call.title` | When a call opens, reopens or ends |
-| `call.recording_stopped`, `call.recording_resumed` | `call.id` | When the user stops or resumes recording a call |
-| `call.captions` | `call.id`, `call.platform`, `call.caption_count`, `mc.caption.last_at`, `mc.caption.is_backlog` | At a board tick, when the call's caption count rose since its last `call.captions` line |
+| `call.recording_stopped`, `call.recording_resumed` | `call.id` | When the user stops or resumes recording a call, and just before `call.started` or `call.resumed` when the call's log holds a stop or resume the detectors have not heard |
+| `call.captions` | `call.id`, `call.platform`, `call.caption_count`, `mc.caption.last_at`, `mc.caption.is_backlog` | At a board tick, when the call's caption count rose or its last caption moved on since its last `call.captions` line |
 | `meet.health` | `call.id`, `mc.meet.captions` (`on`, `off`, `unavailable`), `mc.meet.caption_source` (`channel`, `dom`, `none`), `mc.meet.is_caption_frames_failing` | When a Meet health report differs from the call's last one |
 | `meet.port_held` | `call.id`, `mc.meet.is_port_held` | When an mc-meet port starts or stops holding the call |
 | `meet.pages_away` | `call.id`, `mc.meet.is_pages_away` | When every Meet tab of the call goes away, or one comes back |
@@ -147,9 +146,12 @@ the constants. Values are closed codes, never free text.
 | `huddle.permission` | `mc.huddle.is_permission_missing` | When the Accessibility permission for huddles goes missing or comes back |
 | `call.tab_video_recorded` | `call.id` | When the call's Meet tab video writes its first fragment |
 | `host.suspended` | `mc.host.suspended_ms` | When the wall clock moved over 5 s more than the monotonic clock between two board ticks |
-| `capture.audio.*` | The report's fields, with `audio.stream` where a stem applies | For each audio helper report: `recording`, `gap`, `rotated`, `segment_closed`, `device_changed`, `mic_unavailable`, `permission`, `sleep`, `wake`, `error` |
-| `capture.video.*` | The report's fields | For each video helper report: `recording`, `gap`, `window_changed`, `permission`, `segment_closed`, `error` |
+| `capture.audio.*` | The report's fields, with `audio.stream` where a stem applies | For each audio helper report: `recording`, `gap`, `rotated`, `segment_closed`, `device_changed`, `mic_unavailable`, `permission`, `sleep`, `wake`, `error`, `stream_lost` |
+| `capture.video.*` | The report's fields | For each video helper report: `recording`, `gap`, `window_changed`, `permission`, `segment_closed`, `error`, `stream_lost` |
 | `capture.process_failed` | `call.id`, `mc.capture.helper` (`audio`, `video`), `error.type`, `exception.message`, the restart fields | When a capture helper exits, hangs or does not start |
+| `call.problem` | `call.id`, `call.platform`, `error.type`, `mc.problem.layer`, `mc.problem.detector`, `mc.problem.evidence`, `mc.problem.evidence_at` | WARN, when a detector raises a problem or its problem changes |
+| `call.recovered` | `call.id`, `call.platform`, `error.type`, `mc.problem.layer` | When a detector's problem clears or changes |
+| `call.problem_noticed` | `call.id`, `error.type`, `mc.problem.layer` | When a problem's notification goes out |
 
 The on-change lines are INFO. Each keeps its last value per call. A line with no call keeps one
 last value for the app. `capture_protocol::report_lines` turns a helper report into its line, so
@@ -157,13 +159,76 @@ every process that reads reports logs them the same way. Helper heartbeats stay 
 `event.name`: detectors read the level rows instead.
 
 The board logs `call.captions` at most once per 5 s per call. It logs one at once when the call
-waited for its first caption or had a problem. `call.caption_count` counts distinct Meet caption
+waited for its first caption or had a problem. A revised caption moves `mc.caption.last_at` and
+not the count, and also gets a line. `call.caption_count` counts distinct Meet caption
 lines, or the lines a huddle log holds. `mc.caption.last_at` is when the latest caption reached
 the app. A reopened log's earlier captions log one line with `mc.caption.is_backlog` true and no
 `mc.caption.last_at`.
 
 `extension.connection` and `host.suspended` belong to no call. A call's report keeps them when
 they fall in the call's time span.
+
+## Detectors
+
+The `detectors` crate holds every rule that judges a call. Each rule is a `Detector`: it takes
+the call's event lines and metric rows in time order and says which problem it sees now. The
+crate reads only parsed lines, so the same rules run live in the app and over a saved bundle.
+
+A call has one detector per layer: Meet captions or huddle captions, mic, remote audio, audio
+helper and video. Each detector holds at most one problem. A host keys calls by trace id, so a
+report with no text still replays. The host steps time on line timestamps and on each detector's
+next deadline, so a firing's time is its deadline, not the tick that saw it. A
+`host.suspended` span does not count towards any duration. The host learns every
+`host.suspended` span of a batch before the batch's lines step time. While the user stops a call, no
+detector raises a problem. While the Mac sleeps, no capture detector raises one.
+
+Live, the telemetry tap hands the detector lines and call metric rows to a queue of 2048 lines.
+The status board drains it once a second, sorts the lines by time, feeds the host and advances
+it to the wall clock. A full queue drops lines and logs the count once per tick.
+
+### Problems
+
+| Layer | Code | Problems |
+|---|---|---|
+| Audio helper | `audio_helper` | `audio_helper_down`, `audio_not_resumed` |
+| Video | `video` | `screen_recording_refused`, `video_helper_down`, `video_stream_lost` |
+| Remote audio | `audio_remote` | `audio_capture_permission_refused`, `remote_lost`, `remote_digital_silence` |
+| Mic | `audio_mic` | `mic_permission_refused`, `mic_lost`, `mic_digital_silence` |
+| Extension | `extension` | `extension_disconnected` |
+| Meet page | `meet_page` | `meet_page_away` |
+| Meet captions | `meet_captions` | `captions_off`, `meet_captions_unavailable` |
+| Caption decoder | `caption_decoder` | `caption_parse_failures` |
+| Huddle reader | `huddle_reader` | `captions_off`, `huddle_captions_unreadable` |
+| Captions, cause unknown | `captions` | `captions_silent`, `no_captions` |
+
+The table runs from the deepest layer to the shallowest. A Meet caption problem other than a
+disconnect counts after 20 s with no caption. `captions_silent` and `no_captions` count after
+2 minutes. `mic_digital_silence` counts after 10 s of mic peaks at -120 dBFS.
+`remote_digital_silence` counts after 60 s of remote peaks at -120 dBFS while the user spoke for
+at least 10 s of them. `remote_lost` counts at once for a stalled, stale or dead tap, and after
+5 s for a format or rate change. `audio_not_resumed` counts 20 s after a wake with no new
+segment. `audio_helper_down` and `video_helper_down` clear when the helper records again. When
+the failure's `capture.is_failing` is true, they clear only after the helper records for 60 s
+with no failure, so a crash loop lasts long enough to notify.
+
+A problem that lasts 30 s gets one notification per outage. A closed Meet tab gets none, and a
+disconnect gets one only while another mc-meet port is connected.
+
+A capture outage ends when its detector shows no problem while the Mac is awake. Its end sends
+"Audio back" or "Video back", unless the user stopped the call. A sleep hides capture problems
+but does not end their outage.
+
+A raise dumps every recorder of the call. One detector dumps at most once a minute per call. A
+Meet caption problem also writes the lead-up at the call's first caption problem and asks for a page
+snapshot.
+
+### The failing layer
+
+A call's verdict names one failing layer from its problem history. Overlapping problems form
+one episode: one fault and the symptoms it caused. The worst episode is a notified one before
+one that was not, then the longest. Its first problem names the layer. Problems raised at the
+same time go to the deeper layer, since its fault explains the symptoms above it. The debug
+report's `call-status.json` holds the history and the verdict, and `mc debug replay` prints both.
 
 ## Flight recorder
 

@@ -142,9 +142,9 @@ Progress is tracked in the [checklist](05-checklist.md).
   segment in `audio.json`, `video.json` or a `NNN-` file name.
 - If the helper exits, the app restarts it after 1, 2 and then 4 s. A restart takes the next
   segment number only when the failed run left files. A rotation moves the number on too.
-- After 3 failures in 60 s the tray shows "Recording failed" and one notification. Restarts then
-  wait 30 s, or 5 minutes when a device would not open. The notification comes again only after a
-  recording starts or the failures drop below 3 in 60 s.
+- After 3 failures in 60 s restarts wait 30 s, or 5 minutes when a device would not open. Each
+  failure logs `capture.process_failed`, which raises `audio_helper_down` or
+  `video_helper_down` on the status board until the helper records again.
 - The app kills a hung helper. A helper is hung when for 15 s no heartbeat counter grows and
   neither stem file grows.
 - To stop, the app sends `stop`, closes stdin and waits 12 s before it kills the helper. The
