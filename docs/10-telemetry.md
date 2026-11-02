@@ -205,6 +205,7 @@ that closes joins its sampler on a blocking thread, off the async runtime.
 | Metric | Unit | Attributes | Source |
 |---|---|---|---|
 | `mc.audio.level.rms`, `mc.audio.level.peak` | dBFS | `mc.audio.stem`: `mic` or `remote` | The audio helper's heartbeat, one row per heartbeat |
+| `mc.audio.self_speaking` | 1 | None | The app, from the mic level in each heartbeat: 1 when the user spoke in that second, else 0 |
 | `mc.video.frames` | {frame} | `mc.video.frame.kind`: `encoded` (new frames) or `repeated` | The window video helper's heartbeat |
 | `process.cpu.utilization` | 1 | `service.name`, and `process.command` for a helper | The app, every 10 s, from a process's second sample on |
 | `process.memory.usage` | By | The same | The app, every 10 s |
@@ -243,6 +244,25 @@ A 1 s heartbeat costs one line of about 250 bytes a second on the helper's pipe.
 heartbeat with an array of five levels would save four small writes a second. The app would then
 need a second write path that back-dates rows, and levels would arrive 5 s late. The video
 helper's heartbeat comes every 1 s too.
+
+### The user's speech
+
+The app decides from the mic stem's RMS whether the user spoke in each heartbeat second. It
+writes the answer as the gauge `mc.audio.self_speaking`, 1 or 0, in the same row as the levels.
+A gauge needs no baseline, so the timeline sums a minute's speech as the gauge times the row's
+interval. The rule reads only the mic stem, so it works the same for Meet calls and Slack huddles.
+
+The app tracks the mic's noise floor per call. The floor drops at once to any lower second and
+otherwise climbs 0.05 dB a second, 3 dB a minute. A minute of steady speech then cannot lift the
+floor to the voice, and a room that gets louder still raises the floor. A new mic stream, a mic
+change or a lost mic starts a new floor. Digital silence, the filler in a gap, moves no floor and
+counts as no speech.
+
+A second is speech when its RMS is more than 8 dB over the floor. In saved calls, a 34-minute
+Meet call where the user mostly listened had 95% of its seconds within 6.7 dB of the floor. A call
+where the user talked had half its seconds 19 dB or more above the floor. There is no voice
+detection model. Remote speech that the mic hears from the speakers counts as the user's speech.
+The rule reads the room, not Meet's mute button, so speech while muted counts too.
 
 ### Environment rows
 
@@ -360,12 +380,12 @@ lines match on session, mc-meet's time, name and attributes.
 | Command | Prints |
 |---|---|
 | `mc debug timeline <bundle>` | One row per line in IST: time, service, severity, then the body, a metric summary or the environment |
-| `mc debug timeline <bundle> --by-minute` | One row per minute: speech seconds from `mc.meet.self_speaking`, mean mic and remote dBFS over power, new caption frames by kind and acks per caption channel, caption presses, problems. A channel is named by owner, label and id, such as `own captions_v2#6` or `meet captions_v2#125`, and is left out of a minute it counted nothing in. Flags a minute with over 20 s of speech and no parsed frame |
+| `mc debug timeline <bundle> --by-minute` | One row per minute: speech seconds from `mc.audio.self_speaking`, mean mic and remote dBFS over power, new caption frames by kind and acks per caption channel, caption presses, problems. A channel is named by owner, label and id, such as `own captions_v2#6` or `meet captions_v2#125`, and is left out of a minute it counted nothing in. Flags a minute with over 20 s of speech and no parsed frame |
 | `mc debug timeline <bundle> --service <name>` | Only that service's lines, such as `app`, `mc-capture` or `mc-meet` |
 | `mc debug export-otlp <bundle> --out <file>` | OTLP/JSON for a Collector's `otlpjsonfile` receiver |
 
-No source writes `mc.meet.self_speaking` yet: Meet's speaking indicator has nothing stable to
-read. The speech column then shows `-` and no minute is flagged.
+A bundle with no `mc.audio.self_speaking` point in a minute, such as one saved before the app
+wrote it, shows `-` in that minute's speech column and flags nothing.
 
 A counter's first row in the bundle is its baseline, so a counter that started before the
 bundle adds nothing in that minute. A counter whose `start_timestamp` falls inside the bundle,
