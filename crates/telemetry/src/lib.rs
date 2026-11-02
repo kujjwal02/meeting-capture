@@ -19,6 +19,7 @@
 
 pub mod debug_mode;
 pub mod env;
+pub mod events;
 pub mod fields;
 mod init;
 mod line;

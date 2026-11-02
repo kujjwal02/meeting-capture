@@ -267,6 +267,17 @@ pub enum HealthSource {
     None,
 }
 
+impl HealthSource {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Channel => "channel",
+            Self::Dom => "dom",
+            Self::None => "none",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndReason {

@@ -28,6 +28,12 @@ const SILENCE_LIMIT: Duration = Duration::from_mins(2);
 /// A problem that lasts this long gets a notification. Shorter ones are reconnects and pauses.
 const PROBLEM_NOTICE_AFTER: Duration = Duration::from_secs(30);
 const KEPT_PROBLEMS: usize = 3;
+/// A call whose caption count rose logs `call.captions` at most this often, unless it waits for
+/// a caption or has a problem.
+const CAPTION_LINE_INTERVAL: Duration = Duration::from_secs(5);
+/// A wall clock that moves this much more than the monotonic clock between two ticks means the
+/// host was suspended.
+const SUSPEND_LIMIT: Duration = Duration::from_secs(5);
 const RECENT_CALLS: usize = 5;
 
 /// Why a call is not recording. One closed list for Meet and Slack huddles.
@@ -133,6 +139,16 @@ pub(crate) enum MeetCaptions {
     Off,
     /// Meet refuses captions: the button is disabled or says they are unavailable.
     Unavailable,
+}
+
+impl MeetCaptions {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::On => "on",
+            Self::Off => "off",
+            Self::Unavailable => "unavailable",
+        }
+    }
 }
 
 /// One fact a source reports about an open call.
@@ -336,6 +352,44 @@ struct TrackedCall {
     is_stopped_by_user: bool,
     /// The Meet tab video wrote a fragment. A rejoin keeps it.
     is_tab_video_recorded: bool,
+    caption_lines: CaptionLines,
+}
+
+/// What the call's `call.captions` lines said so far, so a line goes out only when the count
+/// rose.
+#[derive(Default)]
+struct CaptionLines {
+    logged_count: u64,
+    logged_at: Option<Instant>,
+    /// The call waited for a caption or had a problem at the last tick, so a rise logs at once.
+    /// The first caption ends the wait before the tick sees it.
+    was_awaiting_captions: bool,
+    /// The caption count of a reopened log's backlog, not logged yet.
+    pending_backlog_count: Option<u64>,
+}
+
+/// One `call.captions` line, logged after the board lock is released.
+struct CaptionsLine {
+    call_id: PathBuf,
+    platform: CallPlatform,
+    caption_count: u64,
+    /// `None` for a backlog line: it says nothing about whether captions arrive now.
+    last_at: Option<Timestamp>,
+    is_backlog: bool,
+}
+
+impl CaptionsLine {
+    fn log(&self) {
+        tracing::info!(
+            event.name = "call.captions",
+            call.id = %self.call_id.display(),
+            call.platform = self.platform.as_str(),
+            call.caption_count = self.caption_count,
+            mc.caption.last_at = self.last_at.map(|at| at.to_string()),
+            mc.caption.is_backlog = self.is_backlog,
+            "call captions counted"
+        );
+    }
 }
 
 /// What the call announced, so each notification goes out once, even when a state flips back
@@ -486,23 +540,32 @@ impl CallBoard {
         self.lock().is_extension_connected = is_connected;
     }
 
-    /// Works out every open call's state at `now` and returns what to announce.
+    /// Works out every open call's state at `now` and returns what to announce. Logs each
+    /// call's `call.captions` line that is due.
     pub(crate) fn tick(&self, now: Moment) -> Tick {
-        let mut board = self.lock();
-        let board = &mut *board;
-        let mut problem_starts = Vec::new();
-        for call in board.open.values_mut() {
-            problem_starts.extend(call.settle(
-                now,
-                board.is_extension_connected,
-                &mut board.pending,
-            ));
+        let mut caption_lines = Vec::new();
+        let tick = {
+            let mut board = self.lock();
+            let board = &mut *board;
+            let mut problem_starts = Vec::new();
+            for call in board.open.values_mut() {
+                problem_starts.extend(call.settle(
+                    now,
+                    board.is_extension_connected,
+                    &mut board.pending,
+                ));
+                call.take_caption_lines(now, &mut caption_lines);
+            }
+            Tick {
+                announcements: std::mem::take(&mut board.pending),
+                problem_starts,
+                forgotten_calls: std::mem::take(&mut board.forgotten),
+            }
+        };
+        for line in &caption_lines {
+            line.log();
         }
-        Tick {
-            announcements: std::mem::take(&mut board.pending),
-            problem_starts,
-            forgotten_calls: std::mem::take(&mut board.forgotten),
-        }
+        tick
     }
 
     pub(crate) fn view(&self, now: Moment) -> BoardView {
@@ -558,6 +621,7 @@ impl TrackedCall {
             notices: CallNotices::default(),
             is_stopped_by_user: false,
             is_tab_video_recorded: false,
+            caption_lines: CaptionLines::default(),
         }
     }
 
@@ -630,6 +694,7 @@ impl TrackedCall {
             (Observation::MeetLoggedCaptions(line_keys), Signals::Meet(meet)) => {
                 meet.line_keys.extend(line_keys);
                 self.caption_count = self.caption_count.max(meet.line_keys.len() as u64);
+                self.caption_lines.pending_backlog_count = Some(self.caption_count);
             }
             // The watcher reads rows while stopped but logs none, so they are not captions.
             (Observation::HuddleCaptionLines(count), Signals::Huddle(_)) => {
@@ -658,6 +723,43 @@ impl TrackedCall {
                 Signals::Meet(_),
             ) => {}
         }
+    }
+
+    /// Adds the call's due `call.captions` lines: a reopened log's backlog at once, then a
+    /// rise in the count once per `CAPTION_LINE_INTERVAL`, or at once while the call waits for
+    /// a caption or has a problem.
+    fn take_caption_lines(&mut self, now: Moment, lines: &mut Vec<CaptionsLine>) {
+        let is_awaiting_captions =
+            matches!(self.state(), CallState::Waiting | CallState::Problem(_));
+        let lines_state = &mut self.caption_lines;
+        if let Some(backlog_count) = lines_state.pending_backlog_count.take() {
+            lines.push(CaptionsLine {
+                call_id: self.id.clone(),
+                platform: self.platform,
+                caption_count: backlog_count,
+                last_at: None,
+                is_backlog: true,
+            });
+            lines_state.logged_count = lines_state.logged_count.max(backlog_count);
+            lines_state.logged_at = Some(now.instant);
+        }
+        let is_due = lines_state
+            .logged_at
+            .is_none_or(|at| now.instant.saturating_duration_since(at) >= CAPTION_LINE_INTERVAL)
+            || is_awaiting_captions
+            || lines_state.was_awaiting_captions;
+        if self.caption_count > lines_state.logged_count && is_due {
+            lines.push(CaptionsLine {
+                call_id: self.id.clone(),
+                platform: self.platform,
+                caption_count: self.caption_count,
+                last_at: self.last_caption.map(|caption| caption.timestamp),
+                is_backlog: false,
+            });
+            lines_state.logged_count = self.caption_count;
+            lines_state.logged_at = Some(now.instant);
+        }
+        lines_state.was_awaiting_captions = is_awaiting_captions;
     }
 
     fn saw_captions(&mut self, count: u64, now: Moment) {
@@ -1027,11 +1129,17 @@ pub(crate) fn start(app: &AppHandle) {
 async fn watch_calls(app: AppHandle) {
     let mut interval = tokio::time::interval(TICK_INTERVAL);
     let mut had_calls_at_last_tick = false;
+    let mut last_tick: Option<Moment> = None;
     loop {
         interval.tick().await;
+        let now = Moment::now();
+        if let Some(last) = last_tick {
+            log_host_suspended(last, now);
+        }
+        last_tick = Some(now);
         let state = app.state::<AppState>();
         let board = state.calls.status();
-        let tick = board.tick(Moment::now());
+        let tick = board.tick(now);
         for start in &tick.problem_starts {
             report_problem_start(&app, start);
         }
@@ -1051,6 +1159,24 @@ async fn watch_calls(app: AppHandle) {
             crate::tray::show_call_status(&app);
         }
         had_calls_at_last_tick = has_open_calls;
+    }
+}
+
+/// Logs `host.suspended` when the wall clock moved over `SUSPEND_LIMIT` more than the
+/// monotonic clock since the last tick. On macOS `Instant` stops while the host sleeps.
+fn log_host_suspended(last: Moment, now: Moment) {
+    let wall_elapsed = now.timestamp.duration_since(last.timestamp);
+    let Ok(wall_elapsed) = Duration::try_from(wall_elapsed) else {
+        return;
+    };
+    let suspended =
+        wall_elapsed.saturating_sub(now.instant.saturating_duration_since(last.instant));
+    if suspended > SUSPEND_LIMIT {
+        tracing::info!(
+            event.name = "host.suspended",
+            mc.host.suspended_ms = u64::try_from(suspended.as_millis()).unwrap_or(u64::MAX),
+            "the host was suspended"
+        );
     }
 }
 

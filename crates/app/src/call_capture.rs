@@ -46,9 +46,8 @@ use capture_protocol::finalize::{
     FinalizeOutcome, MEDIA_PURGE_INTERVAL, MediaPurge, PendingFinalize,
 };
 use capture_protocol::{
-    AudioCommand, AudioErrorKind, AudioReport, DeviceChangeCause, MicMoment, PermissionService,
-    PermissionState, Platform, Stem, VideoCommand, VideoErrorKind, VideoReport, WindowChangeCause,
-    WindowHint,
+    AudioCommand, AudioErrorKind, AudioReport, MicMoment, PermissionService, PermissionState,
+    Platform, Stem, VideoCommand, VideoErrorKind, VideoReport, WindowChangeCause, WindowHint,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -59,7 +58,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::Instrument as _;
 
-use self::restart_backoff::{FAILURES_SHOWN, RestartBackoff};
+use self::restart_backoff::{FAILURES_SHOWN, Restart, RestartBackoff};
 use crate::AppState;
 use crate::call_status::{Moment, display_time_zone};
 use crate::calls::{Call, CallEvent, CallPlatform};
@@ -1527,7 +1526,7 @@ impl CaptureProcess for AudioProcess {
     }
 
     fn read_report(app: &AppHandle, call_id: &Path, report: &AudioReport) -> ReportSign {
-        log_audio_report(call_id, report);
+        capture_protocol::report_lines::log_audio_report(&call_id.display().to_string(), report);
         crate::call_metrics::take_audio_report(app, call_id, report);
         let capture = &app.state::<AppState>().call_capture;
         match report {
@@ -1707,7 +1706,7 @@ impl CaptureProcess for VideoProcess {
     }
 
     fn read_report(app: &AppHandle, call_id: &Path, report: &VideoReport) -> ReportSign {
-        log_video_report(call_id, report);
+        capture_protocol::report_lines::log_video_report(&call_id.display().to_string(), report);
         crate::call_metrics::take_video_report(call_id, report);
         match report {
             VideoReport::Recording { segment, .. } => ReportSign::Recording { segment: *segment },
@@ -1776,193 +1775,6 @@ impl CaptureProcess for VideoProcess {
     }
 }
 
-fn log_video_report(call_id: &Path, report: &VideoReport) {
-    let call_id = call_id.display().to_string();
-    match report {
-        VideoReport::Recording {
-            segment,
-            window,
-            width_px,
-            height_px,
-            codec,
-            first_host_time_ns,
-        } => tracing::info!(
-            call.id = call_id,
-            segment.number = segment,
-            video.window_id = window.window_id,
-            video.width_px = width_px,
-            video.height_px = height_px,
-            video.codec = %codec,
-            video.first_host_time_ns = first_host_time_ns,
-            "video recording"
-        ),
-        VideoReport::Gap {
-            segment,
-            length_ms,
-            cause,
-            ..
-        } => tracing::warn!(
-            call.id = call_id,
-            segment.number = segment,
-            video.gap_length_ms = length_ms,
-            error.type = %cause,
-            "video gap"
-        ),
-        VideoReport::WindowChanged {
-            segment,
-            cause,
-            window,
-            ..
-        } => tracing::info!(
-            call.id = call_id,
-            segment.number = segment,
-            video.change_cause = %cause,
-            video.window_id = window.as_ref().map(|window| window.window_id),
-            "video window changed"
-        ),
-        VideoReport::Permission { service, state } => tracing::info!(
-            call.id = call_id,
-            permission.service = %service,
-            permission.state = %state,
-            "permission checked"
-        ),
-        VideoReport::Heartbeat { segment, .. } => tracing::debug!(
-            call.id = call_id,
-            segment.number = segment,
-            "video heartbeat"
-        ),
-        VideoReport::Stopped { segment } => tracing::info!(
-            call.id = call_id,
-            segment.number = segment,
-            "video segment closed"
-        ),
-        VideoReport::Error { kind, message } => tracing::error!(
-            call.id = call_id,
-            error.type = %kind,
-            exception.message = message,
-            "video helper error"
-        ),
-    }
-}
-
-fn log_mic_unavailable(
-    call_id: &str,
-    segment: u32,
-    old_device: Option<&str>,
-    cause: Option<DeviceChangeCause>,
-    message: &str,
-) {
-    tracing::warn!(
-        call.id = call_id,
-        segment.number = segment,
-        audio.previous_device = old_device,
-        audio.change_cause = cause.map(|cause| cause.to_string()),
-        exception.message = message,
-        "audio mic unavailable"
-    );
-}
-
-fn log_audio_report(call_id: &Path, report: &AudioReport) {
-    let call_id = call_id.display().to_string();
-    match report {
-        AudioReport::Recording {
-            segment,
-            stream,
-            device,
-            rate_hz,
-            first_host_time_ns,
-            mic_route,
-        } => tracing::info!(
-            call.id = call_id,
-            segment.number = segment,
-            audio.stream = %stream,
-            audio.device = device,
-            audio.rate_hz = rate_hz,
-            audio.first_host_time_ns = first_host_time_ns,
-            mic.reason = mic_route.as_ref().map(|route| route.reason.as_str()),
-            "audio stream recording"
-        ),
-        AudioReport::Gap {
-            segment,
-            stream,
-            start_ms,
-            length_ms,
-            cause,
-            ..
-        } => tracing::warn!(
-            call.id = call_id,
-            segment.number = segment,
-            audio.stream = %stream,
-            audio.gap_start_ms = start_ms,
-            audio.gap_length_ms = length_ms,
-            error.type = %cause,
-            "audio gap"
-        ),
-        AudioReport::Heartbeat { segment, .. } => tracing::debug!(
-            call.id = call_id,
-            segment.number = segment,
-            "audio heartbeat"
-        ),
-        AudioReport::Rotated {
-            from_segment,
-            to_segment,
-        } => tracing::info!(
-            call.id = call_id,
-            segment.number = to_segment,
-            segment.previous_number = from_segment,
-            "audio segment rotated"
-        ),
-        AudioReport::Stopped { segment } => tracing::info!(
-            call.id = call_id,
-            segment.number = segment,
-            "audio segment closed"
-        ),
-        AudioReport::DeviceChanged {
-            segment,
-            stream,
-            old_device,
-            new_device,
-            rate_hz,
-            cause,
-            mic_route,
-        } => tracing::info!(
-            call.id = call_id,
-            segment.number = segment,
-            audio.stream = %stream,
-            audio.previous_device = old_device.as_deref(),
-            audio.device = new_device,
-            audio.rate_hz = rate_hz,
-            audio.change_cause = %cause,
-            mic.reason = mic_route.as_ref().map(|route| route.reason.as_str()),
-            "audio device changed"
-        ),
-        AudioReport::MicUnavailable {
-            segment,
-            old_device,
-            cause,
-            message,
-        } => log_mic_unavailable(&call_id, *segment, old_device.as_deref(), *cause, message),
-        AudioReport::Permission { service, state } => tracing::info!(
-            call.id = call_id,
-            permission.service = %service,
-            permission.state = %state,
-            "permission checked"
-        ),
-        AudioReport::SystemSleep { segment } => tracing::info!(
-            call.id = call_id,
-            segment.number = segment,
-            "the Mac is going to sleep"
-        ),
-        AudioReport::SystemWake => tracing::info!(call.id = call_id, "the Mac woke"),
-        AudioReport::Error { kind, message } => tracing::error!(
-            call.id = call_id,
-            error.type = %kind,
-            exception.message = message,
-            "audio helper error"
-        ),
-    }
-}
-
 /// One process of one call's recording, restarted until the call stops.
 struct Recording<P: CaptureProcess> {
     app: AppHandle,
@@ -2000,6 +1812,21 @@ enum RunNext {
 }
 
 impl<P: CaptureProcess> Recording<P> {
+    fn log_failure(&self, reason: &str, restart: &Restart) {
+        tracing::warn!(
+            event.name = "capture.process_failed",
+            call.id = %self.call.id.display(),
+            // The subcommand names the helper: `audio` or `video`.
+            mc.capture.helper = P::SUBCOMMAND,
+            error.type = "capture_process_failed",
+            exception.message = reason,
+            capture.failures_in_window = restart.failures_in_window,
+            capture.is_failing = restart.is_failing,
+            capture.restart_delay_ms = u64::try_from(restart.delay.as_millis()).unwrap_or(u64::MAX),
+            "a capture process failed; restarting"
+        );
+    }
+
     async fn run(mut self, mut stop: oneshot::Receiver<()>, mut links: ProcessLinks) {
         loop {
             // Restarts use the latest window, never one the watcher saw close.
@@ -2047,16 +1874,7 @@ impl<P: CaptureProcess> Recording<P> {
             let restart = self
                 .backoff
                 .note_failure(Instant::now(), is_device_open_failed);
-            tracing::warn!(
-                call.id = %self.call.id.display(),
-                error.type = "capture_process_failed",
-                exception.message = reason,
-                capture.failures_in_window = restart.failures_in_window,
-                capture.is_failing = restart.is_failing,
-                capture.restart_delay_ms =
-                    u64::try_from(restart.delay.as_millis()).unwrap_or(u64::MAX),
-                "a capture process failed; restarting"
-            );
+            self.log_failure(&reason, &restart);
             if restart.is_newly_failing {
                 crate::notify(
                     &self.app,

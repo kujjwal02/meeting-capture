@@ -496,7 +496,7 @@ impl CallDebug {
     }
 
     /// Gathers the call's evidence into one new folder and returns the folder: the app log lines
-    /// of the call, the helper's log lines in the call's time span, the call log, the capture
+    /// of the call and the call-less detector lines in its time span, the helper's log lines in the call's time span, the call log, the capture
     /// manifests, the job row and every file of the call's and the meeting's debug folders.
     pub(crate) fn save_report(&self, request: &ReportRequest) -> std::io::Result<PathBuf> {
         let stem = call_stem(&request.call_id);
@@ -511,15 +511,20 @@ impl CallDebug {
             .chain(request.session_ids.iter().cloned())
             .map(|needle| json_escaped(&needle))
             .collect();
+        let window = call_window(request, saved_at);
+        let global_names: Vec<String> = telemetry::events::GLOBAL_DETECTOR_EVENTS
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect();
         let app_logs = telemetry::daily_log_files(&self.log_dir, telemetry::Service::App)?;
         output.copy_json_lines(&app_logs, &folder.join(APP_LOG_FILE), |line| {
             needles.iter().any(|needle| line.contains(needle.as_str()))
+                || is_global_detector_line(line, &global_names, window)
         })?;
 
         // The helper's lines carry the call only inside its segment span. A helper that has
         // such a line belongs to the call; its lines outside any trace, such as its start and
         // stop, come along within the call's time span.
-        let window = call_window(request, saved_at);
         let helper_logs = telemetry::daily_log_files(&self.log_dir, telemetry::Service::McCapture)?;
         let call = CallMatch {
             call_id: call_id_text,
@@ -1177,6 +1182,22 @@ impl CappedFile {
     }
 }
 
+/// Whether the line is a detector line of no call, such as `host.suspended`, inside `window`.
+/// Detectors read them for every call, so the call's report keeps them. `quoted_names` holds
+/// each name in quotes, as the line spells it.
+fn is_global_detector_line(line: &str, quoted_names: &[String], window: TimeWindow) -> bool {
+    // Most lines name none of the events, so the text check spares parsing them.
+    if !quoted_names.iter().any(|name| line.contains(name.as_str())) {
+        return false;
+    }
+    let facts = LineFacts::of(line);
+    facts
+        .event_name
+        .as_deref()
+        .is_some_and(|name| telemetry::events::GLOBAL_DETECTOR_EVENTS.contains(&name))
+        && window.holds(facts.at)
+}
+
 /// What the report's filters read of one telemetry line.
 #[derive(Default)]
 struct LineFacts {
@@ -1185,6 +1206,7 @@ struct LineFacts {
     instance_id: Option<String>,
     trace_id: Option<String>,
     call_id: Option<String>,
+    event_name: Option<String>,
     /// As text: the pipeline logs it as a number or a string.
     meeting_id: Option<String>,
 }
@@ -1229,6 +1251,7 @@ impl LineFacts {
             }),
             trace_id: text(fields.get(telemetry::fields::TRACE_ID)),
             call_id: text(attribute(telemetry::fields::CALL_ID)),
+            event_name: text(attribute(telemetry::events::EVENT_NAME)),
             meeting_id: attribute(telemetry::fields::MEETING_ID).and_then(|id| match id {
                 serde_json::Value::String(id) => Some(id.clone()),
                 serde_json::Value::Number(id) => Some(id.to_string()),

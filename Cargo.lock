@@ -612,6 +612,7 @@ dependencies = [
  "sources",
  "stem-timing",
  "stem-writer",
+ "tracing",
  "video-capture",
 ]
 

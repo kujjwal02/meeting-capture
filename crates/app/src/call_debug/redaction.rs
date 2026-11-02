@@ -41,6 +41,8 @@ const KEPT_KEYS: &[&str] = &[
     "debug_mode_until",
     "utc",
     "mc.meet.at",
+    "mc.caption.last_at",
+    "mc.problem.evidence_at",
     // Units of metric points, such as `dBFS` and `{frame}`.
     "unit",
     // Files the capture helpers named in their manifests.
@@ -135,6 +137,19 @@ const CODE_KEYS: &[&str] = &[
     "mc.decision.kind",
     "mc.decision.chosen",
     "mc.transcript.speaker_naming",
+    // Detector inputs and verdicts.
+    "mc.meet.captions",
+    "mc.meet.caption_source",
+    "mc.huddle.health",
+    "mc.capture.helper",
+    "mc.problem.layer",
+    "mc.problem.detector",
+    "mc.problem.evidence",
+    "audio.change_cause",
+    "video.rebuild_cause",
+    "audio.stream",
+    "permission.service",
+    "permission.state",
     // Environment lines: device transports, permission states, power.
     "transport",
     "microphone",

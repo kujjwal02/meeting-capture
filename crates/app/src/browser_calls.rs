@@ -35,7 +35,7 @@ use self::log_folder::LogFolder;
 use crate::AppState;
 use crate::call_debug::{FailedFrame, FrameChannel};
 use crate::call_status::{
-    BoardView, CallBoard, CallState, Moment, Observation, ProblemReason, clock,
+    BoardView, CallBoard, CallState, MeetCaptions, Moment, Observation, ProblemReason, clock,
 };
 use crate::calls::{CallEndReason, CallPlatform};
 use crate::finished_logs::{self, LogSource};
@@ -71,6 +71,112 @@ pub(crate) struct BrowserCalls {
     tab_video: Mutex<HashMap<PathBuf, TabVideoEntry>>,
     /// When `call_status` last went out.
     call_status_sent_at: Mutex<Instant>,
+    /// The last value of each Meet line logged on a change. Never held with the book lock.
+    change_lines: Mutex<MeetChangeLines>,
+}
+
+/// The last value each on-change Meet line logged, so a line goes out only when its value
+/// changes.
+#[derive(Default)]
+struct MeetChangeLines {
+    is_extension_connected: Option<bool>,
+    calls: HashMap<PathBuf, LoggedMeetCall>,
+}
+
+#[derive(Default)]
+struct LoggedMeetCall {
+    health: Option<LoggedMeetHealth>,
+    is_port_held: Option<bool>,
+    is_pages_away: Option<bool>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LoggedMeetHealth {
+    captions: MeetCaptions,
+    source: HealthSource,
+    is_caption_frames_failing: bool,
+}
+
+impl MeetChangeLines {
+    fn log_extension_connected(&mut self, is_connected: bool) {
+        if self.is_extension_connected == Some(is_connected) {
+            return;
+        }
+        self.is_extension_connected = Some(is_connected);
+        tracing::info!(
+            event.name = "extension.connection",
+            browser.extension.is_connected = is_connected,
+            "extension connection changed"
+        );
+    }
+
+    fn log_port_held(&mut self, call_id: &Path, is_port_held: bool) {
+        let call = self.calls.entry(call_id.to_path_buf()).or_default();
+        if call.is_port_held == Some(is_port_held) {
+            return;
+        }
+        call.is_port_held = Some(is_port_held);
+        tracing::info!(
+            event.name = "meet.port_held",
+            call.id = %call_id.display(),
+            mc.meet.is_port_held = is_port_held,
+            "meet port hold changed"
+        );
+    }
+
+    fn log_pages_away(&mut self, call_id: &Path, is_pages_away: bool) {
+        let call = self.calls.entry(call_id.to_path_buf()).or_default();
+        if call.is_pages_away == Some(is_pages_away) {
+            return;
+        }
+        call.is_pages_away = Some(is_pages_away);
+        tracing::info!(
+            event.name = "meet.pages_away",
+            call.id = %call_id.display(),
+            mc.meet.is_pages_away = is_pages_away,
+            "meet pages away changed"
+        );
+    }
+
+    /// Logs `meet.health` when the observation is a changed health report.
+    fn log_health(&mut self, call_id: &Path, observation: &Observation) {
+        let health = match observation {
+            Observation::MeetHealth {
+                source,
+                captions,
+                is_caption_frames_failing,
+            } => LoggedMeetHealth {
+                captions: *captions,
+                source: *source,
+                is_caption_frames_failing: *is_caption_frames_failing,
+            },
+            Observation::MeetCaption { .. }
+            | Observation::MeetPortHeld(_)
+            | Observation::MeetPagesAway(_)
+            | Observation::MeetLoggedCaptions(_)
+            | Observation::HuddleCaptionLines(_)
+            | Observation::HuddleHealth(_)
+            | Observation::RecordingStopped(_)
+            | Observation::TabVideoRecorded => return,
+        };
+        let call = self.calls.entry(call_id.to_path_buf()).or_default();
+        if call.health == Some(health) {
+            return;
+        }
+        call.health = Some(health);
+        tracing::info!(
+            event.name = "meet.health",
+            call.id = %call_id.display(),
+            mc.meet.captions = health.captions.as_str(),
+            mc.meet.caption_source = health.source.as_str(),
+            mc.meet.is_caption_frames_failing = health.is_caption_frames_failing,
+            "meet health changed"
+        );
+    }
+
+    fn forget(&mut self, call_id: &Path) {
+        self.calls.remove(call_id);
+    }
 }
 
 /// Where a call's tab video goes, and whether mc-meet should capture it.
@@ -222,6 +328,7 @@ impl BrowserCalls {
             session_requests: broadcast::channel(SESSION_REQUEST_BACKLOG).0,
             tab_video: Mutex::new(HashMap::new()),
             call_status_sent_at: Mutex::new(Instant::now()),
+            change_lines: Mutex::new(MeetChangeLines::default()),
         }
     }
 
@@ -375,6 +482,22 @@ impl BrowserCalls {
 
     fn lock(&self) -> MutexGuard<'_, CallBook> {
         self.book.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Logs the on-change lines one Meet event of the call brings: a port holds the call, and
+    /// the event's health report.
+    fn log_meet_event(&self, call_id: &Path, observation: Option<&Observation>) {
+        let mut change_lines = self.lock_change_lines();
+        change_lines.log_port_held(call_id, true);
+        if let Some(observation) = observation {
+            change_lines.log_health(call_id, observation);
+        }
+    }
+
+    fn lock_change_lines(&self) -> MutexGuard<'_, MeetChangeLines> {
+        self.change_lines
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn lock_tab_video(&self) -> MutexGuard<'_, HashMap<PathBuf, TabVideoEntry>> {
@@ -866,6 +989,12 @@ impl Port {
             .calls
             .status()
             .set_extension_connected(is_extension_connected);
+        let mut change_lines = self.calls().lock_change_lines();
+        change_lines.log_extension_connected(is_extension_connected);
+        for call_id in &unheld {
+            change_lines.log_port_held(call_id, false);
+        }
+        drop(change_lines);
         for call_id in &unheld {
             state
                 .calls
@@ -1015,6 +1144,12 @@ impl Port {
         for call_id in &held_calls {
             board.observe(call_id, Observation::MeetPortHeld(true), Moment::now());
         }
+        let mut change_lines = self.calls().lock_change_lines();
+        change_lines.log_extension_connected(true);
+        for call_id in &held_calls {
+            change_lines.log_port_held(call_id, true);
+        }
+        drop(change_lines);
         crate::tray::refresh(&self.app);
         open_sessions
     }
@@ -1037,6 +1172,10 @@ impl Port {
         );
         for (call_id, is_away) in &calls {
             board.observe(call_id, Observation::MeetPagesAway(*is_away), now);
+        }
+        let mut change_lines = self.calls().lock_change_lines();
+        for (call_id, is_away) in &calls {
+            change_lines.log_pages_away(call_id, *is_away);
         }
     }
 
@@ -1202,13 +1341,20 @@ impl Port {
                 if let Some(observation) = observation {
                     board.observe(log_path, observation.clone(), now);
                 }
+                self.calls().log_meet_event(log_path, observation.as_ref());
                 state.call_debug.remember(log_path, lead_up_line);
             }
             // Its caption text stays out of the lead-up: the user stopped recording.
             Ok(Logged::Withheld {
                 opened: Some(OpenedCall { log_path, .. }),
-            }) => board.observe(log_path, Observation::MeetPortHeld(true), Moment::now()),
-            Ok(Logged::Ended { log_path, .. }) => state.call_debug.forget_lead_up(log_path),
+            }) => {
+                board.observe(log_path, Observation::MeetPortHeld(true), Moment::now());
+                self.calls().log_meet_event(log_path, None);
+            }
+            Ok(Logged::Ended { log_path, .. }) => {
+                state.call_debug.forget_lead_up(log_path);
+                self.calls().lock_change_lines().forget(log_path);
+            }
             Ok(Logged::Duplicate | Logged::Withheld { opened: None }) | Err(_) => {}
         }
         // Other events reach the tray with the status tick. A rebuild closes an open menu.
@@ -1641,6 +1787,13 @@ async fn end_idle_calls(app: AppHandle, pipeline: Arc<Pipeline>) {
         };
         if ended.is_empty() {
             continue;
+        }
+        {
+            let state = app.state::<AppState>();
+            let mut change_lines = state.browser_calls.lock_change_lines();
+            for log_path in &ended {
+                change_lines.forget(log_path);
+            }
         }
         crate::tray::refresh(&app);
         for log_path in ended {
