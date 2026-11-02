@@ -1683,14 +1683,14 @@ impl CaptureProcess for VideoProcess {
         Some(VideoCommand::Window { window_hint: hint })
     }
 
-    // The video helper has no dump command yet; its own log file still holds its INFO lines.
-    // The video protocol has no debug command yet.
-    fn debug_command(_mode: DebugMode) -> Option<VideoCommand> {
-        None
+    fn recorder_dump_command(path: PathBuf) -> Option<VideoCommand> {
+        Some(VideoCommand::DumpRecorder { path })
     }
 
-    fn recorder_dump_command(_path: PathBuf) -> Option<VideoCommand> {
-        None
+    fn debug_command(mode: DebugMode) -> Option<VideoCommand> {
+        Some(VideoCommand::SetDebug {
+            until: mode.enabled_until(),
+        })
     }
 
     fn next_free_segment(folder: &Path) -> Result<u32, String> {

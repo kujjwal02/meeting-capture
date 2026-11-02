@@ -137,20 +137,20 @@ reason. Two problems in one call then keep both windows. A dump writes through a
 opened for append and never reads the file back. A dump file stops growing past 32 MB. It then
 ends with a `dump` line with `mc.recorder.is_file_full`, and later dumps add nothing.
 
-A dump shares the ring's lines and copies none. The audio helper dumps on its own thread and
+A dump shares the ring's lines and copies none. Each capture helper dumps on its own thread and
 waits for that thread before it exits.
 
 | Trigger | Process | Dump file |
 |---|---|---|
 | A call problem starts | App | `debug/<call>/recorder-app.jsonl` |
 | A call problem starts | Audio helper, asked with `dump_recorder` | `debug/<call>/recorder-mc-capture-audio.jsonl` |
+| A call problem starts | Video helper, asked with `dump_recorder` | `debug/<call>/recorder-mc-capture-video.jsonl` |
 | A capture helper exits with an error, hangs or does not start | App | `debug/<call>/recorder-app.jsonl` |
 | A pipeline run fails | App or `mc` | `debug/meeting-<id>/recorder-<service>.jsonl` |
 | A panic | Any | `debug/panic-<time>-<service>-<pid>/recorder-<service>.jsonl` |
 | "Save debug report" | App | The call's folder, then copied into the report |
 
 `<call>` is the call log's file name without its extension, which also names the call folder.
-The video helper has no dump command yet.
 
 The report copies the call's debug folder through the same redaction as every other file. It
 skips hidden and `.partial` files. From each recorder dump it keeps only the dump headers and the
@@ -286,10 +286,11 @@ that table, so the toggle works while another setting fails to resolve.
 |---|---|
 | App | Reads the setting at launch and every 30 s, so a hand edit applies too, and passes each change on. Sets its file level at each toggle. At the end it removes the key, then turns debug mode off |
 | Audio helper | The app sends `set_debug` with `until` right after `start` and at each change |
+| Video helper | The app sends `set_debug` with `until` right after `start` and at each change |
 | Native host | Reads the setting at start and again while it relays, at most every 60 s |
 | mc-meet | The app sends `{"type":"debug_mode","until":...}` after `welcome` and at each change. The worker stores `until` in `chrome.storage.session` as `debugModeUntil`, and removes it when the native port closes. The popup shows "Debug mode on until 14:30" in local time |
 
-The video helper and `mc` do not follow it yet. A saved call report's `call-status.json` holds
+`mc` does not follow it yet. A saved call report's `call-status.json` holds
 `debug_mode_until`, null when off.
 
 The recorder keeps DEBUG lines either way. Debug mode adds them to the log file, so they outlive

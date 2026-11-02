@@ -264,6 +264,13 @@ pub enum VideoCommand {
     /// Close the segment and wait for the next command. Closing stdin also stops, and then the
     /// process exits. The app also sends it when the audio process reports a sleep.
     Stop,
+    /// Append the flight recorder's lines since the last dump into `path` to it. Valid in any
+    /// state; the process answers nothing, and a failure only reaches its log.
+    DumpRecorder { path: PathBuf },
+    /// Debug mode: the log file keeps DEBUG lines until `until`, RFC 3339 UTC; `None` is off.
+    /// The app sends it after `start` and at each change. Valid in any state; the process
+    /// answers nothing.
+    SetDebug { until: Option<String> },
 }
 
 /// The video process to the app.

@@ -36,6 +36,8 @@ use video_capture::{
     VideoCodec, VideoGapRecord, VideoSegmentWriter, VideoWriterError, WindowChangeRecord,
 };
 
+use crate::app_requests;
+
 const TICK: Duration = Duration::from_millis(20);
 /// 1 s, so the app's per-second video metric rows each get fresh counters.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
@@ -135,6 +137,12 @@ impl ReportWriter {
 /// Serves commands until stdin closes. Returns an error, and so exits non-zero, when a segment
 /// fails: the app then restarts the process with the call's next segment number.
 pub(crate) fn serve() -> anyhow::Result<()> {
+    let served = serve_commands();
+    app_requests::join_recorder_dumps();
+    served
+}
+
+fn serve_commands() -> anyhow::Result<()> {
     video_capture::mac::window::connect_window_server();
     let writer = ReportWriter::new();
     let (sender, inputs) = mpsc::channel();
@@ -170,6 +178,8 @@ pub(crate) fn serve() -> anyhow::Result<()> {
                 video.window_id = window_hint.window_id,
                 "video.window_hint_between_segments"
             ),
+            VideoCommand::DumpRecorder { path } => app_requests::spawn_recorder_dump(path),
+            VideoCommand::SetDebug { until } => app_requests::follow_debug_mode(until.as_deref()),
             VideoCommand::Start {
                 call_id,
                 folder,
@@ -248,9 +258,10 @@ fn read_commands(sender: &Sender<HelperInput>, writer: &ReportWriter, stops: &St
                 let stops_before = match command.message {
                     // Counted before the send, so the loop sees the count no later than the line.
                     VideoCommand::Stop => stops.fetch_add(1, Ordering::AcqRel),
-                    VideoCommand::Start { .. } | VideoCommand::Window { .. } => {
-                        stops.load(Ordering::Acquire)
-                    }
+                    VideoCommand::Start { .. }
+                    | VideoCommand::Window { .. }
+                    | VideoCommand::DumpRecorder { .. }
+                    | VideoCommand::SetDebug { .. } => stops.load(Ordering::Acquire),
                 };
                 let input = HelperInput::Command {
                     command: command.message,
@@ -611,6 +622,14 @@ impl Segment<'_> {
                     command: VideoCommand::Window { window_hint },
                     ..
                 }) => self.follow_hint(window_hint),
+                Ok(HelperInput::Command {
+                    command: VideoCommand::DumpRecorder { path },
+                    ..
+                }) => app_requests::spawn_recorder_dump(path),
+                Ok(HelperInput::Command {
+                    command: VideoCommand::SetDebug { until },
+                    ..
+                }) => app_requests::follow_debug_mode(until.as_deref()),
                 Ok(HelperInput::Command {
                     command: VideoCommand::Start { segment, .. },
                     ..
