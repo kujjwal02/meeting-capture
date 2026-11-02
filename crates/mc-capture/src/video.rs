@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context as _;
 use capture::{PermissionService, PermissionState};
 use capture_protocol::{
-    Platform, VideoCommand, VideoErrorKind, VideoGapCause, VideoReport, WindowChangeCause,
-    WindowHint, WindowRecord,
+    Platform, VideoCommand, VideoErrorKind, VideoGapCause, VideoRebuildCause, VideoReport,
+    WindowChangeCause, WindowHint, WindowRecord,
 };
 use video_capture::mac::encoder::{Encoder, EncoderOutput, EncoderSink};
 use video_capture::mac::muxer::{Muxer, MuxerAppend, MuxerOutput, MuxerSink};
@@ -698,7 +698,7 @@ impl Segment<'_> {
                         if let Some(window) = &mut self.window {
                             window.stream = None;
                         }
-                        self.rebuild(None)?;
+                        self.rebuild(VideoRebuildCause::StreamStopped, None)?;
                     }
                 }
             }
@@ -1146,10 +1146,13 @@ impl Segment<'_> {
     }
 
     fn end_gap(&mut self) -> Result<(), SegmentError> {
+        self.end_gap_at(capture::host_now_ns())
+    }
+
+    fn end_gap_at(&mut self, end_ns: u64) -> Result<(), SegmentError> {
         let Some(gap) = self.gap.take() else {
             return Ok(());
         };
-        let end_ns = capture::host_now_ns();
         #[expect(
             clippy::cast_precision_loss,
             reason = "a gap is far shorter than the 2^52 ns where f64 loses whole nanoseconds"
@@ -1216,7 +1219,7 @@ impl Segment<'_> {
         );
         if let Err(error) = stream.resize(size) {
             tracing::warn!(exception.message = %error, "video.resize_failed");
-            return self.rebuild(None);
+            return self.rebuild(VideoRebuildCause::ResizeFailed, None);
         }
         let record = record_of(&window.listed);
         self.note_window_change(WindowChangeCause::Resized, Some(record), Some(size))
@@ -1258,7 +1261,15 @@ impl Segment<'_> {
 
     /// Counts a rebuild and asks for a fresh window to build the stream on. A stall's gap
     /// starts at `gap_start_ns`, its last new frame; any other at the next grid slot.
-    fn rebuild(&mut self, gap_start_ns: Option<u64>) -> Result<(), SegmentError> {
+    fn rebuild(
+        &mut self,
+        cause: VideoRebuildCause,
+        gap_start_ns: Option<u64>,
+    ) -> Result<(), SegmentError> {
+        self.reports.send(&VideoReport::StreamLost {
+            segment: self.request.number,
+            cause,
+        })?;
         self.rebuilds_in_episode += 1;
         self.last_rebuild = Some(Instant::now());
         tracing::warn!(
@@ -1280,9 +1291,27 @@ impl Segment<'_> {
         // rebuild for the same fault.
         self.lookup.in_flight = None;
         self.note(PendingNote::StreamRebuild)?;
-        match gap_start_ns {
-            Some(start_ns) => self.open_gap_at(VideoGapCause::StreamRestart, start_ns),
-            None => self.open_gap(VideoGapCause::StreamRestart),
+        match (self.gap.map(|gap| gap.cause), gap_start_ns) {
+            // The app learns the stream is back only from a `stream_restart` gap, so an open gap
+            // of another cause, such as a hidden window, ends here and the restart gap follows.
+            (
+                Some(
+                    VideoGapCause::WindowHidden
+                    | VideoGapCause::WindowMissing
+                    | VideoGapCause::ProcessStalled,
+                ),
+                _,
+            ) => {
+                let now_ns = capture::host_now_ns();
+                self.end_gap_at(now_ns)?;
+                self.open_gap_at(VideoGapCause::StreamRestart, now_ns);
+            }
+            (Some(VideoGapCause::StreamRestart) | None, Some(start_ns)) => {
+                self.open_gap_at(VideoGapCause::StreamRestart, start_ns);
+            }
+            (Some(VideoGapCause::StreamRestart) | None, None) => {
+                self.open_gap(VideoGapCause::StreamRestart);
+            }
         }
         // Spread the rebuilds, so a stream that fails at once does not use all four in a second.
         self.lookup.due = Some((
@@ -1353,7 +1382,7 @@ impl Segment<'_> {
             }
             (LookupPurpose::StallCheck, WindowLookup::Found { .. }) => {
                 let gap_start_ns = self.last_captured_ns.map(|last| last + FRAME_INTERVAL_NS);
-                self.rebuild(gap_start_ns)?;
+                self.rebuild(VideoRebuildCause::Stalled, gap_start_ns)?;
             }
             // Still there; the next check comes after another quiet spell.
             (LookupPurpose::PresenceCheck, WindowLookup::Found { .. }) => {
@@ -1443,7 +1472,7 @@ impl Segment<'_> {
             }
             Err(error) => {
                 tracing::warn!(exception.message = %error, "video.stream_start_failed");
-                self.rebuild(None)?;
+                self.rebuild(VideoRebuildCause::StartFailed, None)?;
                 return Ok(None);
             }
         }

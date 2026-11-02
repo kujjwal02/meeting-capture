@@ -357,6 +357,19 @@ impl SegmentObserver for AudioObserver<'_> {
         })
     }
 
+    fn stream_lost(
+        &mut self,
+        segment: u32,
+        stem: Stem,
+        cause: DeviceChangeCause,
+    ) -> anyhow::Result<()> {
+        self.writer.send(&AudioReport::StreamLost {
+            segment,
+            stream: stem,
+            cause,
+        })
+    }
+
     fn mic_unavailable(
         &mut self,
         segment: u32,

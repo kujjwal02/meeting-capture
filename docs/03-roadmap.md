@@ -126,7 +126,8 @@ Progress is tracked in the [checklist](05-checklist.md).
   segment: a wake, a rotation, a resume or a helper restart. `dump_recorder` with a path makes
   the helper dump its flight recorder there, in any state.
 - Helper to app: `recording` per stream, `gap`, `heartbeat` every 1 s, `rotated`, `stopped` once
-  the segment is closed, `device_changed` when a stream moves to another device mid-segment,
+  the segment is closed, `stream_lost` when a stream stops delivering, `device_changed` when a
+  stream moves to another device mid-segment,
   `mic_unavailable` when the mic is lost and no safe input is left, `permission` with a
   permission's state, `system_sleep` and `system_wake`, and `error` with a closed kind.
 - A heartbeat carries each stream's device samples read, 16 kHz samples written, and the stem

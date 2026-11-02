@@ -1580,6 +1580,7 @@ impl CaptureProcess for AudioProcess {
                 ReportSign::Logged
             }
             AudioReport::Gap { .. }
+            | AudioReport::StreamLost { .. }
             | AudioReport::DeviceChanged {
                 stream: Stem::Remote,
                 ..
@@ -1756,6 +1757,7 @@ impl CaptureProcess for VideoProcess {
                 ReportSign::StoppedByUser
             }
             VideoReport::Gap { .. }
+            | VideoReport::StreamLost { .. }
             | VideoReport::Permission { .. }
             | VideoReport::Error { .. } => ReportSign::Logged,
         }

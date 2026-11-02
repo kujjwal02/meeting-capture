@@ -106,6 +106,14 @@ pub enum AudioReport {
         #[serde(default)]
         mic_route: Option<MicRoute>,
     },
+    /// A stream stopped delivering and the helper starts to replace it. A later `device_changed`
+    /// or `recording` on the same stem ends the loss. A `mic_unavailable` means no replacement
+    /// exists.
+    StreamLost {
+        segment: u32,
+        stream: Stem,
+        cause: DeviceChangeCause,
+    },
     /// The mic went away, or a segment started, with no safe input left, so the mic stem
     /// records a gap. The helper tries again every 15 s and at each device change; a later
     /// `device_changed` on the mic ends the gap. `old_device` and `cause` are `None` when the
@@ -294,6 +302,12 @@ pub enum VideoReport {
         length_ms: f64,
         cause: VideoGapCause,
     },
+    /// The stream stopped or stalled and the process rebuilds it. A `gap` with cause
+    /// `stream_restart` or a `recording` ends the loss.
+    StreamLost {
+        segment: u32,
+        cause: VideoRebuildCause,
+    },
     /// The recorded window resized, closed, or came back. `window` is `None` while none
     /// matches the hint.
     WindowChanged {
@@ -361,6 +375,38 @@ pub enum VideoErrorKind {
     /// A stream stop took longer than its limit, so the capture may still run. The process
     /// closes the segment and exits, which ends the capture, and the app restarts it.
     StreamStopTimedOut,
+}
+
+/// Why the video process rebuilds its stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VideoRebuildCause {
+    /// The capture stream stopped with an error.
+    StreamStopped,
+    /// The stream could not take the window's new size.
+    ResizeFailed,
+    /// The stream delivered no frame for its stall limit.
+    Stalled,
+    /// A rebuilt stream failed to start.
+    StartFailed,
+}
+
+impl VideoRebuildCause {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamStopped => "stream_stopped",
+            Self::ResizeFailed => "resize_failed",
+            Self::Stalled => "stalled",
+            Self::StartFailed => "start_failed",
+        }
+    }
+}
+
+impl fmt::Display for VideoRebuildCause {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 impl fmt::Display for VideoErrorKind {

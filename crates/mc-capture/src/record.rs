@@ -145,6 +145,13 @@ pub(crate) trait SegmentObserver {
     fn stem_started(&mut self, segment: u32, start: &StemStart) -> anyhow::Result<()>;
     fn segment_events(&mut self, segment: u32, events: Vec<SegmentEvent>) -> anyhow::Result<()>;
     fn device_changed(&mut self, segment: u32, change: &DeviceChange) -> anyhow::Result<()>;
+    /// A stream stopped delivering and the loop starts to replace it. Sent once per loss.
+    fn stream_lost(
+        &mut self,
+        segment: u32,
+        stem: Stem,
+        cause: DeviceChangeCause,
+    ) -> anyhow::Result<()>;
     /// The mic is lost, or the segment started, with no safe input left. The mic stem records a
     /// gap until a later `device_changed`. `cause` is `None` at the segment's start.
     fn mic_unavailable(
@@ -623,6 +630,9 @@ struct LiveDevices {
     watch: DeviceWatch,
     /// Why the mic counts as lost, when it was not its device that went: a closed lid.
     mic_lost_cause: Option<DeviceChangeCause>,
+    /// The observer heard of the mic's current loss. A segment that starts with no mic has
+    /// reported `mic_unavailable` instead, so it starts as reported.
+    is_mic_loss_reported: bool,
 }
 
 /// Records one segment until the observer says stop: opens the mic, then the tap, drains both
@@ -741,6 +751,7 @@ fn open_devices(
         Ok(opened) => (Some(opened.reader), None),
         Err(error) => (None, Some(error)),
     };
+    let is_mic_loss_reported = source.mic().is_none();
     let devices = LiveDevices {
         source,
         feeds: Feeds {
@@ -754,6 +765,7 @@ fn open_devices(
         candidate: None,
         watch,
         mic_lost_cause: None,
+        is_mic_loss_reported,
     };
     Ok((devices, mic_error))
 }
@@ -813,6 +825,7 @@ fn follow_devices(
         candidate,
         watch,
         mic_lost_cause,
+        is_mic_loss_reported,
     } = devices;
     #[cfg(debug_assertions)]
     apply_injected_events(source);
@@ -831,6 +844,16 @@ fn follow_devices(
         .mic()
         .is_none_or(capture::MicStream::is_lost)
         .then(|| mic_lost_cause.unwrap_or(DeviceChangeCause::MicLost));
+    match lost_cause {
+        Some(cause) if !*is_mic_loss_reported => {
+            observer
+                .stream_lost(segment.number(), Stem::Mic, cause)
+                .map_err(SegmentError::Report)?;
+            *is_mic_loss_reported = true;
+        }
+        Some(_) => {}
+        None => *is_mic_loss_reported = false,
+    }
     if let Some(waiting) = candidate.as_ref() {
         match waiting.state(now) {
             CandidateState::Waiting => {}
@@ -1058,6 +1081,9 @@ fn rebuild_tap(
         tap.rebuilds_in_episode = watch.rebuild_count(),
         "tap.rebuilding"
     );
+    observer
+        .stream_lost(segment.number(), Stem::Remote, cause)
+        .map_err(SegmentError::Report)?;
     source.close_remote();
     remote.drain(segment).map_err(SegmentError::Write)?;
     if remote.reader.take().is_some() {
@@ -1294,6 +1320,14 @@ struct DeviceLine<'a> {
 }
 
 #[derive(Serialize)]
+struct StreamLostLine {
+    kind: LineKind,
+    segment: u32,
+    stem: Stem,
+    cause: DeviceChangeCause,
+}
+
+#[derive(Serialize)]
 struct MicUnavailableLine<'a> {
     kind: LineKind,
     segment: u32,
@@ -1351,6 +1385,20 @@ impl SegmentObserver for StatusPrinter {
             new_device: &change.new_device,
             rate_hz: change.rate_hz,
             cause: change.cause,
+        })
+    }
+
+    fn stream_lost(
+        &mut self,
+        segment: u32,
+        stem: Stem,
+        cause: DeviceChangeCause,
+    ) -> anyhow::Result<()> {
+        print_line(&StreamLostLine {
+            kind: LineKind::StreamLost,
+            segment,
+            stem,
+            cause,
         })
     }
 

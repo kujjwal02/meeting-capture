@@ -41,6 +41,7 @@ enum LineKind {
     Summary,
     DeviceChanged,
     MicUnavailable,
+    StreamLost,
     Permission,
     SystemSleep,
     SystemWake,
