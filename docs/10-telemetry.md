@@ -12,7 +12,7 @@ marked as such below.
 | 1. Core | The `telemetry` crate in every binary, correlation ids, the flight recorder with its triggers, daily log files | Built |
 | 2. Debug mode | A tray toggle that turns every process's log file to DEBUG for 24 h. mc-meet follows over native messaging | Built |
 | 3. Metrics and environment | Gauges every 10 s, or every 1 s in a call: audio levels and routes, caption channel series, video fps, host CPU and memory, pipeline decisions. `env.jsonl` with devices, permissions and versions | Built |
-| 4. Report and tools | A report bundle for a call with its job, or for the last 30 minutes. `mc debug timeline` and `mc debug export-otlp` | Built |
+| 4. Report and tools | A report bundle for a call with its job, for a meeting without a call, or for the last 30 minutes. `mc debug timeline` and `mc debug export-otlp` | Built |
 | 5. The 0.8.0 caption bug | One call in debug mode on the caption bug. It checks for missing acks on Meet's channel, captions hidden in `control` frames, and throttling in hidden-box mode | Planned |
 | 6. Detectors | One trait for every invariant over metrics and events. A firing raises a named problem and dumps every recorder. `mc debug replay` runs them over a saved bundle | Planned |
 
@@ -148,7 +148,7 @@ waits for that thread before it exits.
 | A capture helper exits with an error, hangs or does not start | App | `debug/<call>/recorder-app.jsonl` |
 | A pipeline run fails | App or `mc` | `debug/meeting-<id>/recorder-<service>.jsonl` |
 | A panic | Any | `debug/panic-<time>-<service>-<pid>/recorder-<service>.jsonl` |
-| "Save debug report" | App | The call's folder, then copied into the report |
+| "Save debug report" | App | The call's folder, or `debug/meeting-<id>/` for a meeting's report, then copied into the report |
 
 `<call>` is the call log's file name without its extension, which also names the call folder.
 
@@ -309,21 +309,23 @@ the 10-minute ring.
 
 ## Report and tools
 
-"Save debug report" in the tray or the popup saves a bundle for the current or last call. "Save
-debug report of the last 30 min" in the tray saves one for no call in particular. Both go to
-`debug-reports/` and pass every file through the same redaction.
+"Save debug report" in the tray or the popup saves a bundle for the current or last call. A
+listed meeting without a call log has its own "Save debug report" in its tray submenu. A
+dropped-in transcript has no call log, and a call log can be gone. "Save debug report of the
+last 30 min" in the tray saves one for no call in particular. All three go to `debug-reports/`
+and pass every file through the same redaction.
 
-| File in the bundle | Call | Last 30 min |
-|---|---|---|
-| `call-status.json` | The call on the status board, and the files cut at the size cap | The window's start and end, and the files cut at the size cap |
-| `app-log.jsonl` | App lines with the call's id, trace id or session ids | |
-| `<service>-log.jsonl` | `mc-capture` lines of the call's trace or `call.id` in the call's time span, 1 minute wider on each side, with the untraced lines of those helpers | Every service's lines in the window |
-| The call log | Whole | |
-| `audio.json`, `video.json`, `finalize.json` | From the call folder, when present | |
-| `job.json` and `debug-meeting-<id>/` | The job row and debug folder of the meeting made from the call, its dumps cut to the meeting's lines | |
-| `env.jsonl` | | Environment lines in the window |
-| `metrics.jsonl` | In `debug/`, the call's rows | Host metric rows in the window |
-| `debug/` | Every file of the call's debug folder, after a new app recorder dump | A new app recorder dump |
+| File in the bundle | Call | Meeting | Last 30 min |
+|---|---|---|---|
+| `call-status.json` | The call on the status board, and the files cut at the size cap | The `meeting.id`, its `mc.input.revision`, the window's start and end, and the files cut at the size cap | The window's start and end, and the files cut at the size cap |
+| `app-log.jsonl` | App lines with the call's id, trace id or session ids | App lines with the meeting's `meeting.id` or in the trace of one of its runs, from 1 minute before the job store took it to now | |
+| `<service>-log.jsonl` | `mc-capture` lines of the call's trace or `call.id` in the call's time span, 1 minute wider on each side, with the untraced lines of those helpers | `mc` lines picked like the app lines | Every service's lines in the window |
+| The call log | Whole | | |
+| `audio.json`, `video.json`, `finalize.json` | From the call folder, when present | | |
+| `job.json` and `debug-meeting-<id>/` | The job row and debug folder of the meeting made from the call, its dumps cut to the meeting's lines | The meeting's job row, and its debug folder after a new app recorder dump, its dumps cut to the meeting's lines | |
+| `env.jsonl` | | | Environment lines in the window |
+| `metrics.jsonl` | In `debug/`, the call's rows | | Host metric rows in the window |
+| `debug/` | Every file of the call's debug folder, after a new app recorder dump | | A new app recorder dump |
 
 Without "with text", the redaction also covers the new files: device names, meeting titles,
 note paths and error messages become their length. Units, stems, codecs, metric attributes and

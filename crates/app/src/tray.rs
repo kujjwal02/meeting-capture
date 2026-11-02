@@ -53,6 +53,7 @@ enum MenuAction {
     OpenNote(MeetingId),
     Retry(MeetingId),
     OverwriteEdits(MeetingId),
+    SaveMeetingDebugReport(MeetingId),
     StopRecording(PathBuf),
     ResumeRecording(PathBuf),
     RetryFailed,
@@ -77,6 +78,7 @@ impl MenuAction {
             MenuAction::OpenNote(id) => format!("open-note:{id}"),
             MenuAction::Retry(id) => format!("retry:{id}"),
             MenuAction::OverwriteEdits(id) => format!("overwrite-edits:{id}"),
+            MenuAction::SaveMeetingDebugReport(id) => format!("save-meeting-debug-report:{id}"),
             MenuAction::StopRecording(call_id) => format!("stop-recording:{}", call_id.display()),
             MenuAction::ResumeRecording(call_id) => {
                 format!("resume-recording:{}", call_id.display())
@@ -108,6 +110,9 @@ impl MenuAction {
         }
         if let Some(id) = id.strip_prefix("overwrite-edits:") {
             return meeting_id(id).map(MenuAction::OverwriteEdits);
+        }
+        if let Some(id) = id.strip_prefix("save-meeting-debug-report:") {
+            return meeting_id(id).map(MenuAction::SaveMeetingDebugReport);
         }
         if let Some(call_id) = id.strip_prefix("stop-recording:") {
             return Some(MenuAction::StopRecording(PathBuf::from(call_id)));
@@ -723,6 +728,15 @@ fn meeting_submenu(
             true,
         )?)?;
     }
+    // A meeting with a call log is in the call's report.
+    if !crate::call_debug::has_call_log(meeting) {
+        submenu.append(&action_entry(
+            app,
+            &MenuAction::SaveMeetingDebugReport(meeting.id),
+            "Save debug report",
+            true,
+        )?)?;
+    }
     Ok(submenu)
 }
 
@@ -810,6 +824,7 @@ fn handle_menu_event(app: &AppHandle, event: &MenuEvent) {
                 });
             }
         }
+        MenuAction::SaveMeetingDebugReport(id) => save_meeting_debug_report(app, id),
         MenuAction::StopRecording(call_id) => crate::call_capture::stop_call(app, &call_id),
         MenuAction::ResumeRecording(call_id) => crate::call_capture::resume_call(app, &call_id),
         MenuAction::RetryFailed => {
@@ -890,6 +905,20 @@ fn save_recent_debug_report(app: &AppHandle) {
     tauri::async_runtime::spawn_blocking(move || {
         if let Err(error) = crate::call_debug::save_recent_debug_report(&app, false) {
             tracing::error!(exception.message = %error, "could not save a debug report");
+            crate::notify(&app, "Debug report not saved", &error.to_string());
+        }
+    });
+}
+
+fn save_meeting_debug_report(app: &AppHandle, meeting_id: MeetingId) {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = crate::call_debug::save_meeting_debug_report(&app, meeting_id, false) {
+            tracing::error!(
+                meeting.id = meeting_id.as_i64(),
+                exception.message = %error,
+                "could not save a debug report"
+            );
             crate::notify(&app, "Debug report not saved", &error.to_string());
         }
     });
