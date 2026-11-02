@@ -376,7 +376,7 @@ Done when:
 - [x] Dumps on a call problem (app and audio helper, through `dump_recorder`), a failed helper, a
   failed pipeline run, a panic and "Save debug report".
 - [x] The debug report copies the app's daily files and the new dumps through its redaction.
-- [ ] The video helper dumps its recorder on a call problem.
+- [x] The video helper dumps its recorder on a call problem.
 - [ ] A real call problem leaves `recorder-app.jsonl` and `recorder-mc-capture-audio.jsonl` in the
   call's debug folder with the same `trace_id`.
 
@@ -389,7 +389,7 @@ Done when:
   on stdin after `start` and at each change.
 - [x] mc-meet gets `debug_mode` on connect and at each change. Its popup shows the end time.
 - [x] A saved report's `call-status.json` has `debug_mode_until`.
-- [ ] The video helper follows debug mode.
+- [x] The video helper follows debug mode.
 - [ ] One call in debug mode leaves DEBUG lines in `app`, `native-host` and `mc-capture` files.
 
 ### Step 3: metrics and environment
@@ -398,9 +398,9 @@ Done when:
 - [x] Per-stem audio levels and routes in the heartbeat.
 - [x] Caption channel series and acks from mc-meet, per channel and frame kind, with the caption
   channel and press events.
-- [ ] The user's speech from mc-meet as `mc.meet.self_speaking`. Meet's speaking indicator has
-  nothing stable to read.
-- [ ] Host CPU, memory, disk and power. CPU, memory and disk are built; power is not.
+- [x] The user's speech as `mc.audio.self_speaking`, from the mic stem's level over its noise
+  floor. Meet's speaking indicator has nothing stable to read.
+- [x] Host CPU, memory, disk and power.
 - [x] Decision events for source pick and calendar match.
 - [x] `env.jsonl` at app start, call start and each change.
 - [x] Video frames per second from the window video helper.
@@ -412,10 +412,11 @@ Done when:
   folder and the manifests, through the redaction.
 - [x] A report bundle for the last 30 minutes from the tray: every service's lines, the
   environment and host metric lines, and an app recorder dump.
-- [ ] A report bundle for a job without its call.
+- [x] A report bundle for a meeting without its call, from the tray.
 - [x] `mc debug timeline <bundle>` in IST, with `--by-minute` and `--service`.
 - [x] `mc debug export-otlp <bundle>`.
-- [ ] A Collector's `otlpjsonfile` receiver loads an export.
+- [x] A Collector's `otlpjsonfile` receiver loads an export with its default config: each
+  request stays under its 1 MiB line limit.
 
 ### Step 5: the 0.8.0 caption bug
 
@@ -424,9 +425,11 @@ Done when:
 
 ### Step 6: detectors
 
-- [ ] One detector trait. The call status rules move under it.
-- [ ] `mc debug replay <bundle>`.
-- [ ] Each `MC_CAPTURE_INJECT` fault raises its problem and leaves a recorder dump.
+- [x] One detector trait. The call status rules move under it.
+- [x] `mc debug replay <bundle>`.
+- [x] Each `MC_CAPTURE_INJECT` fault raises its problem and leaves a recorder dump:
+  `just inject-check`.
+- [ ] A live call and a huddle on the detector board: tray rows and notifications on screen.
 
 Done when:
 
