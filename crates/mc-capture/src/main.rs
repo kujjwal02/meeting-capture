@@ -10,6 +10,8 @@
 //! 90 days, as the app does at launch and once a day.
 
 #[cfg(target_os = "macos")]
+mod app_requests;
+#[cfg(target_os = "macos")]
 mod audio;
 #[cfg(target_os = "macos")]
 mod devices;
