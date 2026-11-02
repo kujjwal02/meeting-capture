@@ -1,10 +1,10 @@
 //! `mc debug export-otlp`: a bundle as OTLP/JSON, one export request per line, the shape an
 //! OpenTelemetry Collector's `otlpjsonfile` receiver reads.
 //!
-//! Each process's lines become one resource. Per resource the file gets up to three lines: an
-//! `ExportLogsServiceRequest`, an `ExportTraceServiceRequest` and an
-//! `ExportMetricsServiceRequest`. Ids stay in hex, as OTLP/JSON wants, and 64-bit numbers and
-//! times are strings.
+//! Each process's lines become one resource. Per resource the file gets
+//! `ExportLogsServiceRequest`, `ExportTraceServiceRequest` and `ExportMetricsServiceRequest`
+//! lines, each under `REQUEST_BUDGET_BYTES`. Ids stay in hex, as OTLP/JSON wants, and 64-bit
+//! numbers and times are strings.
 
 use std::collections::BTreeMap;
 use std::io::{BufWriter, Write as _};
@@ -27,6 +27,9 @@ const CUMULATIVE: u8 = 2;
 const METRICS_SCOPE: &str = "mc.metrics";
 const RECORDER_SCOPE: &str = "telemetry.recorder";
 const ENVIRONMENT_SCOPE: &str = "mc.env";
+/// The receiver's default `max_log_size` is 1 MiB, and it drops a longer line without an error.
+/// The budget counts records only, so it leaves 256 KiB for the resource and the wrappers.
+const REQUEST_BUDGET_BYTES: usize = 768 * 1024;
 
 pub(crate) struct Written {
     pub requests: usize,
@@ -124,7 +127,8 @@ pub(crate) fn export(bundle: &Bundle, out: &Path) -> anyhow::Result<Written> {
     write_requests(bundle, resources, out)
 }
 
-/// Writes up to three export requests per resource: logs, spans, metrics.
+/// Writes each resource's logs, spans and metrics as export requests of at most
+/// `REQUEST_BUDGET_BYTES` of records each. A metric's points may span several requests.
 fn write_requests(
     bundle: &Bundle,
     resources: BTreeMap<(String, Option<String>), ResourceSignals>,
@@ -139,13 +143,14 @@ fn write_requests(
         spans: 0,
         metric_points: 0,
     };
+    let mut oversized_records = 0_usize;
     for ((service, instance_id), signals) in resources {
         let resource =
             json!({ "attributes": resource_attributes(bundle, &service, instance_id.as_deref()) });
         let mut requests = Vec::new();
-        if !signals.logs.is_empty() {
-            let scope_logs: Vec<Value> = signals
-                .logs
+        let log_chunks = split_by_budget(signals.logs, &mut oversized_records)?;
+        for chunk in log_chunks {
+            let scope_logs: Vec<Value> = chunk
                 .into_iter()
                 .map(|(scope, records)| {
                     written.log_records += records.len();
@@ -156,9 +161,9 @@ fn write_requests(
                 json!({ "resourceLogs": [{ "resource": resource, "scopeLogs": scope_logs }] }),
             );
         }
-        if !signals.spans.is_empty() {
-            let scope_spans: Vec<Value> = signals
-                .spans
+        let span_chunks = split_by_budget(signals.spans, &mut oversized_records)?;
+        for chunk in span_chunks {
+            let scope_spans: Vec<Value> = chunk
                 .into_iter()
                 .map(|(scope, spans)| {
                     written.spans += spans.len();
@@ -169,13 +174,22 @@ fn write_requests(
                 json!({ "resourceSpans": [{ "resource": resource, "scopeSpans": scope_spans }] }),
             );
         }
-        if !signals.metrics.is_empty() {
-            let metrics: Vec<Value> = signals
-                .metrics
+        let mut units = BTreeMap::new();
+        let series_points = signals.metrics.into_iter().map(|(key, series)| {
+            units.insert(key.clone(), series.unit);
+            (key, series.data_points)
+        });
+        let metric_chunks = split_by_budget(series_points, &mut oversized_records)?;
+        for chunk in metric_chunks {
+            let metrics: Vec<Value> = chunk
                 .into_iter()
-                .map(|((name, kind), series)| {
-                    written.metric_points += series.data_points.len();
-                    metric(&name, kind, series)
+                .map(|((name, kind), data_points)| {
+                    written.metric_points += data_points.len();
+                    let unit = units
+                        .get(&(name.clone(), kind))
+                        .cloned()
+                        .unwrap_or_default();
+                    metric(&name, kind, MetricSeries { unit, data_points })
                 })
                 .collect();
             requests.push(json!({
@@ -192,7 +206,54 @@ fn write_requests(
         }
     }
     writer.flush()?;
+    if oversized_records > 0 {
+        eprintln!(
+            "{oversized_records} records are over {REQUEST_BUDGET_BYTES} bytes each: their \
+             requests may pass a Collector's default max_log_size of 1 MiB"
+        );
+    }
     Ok(written)
+}
+
+/// One request's records, by scope or by metric.
+type RequestGroups<Key> = Vec<(Key, Vec<Value>)>;
+
+/// Splits groups of records, such as a scope's log records or a metric's points, into requests
+/// whose records add up to at most `REQUEST_BUDGET_BYTES`. A group may span requests. A record
+/// over the budget goes in a request of its own.
+fn split_by_budget<Key: Clone>(
+    groups: impl IntoIterator<Item = (Key, Vec<Value>)>,
+    oversized_records: &mut usize,
+) -> anyhow::Result<Vec<RequestGroups<Key>>> {
+    let mut requests = Vec::new();
+    let mut request: RequestGroups<Key> = Vec::new();
+    let mut request_bytes = 0_usize;
+    for (key, records) in groups {
+        let mut group = Vec::new();
+        for record in records {
+            // The comma between records adds one byte each.
+            let record_bytes = serde_json::to_vec(&record)?.len() + 1;
+            if record_bytes > REQUEST_BUDGET_BYTES {
+                *oversized_records += 1;
+            }
+            if request_bytes + record_bytes > REQUEST_BUDGET_BYTES && request_bytes > 0 {
+                if !group.is_empty() {
+                    request.push((key.clone(), std::mem::take(&mut group)));
+                }
+                requests.push(std::mem::take(&mut request));
+                request_bytes = 0;
+            }
+            group.push(record);
+            request_bytes += record_bytes;
+        }
+        if !group.is_empty() {
+            request.push((key, group));
+        }
+    }
+    if !request.is_empty() {
+        requests.push(request);
+    }
+    Ok(requests)
 }
 
 fn push_log(signals: &mut ResourceSignals, scope: &str, record: Value) {

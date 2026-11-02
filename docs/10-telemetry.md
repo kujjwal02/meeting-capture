@@ -532,7 +532,9 @@ A counter's first row in the bundle is its baseline, so a counter that started b
 bundle adds nothing in that minute. A counter whose `start_timestamp` falls inside the bundle,
 or that started again, counts its whole total.
 
-The export writes one export request per line: logs, spans and metrics of one resource each.
+The export writes one export request per line: logs, spans or metrics of one resource. A
+request holds at most 768 KiB of records, and a resource's signal takes as many requests as it
+needs. The receiver's default `max_log_size` is 1 MiB, and it drops a longer line with no error.
 A resource is one process, from its `resource` line. mc-meet's rows get a resource of their
 own, with `service.name` `mc-meet`. An environment line goes to the resource of the process
 that wrote it. Without that process's `resource` line, the resource comes from the
