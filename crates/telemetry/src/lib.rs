@@ -15,6 +15,9 @@
 //! - The flight recorder: the last 10 minutes or 8 MB of DEBUG lines, in memory. A problem, a
 //!   panic, a failed job or a failed helper writes it to a debug folder with [`dump_recorder`].
 //!
+//! A [`LineTap`] installed with [`install_line_tap`] also gets chosen log lines and call metric
+//! rows as they are written.
+//!
 //! The crate is portable: no Tauri and no OS calls.
 
 pub mod debug_mode;
@@ -28,6 +31,7 @@ pub mod metrics;
 pub mod parsed;
 mod recorder;
 mod resource;
+mod tap;
 pub mod trace;
 
 pub use init::{
@@ -37,3 +41,4 @@ pub use init::{
 pub use log_file::daily_log_files;
 pub use recorder::{DumpError, DumpReason};
 pub use resource::Service;
+pub use tap::{LineTap, install_line_tap};

@@ -26,6 +26,7 @@ use tracing_subscriber::registry::LookupSpan;
 use crate::fields;
 use crate::init::FileRule;
 use crate::resource::Resource;
+use crate::tap::{LineTap, installed_tap};
 use crate::trace::{SpanId, SpanIds, TraceId};
 
 /// Takes finished lines, each ending in a newline.
@@ -196,12 +197,23 @@ impl<F, R> LineLayer<F, R> {
         }
     }
 
-    fn take_line(&self, metadata: &Metadata<'_>, at: Timestamp, line: Vec<u8>)
-    where
+    /// Hands the line to the sinks, and to `tap` when it wants the line.
+    fn take_line(
+        &self,
+        metadata: &Metadata<'_>,
+        at: Timestamp,
+        line: Vec<u8>,
+        tap: Option<&dyn LineTap>,
+    ) where
         F: LineSink,
         R: LineSink,
     {
         let _inside = SinkEntry::enter();
+        // A line the tap logged would come back through this layer into the tap, which may hold
+        // its own lock then. Inside the sink mark, a panic in the tap does not log either.
+        if let Some(tap) = tap {
+            tap.take(&line);
+        }
         if self.file_rule.keeps(metadata) {
             self.file.take_line(at, line.clone());
         }
@@ -273,7 +285,13 @@ where
             attributes: &collector.attributes,
         };
         if let Some(encoded) = encode(&line) {
-            self.take_line(metadata, at, encoded);
+            let tap = installed_tap().filter(|tap| {
+                matches!(
+                    collector.attributes.get(fields::EVENT_NAME),
+                    Some(Value::String(event_name)) if tap.wants_event(event_name)
+                )
+            });
+            self.take_line(metadata, at, encoded, tap);
         }
     }
 
@@ -306,7 +324,8 @@ where
             attributes: &record.fields,
         };
         if let Some(encoded) = encode(&line) {
-            self.take_line(span.metadata(), at, encoded);
+            // Detectors read events, not closed spans.
+            self.take_line(span.metadata(), at, encoded, None);
         }
     }
 }

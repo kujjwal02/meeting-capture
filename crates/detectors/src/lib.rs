@@ -13,6 +13,7 @@ mod capture;
 mod context;
 mod host;
 mod problem;
+mod queue;
 mod reading;
 mod verdict;
 
@@ -29,6 +30,7 @@ pub use host::{
     ProblemSpan, TraceKey,
 };
 pub use problem::{Layer, Problem};
+pub use queue::LineQueue;
 pub use verdict::{Verdict, VerdictPart, verdict};
 
 /// One rule set over one call's lines. It owns its state; the host owns time and transitions.

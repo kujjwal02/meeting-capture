@@ -34,5 +34,8 @@ pub const RECORDER_REASON: &str = "mc.recorder.reason";
 /// On the `dump` line that ends a dump file grown to its cap: later dumps add nothing.
 pub const RECORDER_IS_FILE_FULL: &str = "mc.recorder.is_file_full";
 
+/// What happened, on an event line: `call.started`, `capture.audio.stream_lost`.
+pub const EVENT_NAME: &str = "event.name";
+
 pub const EXCEPTION_MESSAGE: &str = "exception.message";
 pub const EXCEPTION_STACKTRACE: &str = "exception.stacktrace";
