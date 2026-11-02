@@ -143,6 +143,9 @@ const CODE_KEYS: &[&str] = &[
     "audio_capture",
     "screen_recording",
     "lid",
+    // Host power metric attributes.
+    "mc.host.power.source",
+    "hw.battery.state",
 ];
 
 /// The object that holds a `tracing` JSON line's fields, in reports saved before the telemetry

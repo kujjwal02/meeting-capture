@@ -37,5 +37,28 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "sync", "time"] }
 tracing.workspace = true
 
-[lints]
-workspace = true
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-core-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "CFArray",
+  "CFDictionary",
+  "CFNumber",
+  "CFString",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+  "std",
+  "NSProcessInfo",
+] }
+objc2-io-kit = { version = "0.3", default-features = false, features = ["std", "ps"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = ["Win32_System_Power"] }
+
+# The workspace forbids unsafe code, and `forbid` cannot be lowered per module. The power probe
+# calls IOKit and Win32, so the crate denies unsafe code and allows it in that probe alone.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "warn"
