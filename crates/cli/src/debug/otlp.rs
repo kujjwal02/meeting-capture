@@ -14,7 +14,9 @@ use anyhow::Context as _;
 use jiff::Timestamp;
 use serde_json::{Map, Value, json};
 
-use super::bundle::{Bundle, BundleLine, Entry, LogEntry, MetricPoint, Severity, SpanEntry};
+use telemetry::parsed::{Entry, Line, LogEntry, MetricPoint, Severity, SpanEntry};
+
+use super::bundle::Bundle;
 
 const TRACE_ID_BYTES: usize = 16;
 const SPAN_ID_BYTES: usize = 8;
@@ -60,8 +62,8 @@ pub(crate) fn export(bundle: &Bundle, out: &Path) -> anyhow::Result<Written> {
             .entry((line.service.clone(), line.instance_id.clone()))
             .or_default();
         match &line.entry {
-            Entry::Resource => {}
-            Entry::Dump { reason } => {
+            Entry::Resource(_) => {}
+            Entry::Dump { reason, .. } => {
                 let mut attributes = Map::new();
                 if let Some(reason) = reason {
                     attributes.insert(
@@ -202,7 +204,7 @@ fn push_log(signals: &mut ResourceSignals, scope: &str, record: Value) {
 }
 
 /// The record and whether an id was dropped for not being W3C hex.
-fn log_line_record(line: &BundleLine, log: &LogEntry) -> (Value, bool) {
+fn log_line_record(line: &Line, log: &LogEntry) -> (Value, bool) {
     let trace_id = log
         .trace_id
         .as_deref()
@@ -252,7 +254,7 @@ fn log_record(
 }
 
 /// `None` for a span whose ids are not W3C hex: a collector rejects it.
-fn span_record(line: &BundleLine, span: &SpanEntry) -> Option<Value> {
+fn span_record(line: &Line, span: &SpanEntry) -> Option<Value> {
     if !is_hex_id(&span.trace_id, TRACE_ID_BYTES) || !is_hex_id(&span.span_id, SPAN_ID_BYTES) {
         return None;
     }

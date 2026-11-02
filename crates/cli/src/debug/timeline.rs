@@ -8,7 +8,9 @@ use jiff::tz::{Offset, TimeZone};
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Map, Value};
 
-use super::bundle::{Bundle, BundleLine, Entry, LogEntry, MetricPoint, MetricRow};
+use telemetry::parsed::{Entry, Line, LogEntry, MetricPoint, MetricRow};
+
+use super::bundle::Bundle;
 
 const SELF_SPEAKING: &str = "mc.audio.self_speaking";
 const LEVEL_RMS: &str = "mc.audio.level.rms";
@@ -29,7 +31,7 @@ fn ist() -> TimeZone {
     TimeZone::fixed(Offset::constant(5).saturating_add(SignedDuration::from_mins(30)))
 }
 
-fn is_shown(line: &BundleLine, service: Option<&str>) -> bool {
+fn is_shown(line: &Line, service: Option<&str>) -> bool {
     service.is_none_or(|service| line.service == service)
 }
 
@@ -43,7 +45,7 @@ pub(crate) fn print_lines(
     for line in bundle.lines.iter().filter(|line| is_shown(line, service)) {
         let severity = match &line.entry {
             Entry::Log(log) => log.severity.text(),
-            Entry::Resource
+            Entry::Resource(_)
             | Entry::Dump { .. }
             | Entry::Span(_)
             | Entry::Metric(_)
@@ -62,9 +64,9 @@ pub(crate) fn print_lines(
     Ok(())
 }
 
-fn describe(bundle: &Bundle, line: &BundleLine) -> String {
+fn describe(bundle: &Bundle, line: &Line) -> String {
     match &line.entry {
-        Entry::Resource => {
+        Entry::Resource(_) => {
             let resource = line
                 .instance_id
                 .as_ref()
@@ -80,7 +82,7 @@ fn describe(bundle: &Bundle, line: &BundleLine) -> String {
                 field("process.pid")
             )
         }
-        Entry::Dump { reason } => {
+        Entry::Dump { reason, .. } => {
             format!("recorder dump: {}", reason.as_deref().unwrap_or("?"))
         }
         Entry::Log(log) => describe_log(log),
@@ -224,7 +226,7 @@ pub(crate) fn print_by_minute(
         bundle_start: bundle
             .lines
             .iter()
-            .find(|line| !matches!(line.entry, Entry::Resource))
+            .find(|line| !matches!(line.entry, Entry::Resource(_)))
             .map(|line| line.at),
         last_totals: HashMap::new(),
     };
@@ -249,7 +251,7 @@ pub(crate) fn print_by_minute(
                     );
                 }
             }
-            Entry::Resource | Entry::Dump { .. } | Entry::Span(_) | Entry::Env(_) => {}
+            Entry::Resource(_) | Entry::Dump { .. } | Entry::Span(_) | Entry::Env(_) => {}
         }
     }
     let time_zone = ist();
@@ -293,12 +295,7 @@ pub(crate) fn print_by_minute(
     Ok(())
 }
 
-fn add_metric_row(
-    minute: &mut Minute,
-    row: &MetricRow,
-    line: &BundleLine,
-    counters: &mut Counters,
-) {
+fn add_metric_row(minute: &mut Minute, row: &MetricRow, line: &Line, counters: &mut Counters) {
     let interval_ms = row.interval_ms.unwrap_or(DEFAULT_INTERVAL_MS);
     for point in &row.points {
         match point.name.as_str() {
@@ -355,7 +352,7 @@ impl Counters {
     // A series' first row is a baseline, unless the counter started inside the bundle. A new
     // start or a total below the last one is a counter that started again, such as a reloaded
     // Meet tab, so all of it is new.
-    fn added_since_last(&mut self, point: &MetricPoint, line: &BundleLine) -> f64 {
+    fn added_since_last(&mut self, point: &MetricPoint, line: &Line) -> f64 {
         let series = format!(
             "{}|{}|{}|{}",
             line.service,

@@ -24,6 +24,7 @@ mod init;
 mod line;
 mod log_file;
 pub mod metrics;
+pub mod parsed;
 mod recorder;
 mod resource;
 pub mod trace;

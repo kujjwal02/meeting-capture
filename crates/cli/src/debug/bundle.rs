@@ -15,199 +15,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow, bail};
 use jiff::Timestamp;
-use serde_json::{Map, Number, Value};
-
-/// The kind of a telemetry line, from its `record` field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecordKind {
-    Resource,
-    Dump,
-    Log,
-    Span,
-    Metric,
-    Env,
-}
-
-impl RecordKind {
-    const ALL: [Self; 6] = [
-        Self::Resource,
-        Self::Dump,
-        Self::Log,
-        Self::Span,
-        Self::Metric,
-        Self::Env,
-    ];
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Resource => "resource",
-            Self::Dump => "dump",
-            Self::Log => "log",
-            Self::Span => "span",
-            Self::Metric => "metric",
-            Self::Env => "env",
-        }
-    }
-
-    fn parse(text: &str) -> anyhow::Result<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|kind| kind.name() == text)
-            .ok_or_else(|| {
-                anyhow!(
-                    "field `record` is {text:?}; valid options: {}",
-                    option_list(Self::ALL.map(Self::name))
-                )
-            })
-    }
-}
-
-/// A log line's severity, as `tracing` names its levels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Severity {
-    Trace,
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Fatal,
-}
-
-impl Severity {
-    const ALL: [Self; 6] = [
-        Self::Trace,
-        Self::Debug,
-        Self::Info,
-        Self::Warn,
-        Self::Error,
-        Self::Fatal,
-    ];
-
-    pub(crate) fn text(self) -> &'static str {
-        match self {
-            Self::Trace => "TRACE",
-            Self::Debug => "DEBUG",
-            Self::Info => "INFO",
-            Self::Warn => "WARN",
-            Self::Error => "ERROR",
-            Self::Fatal => "FATAL",
-        }
-    }
-
-    /// OpenTelemetry's severity number: the first of each level's range.
-    pub(crate) fn number(self) -> u8 {
-        match self {
-            Self::Trace => 1,
-            Self::Debug => 5,
-            Self::Info => 9,
-            Self::Warn => 13,
-            Self::Error => 17,
-            Self::Fatal => 21,
-        }
-    }
-
-    fn parse(field: &str, text: &str) -> anyhow::Result<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|severity| severity.text().eq_ignore_ascii_case(text))
-            .ok_or_else(|| {
-                anyhow!(
-                    "field `{field}` is {text:?}; valid options: {}",
-                    option_list(Self::ALL.map(Self::text))
-                )
-            })
-    }
-}
-
-/// The kind a `record` field names. A value that is not a string is named by its JSON type.
-fn record_kind(record: &Value) -> anyhow::Result<RecordKind> {
-    match record {
-        Value::String(text) => RecordKind::parse(text),
-        Value::Null => bail!("field `record` is null, not a string"),
-        Value::Bool(_) => bail!("field `record` is a boolean, not a string"),
-        Value::Number(_) => bail!("field `record` is a number, not a string"),
-        Value::Array(_) => bail!("field `record` is an array, not a string"),
-        Value::Object(_) => bail!("field `record` is an object, not a string"),
-    }
-}
-
-fn option_list<const N: usize>(names: [&str; N]) -> String {
-    names.join(", ")
-}
+use serde_json::{Map, Value};
+use telemetry::parsed::{Entry, Line, LogEntry, Severity, parse_record};
 
 pub(crate) struct Bundle {
     /// Every line, oldest first.
-    pub lines: Vec<BundleLine>,
+    pub lines: Vec<Line>,
     /// Each process's resource attributes, by `service.instance.id`.
     pub resources: HashMap<String, Map<String, Value>>,
-}
-
-pub(crate) struct BundleLine {
-    pub at: Timestamp,
-    pub service: String,
-    pub instance_id: Option<String>,
-    pub entry: Entry,
-}
-
-pub(crate) enum Entry {
-    /// A process's resource line. Its attributes are in [`Bundle::resources`].
-    Resource,
-    Dump {
-        reason: Option<String>,
-    },
-    Log(LogEntry),
-    Span(SpanEntry),
-    Metric(MetricRow),
-    /// An environment line's fields, without `record` and `timestamp`.
-    Env(Map<String, Value>),
-}
-
-pub(crate) struct LogEntry {
-    pub severity: Severity,
-    pub body: String,
-    pub scope: Option<String>,
-    pub trace_id: Option<String>,
-    pub span_id: Option<String>,
-    pub attributes: Map<String, Value>,
-}
-
-pub(crate) struct SpanEntry {
-    pub name: String,
-    pub scope: Option<String>,
-    pub trace_id: String,
-    pub span_id: String,
-    pub parent_span_id: Option<String>,
-    pub started_at: Timestamp,
-    pub attributes: Map<String, Value>,
-}
-
-pub(crate) struct MetricRow {
-    pub interval_ms: Option<u64>,
-    pub points: Vec<MetricPoint>,
-}
-
-pub(crate) struct MetricPoint {
-    /// The OpenTelemetry metric name, without the attribute suffix of the row's key.
-    pub name: String,
-    pub value: Number,
-    pub unit: String,
-    pub attributes: Map<String, Value>,
-    /// Set on a cumulative counter: when it started counting.
-    pub start: Option<Timestamp>,
-}
-
-impl MetricPoint {
-    pub(crate) fn value_f64(&self) -> f64 {
-        self.value.as_f64().unwrap_or_default()
-    }
-
-    /// The attribute's text: a string as is, any other value in JSON.
-    pub(crate) fn attribute(&self, key: &str) -> Option<String> {
-        self.attributes.get(key).map(|value| match value {
-            Value::String(text) => text.clone(),
-            other => other.to_string(),
-        })
-    }
 }
 
 impl Bundle {
@@ -237,7 +52,7 @@ impl Bundle {
 }
 
 enum Parsed {
-    Line(Box<BundleLine>),
+    Line(Box<Line>),
     /// A line with no time to place it by.
     Untimed,
     /// A line another file of the bundle already holds.
@@ -246,7 +61,7 @@ enum Parsed {
 
 #[derive(Default)]
 struct Reader {
-    lines: Vec<BundleLine>,
+    lines: Vec<Line>,
     resources: HashMap<String, Map<String, Value>>,
     seen: HashSet<String>,
     untimed_lines: usize,
@@ -295,9 +110,10 @@ impl Reader {
             };
             let parsed = match fields.get("record") {
                 Some(_) if !self.seen.insert(canonical_text(&fields)) => Ok(Parsed::Repeat),
-                Some(record) => record_kind(record)
-                    .and_then(|kind| self.record_line(kind, fields))
+                Some(_) => parse_record(fields)
+                    .map_err(anyhow::Error::from)
                     .map(|line| {
+                        let line = self.adopt(line);
                         if self.is_repeated_meet_event(&line) {
                             Parsed::Repeat
                         } else {
@@ -324,7 +140,7 @@ impl Reader {
 
     /// Whether another file already held this mc-meet event. The app writes each event to its
     /// log and to the call's `events.jsonl`; the two lines differ in time and process fields.
-    fn is_repeated_meet_event(&mut self, line: &BundleLine) -> bool {
+    fn is_repeated_meet_event(&mut self, line: &Line) -> bool {
         let Entry::Log(log) = &line.entry else {
             return false;
         };
@@ -349,103 +165,42 @@ impl Reader {
         !self.seen.insert(key)
     }
 
-    fn record_line(
-        &mut self,
-        kind: RecordKind,
-        mut fields: Map<String, Value>,
-    ) -> anyhow::Result<BundleLine> {
-        let at = required_time(&fields, "timestamp")?;
-        let (service, instance_id, entry) = match kind {
-            RecordKind::Resource | RecordKind::Dump => {
-                let Some(Value::Object(resource)) = fields.remove("resource") else {
-                    bail!("field `resource` is missing or not an object");
-                };
-                let service = required_text(&resource, "service.name")?;
-                let instance_id = optional_text(&resource, "service.instance.id");
+    /// Files a telemetry line's process under the bundle's own rules: mc-meet's events go to
+    /// mc-meet, and resource attributes go to [`Bundle::resources`].
+    fn adopt(&mut self, mut line: Line) -> Line {
+        match &mut line.entry {
+            Entry::Resource(resource) | Entry::Dump { resource, .. } => {
                 // The process's own line wins over what an environment line said of it.
-                if let Some(instance_id) = &instance_id {
-                    self.resources.insert(instance_id.clone(), resource);
+                if let Some(instance_id) = &line.instance_id {
+                    self.resources.insert(instance_id.clone(), resource.clone());
                 }
-                let entry = match kind {
-                    RecordKind::Dump => Entry::Dump {
-                        reason: fields.get("attributes").and_then(|attributes| {
-                            optional_text_in(attributes, "mc.recorder.reason")
-                        }),
-                    },
-                    RecordKind::Resource
-                    | RecordKind::Log
-                    | RecordKind::Span
-                    | RecordKind::Metric
-                    | RecordKind::Env => Entry::Resource,
-                };
-                (service, instance_id, entry)
             }
-            RecordKind::Log => log_entry(fields)?,
-            RecordKind::Span => {
-                let Some(Value::Object(span)) = fields.get("span") else {
-                    bail!("field `span` is missing or not an object");
-                };
-                let entry = Entry::Span(SpanEntry {
-                    name: required_text(span, "name")?,
-                    scope: optional_text(&fields, "scope"),
-                    trace_id: required_text(&fields, "trace_id")?,
-                    span_id: required_text(&fields, "span_id")?,
-                    parent_span_id: optional_text(span, "parent_span_id"),
-                    started_at: required_time(span, "start_timestamp")?,
-                    attributes: take_object(&mut fields, "attributes"),
-                });
-                (
-                    required_text(&fields, "service.name")?,
-                    optional_text(&fields, "service.instance.id"),
-                    entry,
-                )
+            Entry::Env(fields) => {
+                // The resource fields name the process: they go to its resource, which a
+                // bundle without the process's resource line then still has.
+                let mut resource = Map::new();
+                for key in ENV_RESOURCE_KEYS {
+                    if let Some(value) = fields.remove(key) {
+                        resource.insert(key.to_owned(), value);
+                    }
+                }
+                if let Some(instance_id) = &line.instance_id {
+                    self.resources
+                        .entry(instance_id.clone())
+                        .or_insert(resource);
+                }
             }
-            RecordKind::Metric => {
-                let points = take_object(&mut fields, "points")
-                    .into_iter()
-                    .map(|(key, point)| metric_point(&key, point))
-                    .collect::<anyhow::Result<Vec<_>>>()?;
-                let entry = Entry::Metric(MetricRow {
-                    interval_ms: fields.get("interval_ms").and_then(Value::as_u64),
-                    points,
-                });
-                (
-                    required_text(&fields, "service.name")?,
-                    optional_text(&fields, "service.instance.id"),
-                    entry,
-                )
+            Entry::Log(log) => {
+                // The app logs mc-meet's events under scope `mc_meet`. They are mc-meet's, as
+                // its metric rows are, which name no process.
+                if log.scope.as_deref().is_some_and(is_mc_meet_scope) {
+                    MC_MEET_SERVICE.clone_into(&mut line.service);
+                    line.instance_id = None;
+                }
             }
-            RecordKind::Env => self.env_entry(fields),
-        };
-        Ok(BundleLine {
-            at,
-            service,
-            instance_id,
-            entry,
-        })
-    }
-
-    /// An environment line's service, process and fields.
-    fn env_entry(&mut self, mut fields: Map<String, Value>) -> (String, Option<String>, Entry) {
-        fields.remove("record");
-        fields.remove("timestamp");
-        // The app writes the environment lines: one that names no process is the app's.
-        let service = optional_text(&fields, "service.name").unwrap_or_else(|| "app".to_owned());
-        let instance_id = optional_text(&fields, "service.instance.id");
-        // The resource fields name the process: they go to its resource, which a
-        // bundle without the process's resource line then still has.
-        let mut resource = Map::new();
-        for key in ENV_RESOURCE_KEYS {
-            if let Some(value) = fields.remove(key) {
-                resource.insert(key.to_owned(), value);
-            }
+            Entry::Span(_) | Entry::Metric(_) => {}
         }
-        if let Some(instance_id) = &instance_id {
-            self.resources
-                .entry(instance_id.clone())
-                .or_insert(resource);
-        }
-        (service, instance_id, Entry::Env(fields))
+        line
     }
 
     /// A line of a report saved before the telemetry format.
@@ -480,7 +235,7 @@ impl Reader {
             .or_else(|| optional_text(&fields, "kind"))
             .unwrap_or_else(|| "line".to_owned());
         fields.remove("received_at");
-        Ok(Parsed::Line(Box::new(BundleLine {
+        Ok(Parsed::Line(Box::new(Line {
             at,
             // The app keeps these events as mc-meet sent them.
             service: MC_MEET_SERVICE.to_owned(),
@@ -497,32 +252,9 @@ impl Reader {
     }
 }
 
-/// A log line's service, process and entry.
-fn log_entry(mut fields: Map<String, Value>) -> anyhow::Result<(String, Option<String>, Entry)> {
-    let severity = Severity::parse("severity_text", &required_text(&fields, "severity_text")?)?;
-    let scope = optional_text(&fields, "scope");
-    let service = required_text(&fields, "service.name")?;
-    // The app logs mc-meet's events under scope `mc_meet`. They are mc-meet's, as
-    // its metric rows are, which name no process.
-    let (service, instance_id) = if scope.as_deref().is_some_and(is_mc_meet_scope) {
-        (MC_MEET_SERVICE.to_owned(), None)
-    } else {
-        (service, optional_text(&fields, "service.instance.id"))
-    };
-    let entry = Entry::Log(LogEntry {
-        severity,
-        body: optional_text(&fields, "body").unwrap_or_default(),
-        scope,
-        trace_id: optional_text(&fields, "trace_id"),
-        span_id: optional_text(&fields, "span_id"),
-        attributes: take_object(&mut fields, "attributes"),
-    });
-    Ok((service, instance_id, entry))
-}
-
 /// A `tracing_subscriber` JSON line: `timestamp`, `level`, `fields` with `message`, `target`, and
 /// the enclosing spans.
-fn tracing_line(file_name: &str, mut fields: Map<String, Value>) -> anyhow::Result<BundleLine> {
+fn tracing_line(file_name: &str, mut fields: Map<String, Value>) -> anyhow::Result<Line> {
     let at = required_time(&fields, "timestamp")?;
     let severity = Severity::parse("level", &required_text(&fields, "level")?)?;
     let mut attributes = Map::new();
@@ -540,7 +272,7 @@ fn tracing_line(file_name: &str, mut fields: Map<String, Value>) -> anyhow::Resu
         None => String::new(),
     };
     attributes.extend(event_fields);
-    Ok(BundleLine {
+    Ok(Line {
         at,
         service: earlier_log_service(file_name).to_owned(),
         instance_id: None,
@@ -568,25 +300,6 @@ fn earlier_file_label(file_name: &str) -> &'static str {
         .into_iter()
         .find(|label| file_name.starts_with(label))
         .unwrap_or("call-log")
-}
-
-/// One entry of a metric row's `points`. The key is the name, then `|` and the attributes when
-/// one name has several series.
-fn metric_point(key: &str, point: Value) -> anyhow::Result<MetricPoint> {
-    let name = key.split_once('|').map_or(key, |(name, _)| name).to_owned();
-    let Value::Object(mut point) = point else {
-        bail!("metric point `{key}` is not an object");
-    };
-    let Some(Value::Number(value)) = point.remove("value") else {
-        bail!("metric point `{key}`: field `value` is missing or not a number");
-    };
-    Ok(MetricPoint {
-        name,
-        value,
-        unit: optional_text(&point, "unit").unwrap_or_default(),
-        start: optional_time(&point, "start_timestamp"),
-        attributes: take_object(&mut point, "attributes"),
-    })
 }
 
 /// Every `.jsonl` file under `path`, in name order, or `path` itself when it is a file.
