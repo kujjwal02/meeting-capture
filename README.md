@@ -125,11 +125,16 @@ just hooks
 | `just signing-cert` | Adds the self-signed code-signing identity to the login keychain, once. macOS keeps the app's permissions across updates only with a stable identity. |
 | `just meet-e2e` | Runs a live Meet call through mc-meet and a dev app, then checks the call log and the note. Needs two Google accounts: see [tools/meet-e2e](tools/meet-e2e/README.md). |
 | `just release` | Runs `just check`, then builds the signed DMG, the updater package and `latest.json` in `target/dist`. |
+| `just publish` | Runs `just release` from the version's pushed tag, then publishes the GitHub release and updates the Homebrew cask. |
 
 To release, set `version` in `Cargo.toml`, merge to `main`, then push a tag such as `v0.3.0`. The
 Release workflow runs the checks, builds and signs the app, publishes the GitHub release, and
 updates the [Homebrew cask](https://github.com/kujjwal02/homebrew-tap). Installed apps check for a new
 release about every hour while the computer is awake.
+
+GitHub cancels a job after about 15 minutes when no hosted runner takes it. The "Rerun jobs that got
+no runner" workflow then reruns the job, with at most 3 attempts per run. If the release still gets
+no macOS runner, cancel the run and run `just publish` on a Mac that holds the signing keys.
 
 To keep a dev run away from your real job store, set `MEETING_CAPTURE_HOME` to a scratch folder. The
 app then reads `config/settings.toml` and writes `data/` inside it. It also runs next to the

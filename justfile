@@ -66,6 +66,13 @@ signing-cert:
 [macos]
 release: check bundle
 
+# Check, build and publish the version's pushed tag from this Mac, without the Release workflow.
+[macos]
+publish:
+    scripts/publish-release.sh check
+    just release
+    scripts/publish-release.sh upload
+
 # Build the signed DMG, the signed updater package and latest.json into
 # target/dist/. The release workflow sets the updater key variables; locally they default to the files in ~/.tauri.
 [macos]
