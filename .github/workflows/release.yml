@@ -13,12 +13,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check:
-    uses: ./.github/workflows/check.yml
+  windows:
+    name: clippy (Windows)
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  # Runs just check itself, so a release waits for one macOS runner and not two.
   release:
-    needs: check
-    runs-on: macos-15
+    needs: windows
+    runs-on: macos-26
     permissions:
       contents: write
     outputs:
@@ -30,7 +38,7 @@ jobs:
           persist-credentials: false
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
-          tool: just@1.58.0,tauri-cli@2.12.3
+          tool: just@1.58.0,taplo@0.10.0,typos@1.51.1,biome@2.5.15,rumdl@0.2.79,cargo-deny@0.20.2,cargo-shear@1.14.0,tauri-cli@2.12.3
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Check the tag matches the workspace version
@@ -43,6 +51,8 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - run: just check
 
       # The same self-signed identity as `just signing-cert`, so macOS keeps the app's permissions
       # across updates.
