@@ -2,7 +2,8 @@
 // It wraps RTCPeerConnection to read Meet's data channels, opens the caption channels itself,
 // and reads two Meet RPC responses through a fetch wrapper. It sends what it reads to the
 // content script as JSON strings in "mc-meet:page" events, and takes commands from
-// "mc-meet:content" events: listen, snapshot for debug material, and debug_mode. Once a second
+// "mc-meet:content" events: listen, snapshot for debug material, debug_mode, and
+// reopen_caption_channels. Once a second
 // it posts caption channel telemetry: counters, lifecycle events and, in debug mode, raw frames.
 // It makes no network requests of its own.
 (() => {
@@ -20,6 +21,10 @@
   const MAX_EARLY_MESSAGES = 2000;
   const REOPEN_ATTEMPTS = 5;
   const REOPEN_DELAY_MS = 2000;
+  // Meet's own captions_v2 normally exists before "collections". In the one call where it came
+  // after the hook's channels, no caption reached any channel. Builds with no such channel wait
+  // this long.
+  const MEET_CAPTION_CHANNEL_WAIT_MS = 3000;
   // Data channels a snapshot lists, newest last.
   const SNAPSHOT_CHANNELS = 30;
   const TELEMETRY_INTERVAL_MS = 1000;
@@ -44,6 +49,9 @@
   let captionChannelsOpenedAt;
   const ownChannels = new WeakSet();
   const watchedChannels = new WeakSet();
+  const connectionsWithMeetChannel = new WeakSet();
+  const connectionsWithOwnChannels = new WeakSet();
+  let meetingConnectionAdoptedAtMs = 0;
   // { label, isOwn, channel } per channel seen, newest last. A closed channel's entry lets go of
   // it, so Meet's closed channels and their connections can be freed.
   const seenChannels = [];
@@ -70,7 +78,10 @@
     post({
       t: "hook_state",
       installed: Boolean(wire && NativePeerConnection),
-      caption_channels_opened_at: captionChannelsOpenedAt ?? null,
+      // RTCPeerConnection.close() fires no connectionstatechange, so a time from a closed
+      // connection is read here, not only cleared by the listener.
+      caption_channels_opened_at:
+        meetingConnection?.connectionState === "closed" ? null : (captionChannelsOpenedAt ?? null),
     });
   }
 
@@ -286,7 +297,11 @@
   function openCaptionChannel(connection, label, attempt) {
     let channel;
     try {
-      channel = connection.createDataChannel(label, { ordered: true, maxRetransmits: 10 });
+      // The native call, so the createDataChannel wrapper never reads this channel as Meet's.
+      channel = nativeCreateDataChannel.call(connection, label, {
+        ordered: true,
+        maxRetransmits: 10,
+      });
     } catch (error) {
       post({ t: "caption_channel_failed", label, error: String(error?.message ?? error) });
       return;
@@ -295,7 +310,22 @@
     ownChannels.add(channel);
     noteChannel(channel);
     watchChannel(channel);
+    // A press while the hook's captions_v2 is not open would turn Meet's caption box on, so the
+    // opened time holds exactly while it is open.
+    if (label === "captions_v2") {
+      const noteOwnChannelOpen = () => {
+        if (meetingConnection !== connection) return;
+        captionChannelsOpenedAt = Date.now();
+        postHookState();
+      };
+      if (channel.readyState === "open") noteOwnChannelOpen();
+      else channel.addEventListener("open", noteOwnChannelOpen, { once: true });
+    }
     channel.addEventListener("close", () => {
+      if (label === "captions_v2" && meetingConnection === connection) {
+        captionChannelsOpenedAt = undefined;
+        postHookState();
+      }
       const isLive =
         connection.connectionState !== "closed" && connection.connectionState !== "failed";
       if (isLive && meetingConnection === connection && attempt < REOPEN_ATTEMPTS) {
@@ -304,15 +334,45 @@
     });
   }
 
-  // The connection that carries "collections" is the meeting's. Open caption channels on it once.
-  // Meet then streams captions to us without the captions button. The language stays Meet's.
+  function openOwnCaptionChannels(connection) {
+    if (meetingConnection !== connection || connectionsWithOwnChannels.has(connection)) return;
+    if (connection.signalingState === "closed") return;
+    connectionsWithOwnChannels.add(connection);
+    noteTelemetryEvent("mc.caption.channels.opened", {
+      "mc.caption.channels.wait_ms": Date.now() - meetingConnectionAdoptedAtMs,
+      "mc.caption.channels.is_meet_channel_seen": connectionsWithMeetChannel.has(connection),
+    });
+    for (const label of CAPTION_LABELS) openCaptionChannel(connection, label, 0);
+  }
+
+  // The connection that carries "collections" is the meeting's. Open caption channels on it once,
+  // after Meet's own captions_v2. Meet then streams captions to us without the captions button.
+  // The language stays Meet's.
   function adoptMeetingConnection(connection) {
     if (meetingConnection === connection) return;
     meetingConnection = connection;
-    reader.newCall();
-    for (const label of CAPTION_LABELS) openCaptionChannel(connection, label, 0);
-    captionChannelsOpenedAt = Date.now();
+    meetingConnectionAdoptedAtMs = Date.now();
+    captionChannelsOpenedAt = undefined;
     postHookState();
+    reader.newCall();
+    if (connectionsWithMeetChannel.has(connection)) {
+      openOwnCaptionChannels(connection);
+      return;
+    }
+    setTimeout(() => openOwnCaptionChannels(connection), MEET_CAPTION_CHANNEL_WAIT_MS);
+  }
+
+  // Closes the hook's open caption channels. Each one's close listener opens it again after
+  // REOPEN_DELAY_MS, which comes after Meet's own channel. The content script asks when Meet
+  // answered no press.
+  function reopenOwnCaptionChannels() {
+    const openChannels = [...captionChannelStats.values()]
+      .map((stats) => stats.channel)
+      .filter((channel) => ownChannels.has(channel) && channel.readyState === "open");
+    if (!meetingConnection || openChannels.length === 0) return;
+    captionChannelsOpenedAt = undefined;
+    postHookState();
+    for (const channel of openChannels) nativeCloseChannel.call(channel);
   }
 
   function noteChannel(channel) {
@@ -327,6 +387,10 @@
   function onChannel(connection, channel) {
     noteChannel(channel);
     watchChannel(channel);
+    if (channel.label === "captions_v2") {
+      connectionsWithMeetChannel.add(connection);
+      openOwnCaptionChannels(connection);
+    }
     if (channel.label === "collections") adoptMeetingConnection(connection);
   }
 
@@ -334,7 +398,7 @@
   NativePeerConnection.prototype.createDataChannel = function (...args) {
     const channel = nativeCreateDataChannel.apply(this, args);
     try {
-      if (channel && !ownChannels.has(channel)) onChannel(this, channel);
+      if (channel) onChannel(this, channel);
     } catch {}
     return channel;
   };
@@ -425,6 +489,10 @@
     }
     if (command?.t === "debug_mode") {
       debugModeUntilMs = Number.isFinite(command.until_ms) ? command.until_ms : 0;
+      return;
+    }
+    if (command?.t === "reopen_caption_channels") {
+      reopenOwnCaptionChannels();
       return;
     }
     if (command?.t !== "listen") return;

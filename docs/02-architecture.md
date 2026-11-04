@@ -155,10 +155,10 @@ in the `detectors` crate and read the app's own event lines and call metric rows
   rebuilt only when a call opens or ends or a capture problem starts or clears; the status tick
   changes the text of its call lines in place, so an open menu stays open. On Windows the
   tooltip is cut to 127 UTF-16 units.
-- Notifications: "Recording" once per call at its first caption. "Not recording" after a caption
+- Notifications: "Recording" once per call at its first caption. "No captions" after a caption
   problem lasts 30 s, once per reason in one outage. "Recording again" at the first caption after
   it, which ends the outage, so a later outage is announced again. "No transcript captured" when
-  a call ends with no caption. A Meet tab that closed or reloaded gets no "Not recording", since
+  a call ends with no caption. A Meet tab that closed or reloaded gets no "No captions", since
   mc-meet ends the call in 5 minutes unless the tab comes back. "mc-meet disconnected" gets one
   only while another mc-meet port is connected: with none, the browser quit. "Audio problem" or
   "Video problem" after a capture problem lasts 30 s, and "Audio back" or "Video back" when it

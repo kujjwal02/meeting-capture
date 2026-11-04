@@ -16,8 +16,10 @@ const MIN_CAPTION_SEGMENTS: usize = 3;
 #[derive(Debug, Clone, Copy)]
 pub enum Intake {
     Recorded(MeetingId),
-    /// Shorter than the tray's minimum, or with too few caption segments. Intake logs the length.
+    /// Shorter than the tray's minimum. Intake logs the length.
     TooShort,
+    /// Long enough, with fewer than `MIN_CAPTION_SEGMENTS` caption segments. Intake logs both.
+    TooFewCaptions,
 }
 
 /// A saved input that cannot be read, or does not parse as its kind.
@@ -100,13 +102,21 @@ impl Pipeline {
         let (input, transcript) = read_as(kind, log_path)?;
         let length_s = transcript.duration().as_secs();
         let segments = transcript.segments.len();
-        if length_s < i64::from(min_call_seconds) || segments < MIN_CAPTION_SEGMENTS {
+        if length_s < i64::from(min_call_seconds) {
             tracing::info!(
                 call.length_s = length_s,
                 caption.segments = segments,
                 "short call; no note"
             );
             return Ok(Intake::TooShort);
+        }
+        if segments < MIN_CAPTION_SEGMENTS {
+            tracing::info!(
+                call.length_s = length_s,
+                caption.segments = segments,
+                "too few captions; no note"
+            );
+            return Ok(Intake::TooFewCaptions);
         }
         let id = self.record(kind, log_path, &input, &transcript)?;
         Ok(Intake::Recorded(id))

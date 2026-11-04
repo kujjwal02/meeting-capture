@@ -76,6 +76,12 @@ button reads on (`aria-pressed` true), still with no box. A second press stops t
 and the button reads off about 30 s later. Meet also opens its own negotiated `captions_v2`
 (id 125) at call start.
 
+Measured over 15 calls up to 2026-11-04, Meet's `captions_v2` existed before the hook's channels in
+14. In those 14, Meet's channel got 1 control frame at its start. In the other call Meet created it
+70 ms after the hook's channels opened. The hook's `captions_v2` then got about 1 control frame per
+second from its start, before any press. Meet's channel got none. No utterance arrived in 27
+minutes, and 3 C presses changed nothing. The hook waits for Meet's channel.
+
 ## Telemetry counts
 
 The page hook counts each caption channel apart, by the channel object, and reports it under

@@ -10,6 +10,8 @@
 
   const selectors = globalThis.mcMeetSelectors;
   const findIconButton = globalThis.mcMeetFindIconButton;
+  // Telemetry sends these tag names as they are, and "other" or "none" for the rest.
+  const PRESS_ACTIVE_ELEMENTS = new Set(["body", "button", "div", "iframe", "input", "textarea"]);
   const callEvents = globalThis.mcMeetCallEvents;
 
   const SESSION_KEY = "mc-meet-session";
@@ -47,6 +49,7 @@
   // This call's captions presses, for the debug snapshot: Meet may ignore a press made while the
   // page has no focus, and the console line is gone once the tab closes.
   let captionsPresses = [];
+  let captionChannelReopens = 0;
   let isSelfRemoved = false;
   let selfName = "";
   let isRosterFromChannel = false;
@@ -232,6 +235,7 @@
     lastRosterKey = "";
     lastHealthKey = "";
     captionsPresses = [];
+    captionChannelReopens = 0;
     lastControl = null;
     // The last call's "unavailable" text would read as this call's notice.
     globalThis.mcMeetForgetUnavailableTooltip();
@@ -295,15 +299,18 @@
   // the stream, so the policy presses again only while Meet's control has not read on since.
   // Never touches the caption language. control is Meet's captions control as the check read it.
   function requestCaptions(nowMs, control) {
-    const notePress = (isShortcut) => {
+    // Read before the press: the dispatch could change them.
+    const hasFocus = document.hasFocus();
+    const isVisible = document.visibilityState === "visible";
+    const notePress = (isShortcut, keyOutcome) => {
       // Meet may ignore the press while the page has no focus, as a notification can take it.
       const press = {
         at: new Date(nowMs).toISOString(),
         is_shortcut: isShortcut,
         reason: captionsPresses.length === 0 ? "first" : "retry",
         control_state_before: controlStateOf(control),
-        has_focus: document.hasFocus(),
-        is_visible: document.visibilityState === "visible",
+        has_focus: hasFocus,
+        is_visible: isVisible,
       };
       captionsPresses.push(press);
       console.info("mc-meet: captions press", press);
@@ -315,12 +322,13 @@
         "mc.caption.control.state_before": press.control_state_before,
         "mc.caption.control.kind": control.kind,
         "mc.caption.press.number": captionsPresses.length,
+        ...keyOutcome,
       });
       captionSource.decide({ kind: "captions_requested", atMs: nowMs });
     };
     const button = findIconButton(selectors.captionsOffIcon);
     if (button) {
-      notePress(false);
+      notePress(false, {});
       button.click();
       return;
     }
@@ -328,9 +336,11 @@
     // shortcut presses it without the popup.
     const menuButton = findIconButton(selectors.captionsMenuIcon);
     if (menuButton?.getAttribute("aria-pressed") !== "false") return;
-    notePress(true);
+    // Whether Meet's handler took the key, and what held focus, tell an ignored press apart.
+    const activeTag = document.activeElement?.tagName?.toLowerCase();
+    let isKeyDefaultPrevented = false;
     for (const type of ["keydown", "keyup"]) {
-      document.body.dispatchEvent(
+      const isDispatchedPlainly = document.body.dispatchEvent(
         new KeyboardEvent(type, {
           key: "c",
           code: "KeyC",
@@ -339,7 +349,30 @@
           cancelable: true,
         }),
       );
+      if (type === "keydown") isKeyDefaultPrevented = !isDispatchedPlainly;
     }
+    notePress(true, {
+      "mc.caption.press.is_key_default_prevented": isKeyDefaultPrevented,
+      "mc.caption.press.active_element": PRESS_ACTIVE_ELEMENTS.has(activeTag)
+        ? activeTag
+        : activeTag
+          ? "other"
+          : "none",
+    });
+  }
+
+  // Meet took no press on these channels. New channels open after Meet's own and get new presses.
+  function reopenCaptionChannels() {
+    captionSource.decide({ kind: "channels_reopen_requested" });
+    captionChannelReopens += 1;
+    noteTelemetryEvent("mc.caption.channels.reopen", {
+      "mc.caption.channels.reopen_number": captionChannelReopens,
+    });
+    document.dispatchEvent(
+      new CustomEvent("mc-meet:content", {
+        detail: JSON.stringify({ t: "reopen_caption_channels" }),
+      }),
+    );
   }
 
   // ---- Telemetry. The hook posts once a second; each post goes on with this script's events.
@@ -602,10 +635,12 @@
       atMs: nowMs,
       isCaptionsOn: button.isOn,
       isCaptionsUnavailable: button.isUnavailable,
+      isMenuControl: button.kind === "menu",
     });
     noteControl(button);
     follow(decision);
-    if (decision.isCaptionsRequestDue) requestCaptions(nowMs, button);
+    if (decision.isChannelsReopenDue) reopenCaptionChannels();
+    else if (decision.isCaptionsRequestDue) requestCaptions(nowMs, button);
 
     const isRosterLate = nowMs - call.page_started_ms >= ROSTER_WAIT_MS;
     if (!isRosterFromChannel && isRosterLate && nowMs - lastDomRosterMs >= DOM_ROSTER_EVERY_MS) {

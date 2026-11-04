@@ -63,8 +63,8 @@ pub enum Notice {
     /// The first caption arrived.
     Recording,
     /// A caption problem lasted 30 s. Once per problem in one outage.
-    NotRecording(Problem),
-    /// A caption arrived after a `NotRecording`. It ends the outage.
+    CaptionTrouble(Problem),
+    /// A caption arrived after a `CaptionTrouble`. It ends the outage.
     RecordingAgain,
     /// The call ended with no caption.
     NoTranscript,
@@ -226,7 +226,7 @@ struct Notices {
     /// The problems announced in each detector's current outage. A caption outage ends at a
     /// "Recording again"; a capture outage at its clear.
     outages: HashMap<DetectorKind, HashSet<Problem>>,
-    /// When the last "Not recording" went out. A caption after it is a recovery.
+    /// When the last "No captions" went out. A caption after it is a recovery.
     recovery_owed_since: Option<Timestamp>,
     is_no_transcript_announced: bool,
 }
@@ -539,7 +539,7 @@ impl CallSlot {
             } else {
                 self.notices.recovery_owed_since = Some(at);
                 if is_new_in_outage {
-                    notices.push(Notice::NotRecording(active.problem));
+                    notices.push(Notice::CaptionTrouble(active.problem));
                 }
             }
         }

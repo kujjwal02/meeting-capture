@@ -1,4 +1,4 @@
-//! What each call is doing now: waiting for its first caption, recording, or not recording and
+//! What each call is doing now: waiting for its first caption, recording, or a caption problem and
 //! why, and whether its capture has a problem. Meet calls and Slack huddles both feed it. The
 //! rules live in the `detectors` crate and read the app's own telemetry lines; the board feeds
 //! them each tick, keeps the caption tally and the titles, and says what to announce. The tray,
@@ -977,7 +977,10 @@ impl CallView {
                 clock(self.recording_since.unwrap_or(self.started_at), time_zone)
             ),
             CallState::Problem(problem) => {
-                format!("{name}: not recording, {}; {captions}", problem.describe())
+                format!(
+                    "{name}: caption problem, {}; {captions}",
+                    problem.describe()
+                )
             }
             CallState::Stopped => format!("{name}: recording stopped by you; {captions}"),
         }
@@ -1176,9 +1179,12 @@ fn announce(app: &AppHandle, announced: &Announced) {
             format!("Recording {name}"),
             format!("Captions arrive from {source}."),
         ),
-        Notice::NotRecording(problem) => (
-            format!("Not recording {name}"),
-            capitalise(problem.describe()),
+        Notice::CaptionTrouble(problem) => (
+            format!("No captions from {name}"),
+            format!(
+                "{}. Audio and video have their own notices.",
+                capitalise(problem.describe())
+            ),
         ),
         Notice::RecordingAgain => (
             format!("Recording again {name}"),
@@ -1186,8 +1192,8 @@ fn announce(app: &AppHandle, announced: &Announced) {
         ),
         Notice::NoTranscript => (
             format!("No transcript captured for {name}"),
-            "The call ended with no caption. \"Save debug report\" in the tray keeps what \
-             happened."
+            "The call ended with no caption, so it gets no note. Anything it recorded stays in \
+             the call's folder. \"Save debug report\" in the tray keeps what happened."
                 .to_owned(),
         ),
         Notice::CaptureTrouble(problem) => (

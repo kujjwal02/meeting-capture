@@ -21,7 +21,7 @@ pub fn log_edge(edge: &Edge, call_id: &str, platform: Option<&str>) {
 /// Logs a notice that tells the user of a problem. Other notices log nothing.
 pub fn log_notice(notice: Notice, call_id: &str) {
     let problem = match notice {
-        Notice::NotRecording(problem) | Notice::CaptureTrouble(problem) => problem,
+        Notice::CaptionTrouble(problem) | Notice::CaptureTrouble(problem) => problem,
         Notice::Recording
         | Notice::RecordingAgain
         | Notice::NoTranscript
@@ -40,7 +40,7 @@ fn log_raised(edge: &Edge, problem: Problem, call_id: &str, platform: Option<&st
     let heading = if problem.layer().is_capture() {
         "call capture problem"
     } else {
-        "call not recording"
+        "call captions problem"
     };
     tracing::warn!(
         event.name = "call.problem",
