@@ -84,6 +84,9 @@ before you write a new driver or spike.
   call gets no caption either way, so read the button, or `frame_counters` in the debug
   snapshot. Open the guest browser only after the host is in the call. A driver that opened it
   before the host joined saw 3 of 7 presses ignored. `run.mjs` opens it after and saw none.
+- About 1 control frame per second does not prove Meet took a press. The stream can run with no
+  utterances. Compare the serial of Meet's `captions_v2` with the hook's in the
+  `mc.caption.channel.opened` events: the hook's must open later.
 - The profile may hold a `meet.google.com/home` tab in another window. Pick the call tab by its
   meeting code, not by the first `meet.google.com` match.
 - `chrome.action.openPopup()` fails with "Could not find an active browser window" when another

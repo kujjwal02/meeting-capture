@@ -217,7 +217,7 @@ fn firings_of(
     }
     for notice in notices.iter().filter(|notice| notice.call == *call) {
         let problem = match notice.notice {
-            Notice::NotRecording(problem) | Notice::CaptureTrouble(problem) => problem,
+            Notice::CaptionTrouble(problem) | Notice::CaptureTrouble(problem) => problem,
             Notice::Recording
             | Notice::RecordingAgain
             | Notice::NoTranscript

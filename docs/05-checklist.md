@@ -217,7 +217,7 @@ Done when:
 - [x] 3 Meet calls, one with a second Meet tab, one browser restart and one app quit mid-call,
   each give one note whose attendees joined the call.
 - [ ] A Meet call where Meet refuses captions shows amber in the tray and on the mc-meet icon,
-  and a "Not recording" notification names the reason within 1 minute.
+  and a "No captions" notification names the reason within 1 minute.
 
 ## Phase 2: call detection
 

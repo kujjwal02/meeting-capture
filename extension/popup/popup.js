@@ -11,7 +11,7 @@
   const STATE_WORDS = {
     waiting: "Waiting for captions",
     recording: "Recording",
-    problem: "Not recording",
+    problem: "Problem",
     stopped: "Recording stopped",
   };
   const SOURCE_WORDS = { channel: "call", dom: "page", none: "none yet" };

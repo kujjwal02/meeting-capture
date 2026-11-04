@@ -102,6 +102,10 @@ enum MeetEventName {
     ChannelError,
     #[serde(rename = "mc.caption.channel.close_blocked")]
     ChannelCloseBlocked,
+    #[serde(rename = "mc.caption.channels.opened")]
+    ChannelsOpened,
+    #[serde(rename = "mc.caption.channels.reopen")]
+    ChannelsReopen,
     #[serde(rename = "mc.caption.press")]
     Press,
     #[serde(rename = "mc.caption.control.changed")]
@@ -167,6 +171,15 @@ const CHANNEL_CLOSED_ATTRIBUTES: AttributeRules =
     &[("mc.caption.channel.lifetime_ms", AttributeRule::Count)];
 const CHANNEL_ERROR_ATTRIBUTES: AttributeRules =
     &[("error.type", AttributeRule::OneOf(CHANNEL_ERROR_TYPES))];
+const CHANNELS_OPENED_ATTRIBUTES: AttributeRules = &[
+    ("mc.caption.channels.wait_ms", AttributeRule::Count),
+    (
+        "mc.caption.channels.is_meet_channel_seen",
+        AttributeRule::Flag,
+    ),
+];
+const CHANNELS_REOPEN_ATTRIBUTES: AttributeRules =
+    &[("mc.caption.channels.reopen_number", AttributeRule::Count)];
 const CHANNEL_AGE_ATTRIBUTES: AttributeRules =
     &[("mc.caption.channel.age_ms", AttributeRule::Count)];
 const PRESS_ATTRIBUTES: AttributeRules = &[
@@ -181,6 +194,16 @@ const PRESS_ATTRIBUTES: AttributeRules = &[
     ("mc.caption.press.has_focus", AttributeRule::Flag),
     ("mc.caption.press.is_visible", AttributeRule::Flag),
     ("mc.caption.press.number", AttributeRule::Count),
+    (
+        "mc.caption.press.is_key_default_prevented",
+        AttributeRule::Flag,
+    ),
+    (
+        "mc.caption.press.active_element",
+        AttributeRule::OneOf(&[
+            "none", "other", "body", "button", "div", "iframe", "input", "textarea",
+        ]),
+    ),
     (
         "mc.caption.control.state_before",
         AttributeRule::OneOf(CONTROL_STATES),
@@ -220,6 +243,8 @@ impl MeetEventName {
             Self::ChannelClosed => "mc.caption.channel.closed",
             Self::ChannelError => "mc.caption.channel.error",
             Self::ChannelCloseBlocked => "mc.caption.channel.close_blocked",
+            Self::ChannelsOpened => "mc.caption.channels.opened",
+            Self::ChannelsReopen => "mc.caption.channels.reopen",
             Self::Press => "mc.caption.press",
             Self::ControlChanged => "mc.caption.control.changed",
             Self::FirstFrame => "mc.caption.first_frame",
@@ -236,6 +261,8 @@ impl MeetEventName {
             Self::ChannelClosed => [CHANNEL_ATTRIBUTES, CHANNEL_CLOSED_ATTRIBUTES],
             Self::ChannelError => [CHANNEL_ATTRIBUTES, CHANNEL_ERROR_ATTRIBUTES],
             Self::FirstFrame | Self::FirstCaption => [CHANNEL_ATTRIBUTES, CHANNEL_AGE_ATTRIBUTES],
+            Self::ChannelsOpened => [CHANNELS_OPENED_ATTRIBUTES, &[]],
+            Self::ChannelsReopen => [CHANNELS_REOPEN_ATTRIBUTES, &[]],
             Self::Press => [PRESS_ATTRIBUTES, &[]],
             Self::ControlChanged => [CONTROL_CHANGED_ATTRIBUTES, &[]],
         }

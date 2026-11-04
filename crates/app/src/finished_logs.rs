@@ -39,7 +39,8 @@ impl LogSource {
 }
 
 /// Records each log the last run did not turn into a meeting: the app quit or crashed during
-/// the call, or before its note. A call shorter than `min_call_seconds` is skipped.
+/// the call, or before its note. A call shorter than `min_call_seconds`, or with too few captions,
+/// is skipped.
 pub(crate) fn record_left_over(
     app: &AppHandle,
     pipeline: &Pipeline,
@@ -63,7 +64,7 @@ pub(crate) fn record_left_over(
 }
 
 /// Records the finished log at `log_path` as a meeting and runs it. A call shorter than
-/// `min_call_seconds` is skipped.
+/// `min_call_seconds`, or with too few captions, is skipped.
 pub(crate) fn record_and_run(
     app: &AppHandle,
     pipeline: &Pipeline,
@@ -88,7 +89,7 @@ pub(crate) fn record_and_run(
             crate::meetings::run(app, pipeline, id);
         }
         // Its log stays, and `mc ingest` can still write its note.
-        Ok(Intake::TooShort) => {}
+        Ok(Intake::TooShort | Intake::TooFewCaptions) => {}
         Err(IntakeError::Input(error)) => {
             tracing::error!(
                 exception.message = %error,

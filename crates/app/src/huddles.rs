@@ -155,7 +155,7 @@ impl Reporter {
                 self.log_health(&log_path, state);
                 crate::tray::refresh(&self.app);
                 // Captions off and an unreadable window stop the recording, so the status board
-                // announces them with the other "Not recording" notices.
+                // announces them with the other "No captions" notices.
                 let heading = match state {
                     HuddleHealth::Healthy
                     | HuddleHealth::Untested

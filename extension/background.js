@@ -333,7 +333,11 @@ function lookOf(callStatus, isAppReachable, isVideoClickNeeded, isVideoRecording
           title: `Recording video; not recording ${what}: ${callStatus.reason_text}`,
         };
       }
-      return { icon: "problem", badge: "!", title: `Not recording: ${callStatus.reason_text}` };
+      return {
+        icon: "problem",
+        badge: "!",
+        title: `Not recording ${notRecordedOf(callStatus.reason)}: ${callStatus.reason_text}`,
+      };
     }
     case "waiting":
       return { icon: "idle", badge: "…", title: "Waiting for captions" };

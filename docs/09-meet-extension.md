@@ -209,13 +209,16 @@ stored value the content script hides the caption region.
 ## Extension internals
 
 - Caption source. The hook opens `captions` and `captions_v2` on the peer connection that carries
-  `collections`. Meet streams nothing to them until something asks for captions, so the content
-  script presses Meet's captions button once, or Meet's C shortcut where the account has the
+  `collections`, after Meet's own `captions_v2`. It waits up to 3 s for that channel. Meet streams
+  nothing to them until something asks for captions, so the content script presses Meet's
+  captions button once, or Meet's C shortcut where the account has the
   "Captions and translation" button. The stream then goes to the hook's channels, and Meet's
   caption box never shows. About 30 s later Meet's captions button may read on, still with no
   box. Meet sometimes ignores the press: the button never reads on and no stream comes. A second
   press after one Meet took would stop the stream. So mc-meet presses again only while the
-  button has not read on 45 s after the last press, at most 3 times per call. Each press, with
+  button has not read on 45 s after the last press, at most 3 times per set of channels. On the
+  "Captions and translation" button, 3 unanswered presses make the hook close its channels and
+  open them again, at most twice per call, and the presses start over. Each press, with
   its reason, the control state before it, `document.hasFocus()` and the page visibility, goes
   into the page snapshot of a debug folder as `captions_presses`. Some Meet builds also open
   their own negotiated `captions_v2` channel at call start. The hook reads it too. When no
@@ -348,7 +351,7 @@ app is not reachable.
 | No call in the tab | grey ring | none | `mc-meet: connected` |
 | Waiting | grey ring | `…` | `Waiting for captions` |
 | Recording | red dot | `REC` | `Recording since 21:02 IST` |
-| Problem | amber | `!` | `Not recording: <reason>` |
+| Problem | amber | `!` | `Not recording captions: <reason>`, or `the call's events` in place of `captions` |
 | Problem while tab video records | amber | `REC!` | `Recording video; not recording captions: <reason>` |
 | Video needs the click | amber | `REC?` | `Click to record this tab's video` |
 | Stopped by the user | grey ring | none | `Recording stopped` |
@@ -407,7 +410,9 @@ in `mc.meet.dropped_attribute_count`.
 | `mc.caption.channel.close_blocked` | page hook, when it blocks Meet's `close()` | as `opened` |
 | `mc.caption.first_frame` | page hook, per channel | channel attributes, `age_ms` |
 | `mc.caption.first_caption` | page hook, per channel | channel attributes, `age_ms` |
-| `mc.caption.press` | content script, at each captions press | `kind` (`click` or `shortcut`), `reason` (`first` or `retry`), `has_focus`, `is_visible`, the control's `state_before` and `kind`, `number` |
+| `mc.caption.channels.opened` | page hook, as it opens its channels on a connection | `wait_ms`, the wait for Meet's channel; `is_meet_channel_seen` |
+| `mc.caption.channels.reopen` | content script, when it asks the hook to reopen its channels | `reopen_number` |
+| `mc.caption.press` | content script, at each captions press | `kind` (`click` or `shortcut`), `reason` (`first` or `retry`), `has_focus`, `is_visible`, the control's `state_before` and `kind`, `number`. On a `shortcut`: `is_key_default_prevented` and `active_element`, a tag name, `other` or `none` |
 | `mc.caption.control.changed` | content script, when the captions control changes | `state` and `state_before` (`on`, `off`, `unavailable`, `not_found`), `kind` (`button`, `menu`, `none`), `label`, `notice` |
 
 - `label` codes the control's own label, and `notice` the last "captions unavailable" text Meet
