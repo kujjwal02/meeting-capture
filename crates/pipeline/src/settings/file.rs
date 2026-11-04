@@ -33,8 +33,7 @@ impl Default for SlackSettings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct MeetSettings {
-    /// Hide Meet's caption box while mc-meet reads captions from it, so it covers no shared
-    /// screen.
+    /// Hide Meet's caption box during a call, so it covers no shared screen.
     pub hide_captions: bool,
 }
 
@@ -267,8 +266,8 @@ const SETTINGS_HEADER: &str = "\
 # [slack] read_captions: read Slack huddle captions from the Slack desktop app (macOS).
 # [slack] auto_start_captions: press the huddle's Captions tab when its caption panel is hidden.
 # [slack] min_huddle_seconds: a shorter huddle writes no note. Default 120.
-# [meet] hide_captions: hide Meet's caption box while mc-meet reads captions from it, so it
-#   covers no shared screen. With the data channel, the box never shows. Default true.
+# [meet] hide_captions: hide Meet's caption box during a call, so it covers no shared screen.
+#   Default true.
 # [debug] enabled_until: every log file keeps DEBUG lines until this UTC time, at most 24 hours
 #   ahead. The tray's \"Debug mode (24 h)\" sets it and removes it. A hand edit applies within a
 #   minute, with no restart.

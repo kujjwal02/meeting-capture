@@ -21,12 +21,6 @@ globalThis.mcMeetCreateDomCaptions = ({ emit, selfName }) => {
   let region = null;
   let monitorTimer = null;
   let turn = null;
-  let isRegionHidden = false;
-
-  // Meet keeps writing captions into a hidden region, so the reader works with the box gone.
-  function showRegion() {
-    if (region) region.style.display = isRegionHidden ? "none" : "";
-  }
 
   function resolveSpeaker(label) {
     // Meet labels the local user "You" in English. The roster name replaces it when known.
@@ -94,7 +88,6 @@ globalThis.mcMeetCreateDomCaptions = ({ emit, selfName }) => {
     if (!node || node === region) return;
     observer?.disconnect();
     region = node;
-    showRegion();
     turn = null;
     observer = new MutationObserver(onMutations);
     observer.observe(node, { childList: true, characterData: true, subtree: true });
@@ -111,15 +104,38 @@ globalThis.mcMeetCreateDomCaptions = ({ emit, selfName }) => {
       monitorTimer = null;
       observer?.disconnect();
       observer = null;
-      if (region) region.style.display = "";
       region = null;
       turn = null;
     },
-    setRegionHidden(isHidden) {
-      isRegionHidden = isHidden;
-      showRegion();
-    },
     isAttached: () => region !== null,
+  };
+};
+
+// Keeps Meet's caption box off screen, whichever reader is the source: Meet renders the box when
+// it sends captions to its own channel, and the channel reader then reads them with no DOM reader.
+// Meet keeps writing captions into a hidden region, so the DOM reader works with the box gone.
+globalThis.mcMeetCreateCaptionBoxHider = () => {
+  // The app's [meet] hide_captions. The worker stores it; on until the app says otherwise.
+  let isHiding = true;
+  let hiddenRegion = null;
+
+  // Meet creates the region at its first caption and can replace it, so the check loop calls this.
+  function apply() {
+    const region = isHiding
+      ? document.querySelector(globalThis.mcMeetSelectors.captionRegion)
+      : null;
+    if (region === hiddenRegion) return;
+    if (hiddenRegion) hiddenRegion.style.display = "";
+    if (region) region.style.display = "none";
+    hiddenRegion = region;
+  }
+
+  return {
+    apply,
+    setHiding(isOn) {
+      isHiding = isOn;
+      apply();
+    },
   };
 };
 

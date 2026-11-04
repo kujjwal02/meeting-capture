@@ -59,8 +59,6 @@
   let lastPingMs = 0;
   let port = null;
   let isContextValid = true;
-  // The app's [meet] hide_captions. The worker stores it; on until the app says otherwise.
-  let isHidingCaptions = true;
   const outbox = [];
   const failedFramesSent = new Map();
   // Snapshot requests waiting for the page hook's half, by session.
@@ -77,13 +75,13 @@
     emit: (event) => onReaderEvent("dom", event),
     selfName: () => selfName,
   });
+  const captionBox = globalThis.mcMeetCreateCaptionBoxHider();
 
   // ---- Settings. The worker stores what the app sends, so they hold while the app is away.
 
   function takeSettings(settings) {
     if (typeof settings?.hide_captions !== "boolean") return;
-    isHidingCaptions = settings.hide_captions;
-    domCaptions.setRegionHidden(isHidingCaptions);
+    captionBox.setHiding(settings.hide_captions);
   }
 
   chrome.storage.local
@@ -162,6 +160,7 @@
     isContextValid = false;
     clearInterval(checkTimer);
     domCaptions.stop();
+    captionBox.setHiding(false);
   }
 
   // ---- Session.
@@ -294,9 +293,10 @@
   }
 
   // Meet streams nothing on the caption channels until something asks for captions. Pressing
-  // Meet's captions control asks. Meet's captions button reads on about 30 s later, but Meet
-  // renders no caption box, since the captions go to the hook's channels. A second press stops
-  // the stream, so the policy presses again only while Meet's control has not read on since.
+  // Meet's captions control asks. When the captions go to the hook's channels, Meet's captions
+  // button reads on about 30 s later and Meet renders no caption box. When they go to Meet's own
+  // channel, the button reads on within 1 s and Meet renders the box. A second press stops the
+  // stream, so the policy presses again only while Meet's control has not read on since.
   // Never touches the caption language. control is Meet's captions control as the check read it.
   function requestCaptions(nowMs, control) {
     // Read before the press: the dispatch could change them.
@@ -628,6 +628,7 @@
     // While the leave grace runs, the call controls are gone and would read as captions off.
     if (!call || !isInCall) return;
     if (nowMs - call.last_seen_ms >= 5000) storeSession();
+    captionBox.apply();
 
     const button = globalThis.mcMeetReadCaptionsButton();
     const decision = captionSource.decide({

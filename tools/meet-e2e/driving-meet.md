@@ -76,9 +76,11 @@ before you write a new driver or spike.
   `Target.createTarget` is a tab, so its stop and resume never reach the app. Call
   `chrome.action.openPopup()` in the worker, then attach to the popup target and send from there.
 - Meet's caption channels stay silent until something asks for captions. One C press, sent as a
-  synthetic `KeyboardEvent` from the page, starts the stream. With mc-meet's `captions_v2` open,
-  Meet shows no caption box, but its captions button reads on about 30 s later. A second press
-  stops the stream at once. Read `caption_box_shown`, not `captions_on`, to tell what is on screen.
+  synthetic `KeyboardEvent` from the page, starts the stream. On mc-meet's `captions_v2`, Meet
+  renders no caption box, and its captions button reads on about 30 s later. On Meet's own
+  `captions_v2`, Meet renders the box, and the button reads on within 1 s. A second press stops the
+  stream at once. Read `caption_box_shown`, not `captions_on`, to tell what is on screen. Read
+  `is_own` on `mc.caption.first_caption` to tell which channel got the stream.
 - Meet sometimes ignores that press. Its captions button then never reads on, and `captions_v2`
   gets 1 control frame in total, against about 1 per second after a press Meet took. A silent
   call gets no caption either way, so read the button, or `frame_counters` in the debug

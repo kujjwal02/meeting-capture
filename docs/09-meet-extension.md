@@ -212,9 +212,11 @@ stored value the content script hides the caption region.
   `collections`, after Meet's own `captions_v2`. It waits up to 3 s for that channel. Meet streams
   nothing to them until something asks for captions, so the content script presses Meet's
   captions button once, or Meet's C shortcut where the account has the
-  "Captions and translation" button. The stream then goes to the hook's channels, and Meet's
-  caption box never shows. About 30 s later Meet's captions button may read on, still with no
-  box. Meet sometimes ignores the press: the button never reads on and no stream comes. A second
+  "Captions and translation" button. The stream then goes to the hook's channels, and Meet
+  renders no caption box. About 30 s later Meet's captions button may read on, still with no
+  box. In some calls the stream goes to Meet's own `captions_v2` instead: the button reads on
+  within 1 s, Meet renders the box, and the hook reads that channel. Meet sometimes ignores the
+  press: the button never reads on and no stream comes. A second
   press after one Meet took would stop the stream. So mc-meet presses again only while the
   button has not read on 45 s after the last press, at most 3 times per set of channels. On the
   "Captions and translation" button, 3 unanswered presses make the hook close its channels and
@@ -231,9 +233,10 @@ stored value the content script hides the caption region.
   clock, so it also runs in Node. `content/main.js` feeds it timestamped facts and runs the
   reader it picks.
 - Hidden captions. Meet's caption box covers a shared screen. With `hide_captions` on, the
-  caption region gets `display: none` while the DOM reader runs. Meet keeps writing captions
-  into the hidden region. Turning captions off makes Meet close its own caption channel, and the
-  page hook blocks `close()` on caption channels it did not open.
+  once-a-second check gives the caption region `display: none`, whichever reader is the source,
+  so the box can show for up to 1 s. Meet keeps writing captions into the hidden region. Turning
+  captions off makes Meet close its own caption channel, and the page hook blocks `close()` on
+  caption channels it did not open.
 - The DOM reader makes one utterance of each speaker turn. Meet did not trim a 1200-character
   monologue in the caption region, so one speaker talking alone gives one caption line, and a call
   with fewer than 3 lines writes no note.

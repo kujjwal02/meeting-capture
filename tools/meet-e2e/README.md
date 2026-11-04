@@ -52,7 +52,7 @@ mc-meet in your own browsers starts the dev binary without the dev home.
 - The log has at least 3 captions, all from the data channel.
 - A roster lists both people.
 - The chat time is within 15 s of sending.
-- Meet's caption box never shows: every health event has `caption_box_shown` false. Meet's
+- Meet's caption box stays hidden: every health event has `caption_box_shown` false. Meet's
   captions button may read on (`captions_on` true).
 - At least 3 captions arrive after `recording_resumed`.
 - macOS holds off idle sleep while the call records, and not after a stop or after the call.

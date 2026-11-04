@@ -52,9 +52,9 @@ was not running when the tab opened.
    - one `call_started` line;
    - a `health` line with `"source":"channel"` once someone speaks. `"source":"dom"` means the
      channels gave no caption in 20 s, and `detail` says why;
-   - every `health` line has `"caption_box_shown":false`: Meet's caption box never shows.
-     `"captions_on"` turns true about 30 s in: mc-meet pressed Meet's captions button once to
-     start the stream, and the button reads on with no box;
+   - every `health` line has `"caption_box_shown":false`: Meet's caption box stays hidden.
+     `"captions_on"` turns true within 30 s or so: mc-meet pressed Meet's captions button once to
+     start the stream;
    - `roster` lines with your name and `"is_self":true`;
    - `caption` lines whose `version` grows for one `utterance_id`.
 4. Leave the call. A `call_ended` line with `"reason":"left"` follows within about 4 s.

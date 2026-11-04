@@ -20,11 +20,11 @@
 // decide returns { source, health, reportsHealth, isCaptionsRequestDue, isChannelsReopenDue }.
 // source is "none", "channel" or "dom". health holds the health event fields this policy owns.
 //
-// Meet streams nothing on the hook's caption channels until something asks for captions. A click
-// on Meet's captions control asks the server, and the stream goes to the hook's channels. While
-// the hook's captions_v2 is open, Meet renders no caption box. About 30 s later Meet's captions
-// button reads on, still with no box. A second press stops the stream, so the policy presses
-// again only while Meet has not read on since the last press.
+// Meet streams nothing on the caption channels until something asks for captions. A click on
+// Meet's captions control asks the server. The stream then goes to one channel. On the hook's,
+// Meet renders no caption box, and its captions button reads on about 30 s later. On Meet's own,
+// Meet renders the box, and the button reads on within 1 s. A second press stops the stream, so
+// the policy presses again only while Meet has not read on since the last press.
 //
 // Meet sometimes ignores the press: its captions control never reads on and the channels get no
 // stream for the rest of the call. A call nobody speaks in also gets no caption, so only the

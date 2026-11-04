@@ -82,6 +82,15 @@ Measured over 15 calls up to 2026-11-04, Meet's `captions_v2` existed before the
 second from its start, before any press. Meet's channel got none. No utterance arrived in 27
 minutes, and 3 C presses changed nothing. The hook waits for Meet's channel.
 
+Measured over 14 calls with captions from 2026-11-02 to 2026-11-04, Meet sent the utterances to one
+channel per call, with Meet's `captions_v2` opened first in all 14. In 11 calls they went to the
+hook's `captions_v2`: no caption box, and the button read on about 30 s after the press or stayed
+off or "unavailable". In 3 calls they went to Meet's own `captions_v2`: Meet rendered the box, the
+button read on within 1 s, and the hook's channels got no frame. Focus and visibility at the press
+were the same in both groups, and the time from channel open to press overlapped. What makes Meet
+choose is unknown. The hook reads either channel, and the content script hides the box whichever
+one streams. `is_own` on `mc.caption.first_caption` names the channel.
+
 ## Telemetry counts
 
 The page hook counts each caption channel apart, by the channel object, and reports it under
