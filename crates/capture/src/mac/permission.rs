@@ -22,14 +22,9 @@ pub(crate) fn state(service: PermissionService) -> PermissionState {
     let state = match service {
         PermissionService::Microphone => microphone_state(),
         PermissionService::AudioCapture => audio_capture_state(),
-        // The preflight never prompts. Its request twin would, so this process never calls it.
-        PermissionService::ScreenRecording => {
-            if cidre::cg::screen_capture_access::preflight() {
-                PermissionState::Granted
-            } else {
-                PermissionState::Denied
-            }
-        }
+        // The preflight never prompts. Only `request_screen_recording` does, and the app runs it
+        // at launch alone, never mid-call.
+        PermissionService::ScreenRecording => screen_recording_state(),
     };
     tracing::info!(
         permission.service = %service,
@@ -37,6 +32,32 @@ pub(crate) fn state(service: PermissionService) -> PermissionState {
         "permission.checked"
     );
     state
+}
+
+/// Asks macOS for Screen Recording through `CGRequestScreenCaptureAccess`. The system shows its
+/// dialog once per app and files the answer; later calls return the filed state and show nothing.
+/// The first call returns before the user answers, so its state reads denied until the next ask.
+pub(crate) fn request_screen_recording() -> PermissionState {
+    let is_granted = cidre::cg::screen_capture_access::request();
+    let state = if is_granted {
+        PermissionState::Granted
+    } else {
+        screen_recording_state()
+    };
+    tracing::info!(
+        permission.service = %PermissionService::ScreenRecording,
+        permission.state = %state,
+        "permission.requested"
+    );
+    state
+}
+
+fn screen_recording_state() -> PermissionState {
+    if cidre::cg::screen_capture_access::preflight() {
+        PermissionState::Granted
+    } else {
+        PermissionState::Denied
+    }
 }
 
 fn microphone_state() -> PermissionState {

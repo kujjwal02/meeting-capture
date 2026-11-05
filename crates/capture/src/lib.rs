@@ -13,7 +13,7 @@ mod ring;
 
 pub use call::{CallAudioSource, CallReaders, OpenedStem};
 pub use mic::{InputDevices, MicPick, MicRequest, MicRule, MicStream, default_devices, mic_pick};
-pub use permission::permission_state;
+pub use permission::{permission_state, request_screen_recording};
 pub use ring::StemReader;
 pub use stem_timing::{
     BufferStamp, MicMoment, MicPickReason, MicTransport, PermissionService, PermissionState, Stem,

@@ -318,6 +318,10 @@ Done when:
   with a relaunch 5 minutes later, and a lost run record with future-dated files deleted
   nothing. After a 3-day jump a call 89 days old stayed and one 91 days old went. A clock set
   back a week aged calls by the wall clock.
+- [ ] The first launch on a Mac that never saw the app shows the Screen Recording dialog, and a
+  later launch after a refusal shows nothing. Needs `tccutil reset ScreenCapture
+  com.ujjwalkumar.meetingcapture` and a relaunch of the installed app: a dev build's helper runs
+  under the terminal, so macOS files its ask there. Code only.
 - [ ] A Screen Recording grant given mid-call takes effect at the next wake or new huddle window:
   the video process is replaced, so its preflight is not cached. Needs a real revoke and re-grant
   on a Mac; code only.

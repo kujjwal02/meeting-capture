@@ -239,12 +239,18 @@ flowchart LR
   the segment and exits, and `call_capture` restarts it.
 - The video process checks `CGPreflightScreenCaptureAccess` at each segment start and at each
   stream start inside a segment, after a closed window or a rebuild: macOS 15 and later expire
-  the grant every month. A refusal opens no segment, or ends the open one, and nothing prompts.
-  The call's video row then reads "Video off: allow Screen Recording" and opens the Screen
-  Recording pane of System Settings. The audio process records on untouched. macOS may cache the
-  check's answer per process, so the next wake or window hint ends that video process and starts
-  a new one, whose check runs again. Two such restarts of one call are at least 5 s apart. A
-  debug build's `MC_CAPTURE_INJECT` entry `screen-recording-refused` makes the check read denied.
+  the grant every month. A refusal opens no segment, or ends the open one, and nothing prompts
+  mid-call. The call's video row then reads "Video off: allow Screen Recording" and opens the
+  Screen Recording pane of System Settings. The audio process records on untouched. macOS may
+  cache the check's answer per process, so the next wake or window hint ends that video process
+  and starts a new one, whose check runs again. Two such restarts of one call are at least 5 s
+  apart. A debug build's `MC_CAPTURE_INJECT` entry `screen-recording-refused` makes the check
+  read denied.
+- The one prompt runs at launch: `call_capture` runs `mc-capture request-screen-recording`, which
+  calls `CGRequestScreenCaptureAccess`. The first ask shows the system dialog and puts the app on
+  the Screen Recording list; a filed answer shows nothing. The preflight alone never lists the
+  app, so without this ask a huddle records audio only until the user finds the tray row. The
+  ask runs on its own task, so repair and finalize never wait for it.
 - Video follows the audio helper across a sleep: the audio's sleep report stops the video segment,
   and its wake starts the next on the audio's wake segment. A video restart takes video's next
   free number, so each video segment records the `audio_segment` it pairs with.

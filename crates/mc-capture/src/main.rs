@@ -7,7 +7,8 @@
 //! segments a dead writer left open in a call folder, audio and video, as the app does at launch;
 //! `finalize` writes a call folder's `call.mp4`, as the app does when a call ends and at launch
 //! for each folder `pending-finalize` lists; `purge-media` deletes the video of calls older than
-//! 90 days, as the app does at launch and once a day.
+//! 90 days, as the app does at launch and once a day; `request-screen-recording` shows the
+//! system's Screen Recording dialog when the app has never been asked, as the app does at launch.
 
 #[cfg(target_os = "macos")]
 mod app_requests;
@@ -73,6 +74,9 @@ enum Command {
     /// Serve the app's video: JSON line commands on stdin (`start` with a window hint, `stop`),
     /// reports on stdout. Records one window through ScreenCaptureKit. Exits when stdin closes.
     Video,
+    /// Ask macOS for Screen Recording. The system dialog shows when the app has never been
+    /// asked; a filed answer shows nothing. Prints the state afterwards as one JSON object.
+    RequestScreenRecording,
     /// Print every window ScreenCaptureKit lists, on and off screen, as one JSON array, for
     /// picking a `window_id` by hand.
     Windows {
@@ -245,6 +249,12 @@ fn main() -> anyhow::Result<()> {
             #[cfg(not(target_os = "macos"))]
             anyhow::bail!("video records through ScreenCaptureKit, which only macOS has")
         }
+        Command::RequestScreenRecording => {
+            #[cfg(target_os = "macos")]
+            return request_screen_recording();
+            #[cfg(not(target_os = "macos"))]
+            anyhow::bail!("Screen Recording is a macOS permission")
+        }
         Command::Windows { bundle_id } => {
             #[cfg(target_os = "macos")]
             return print_windows(bundle_id.as_deref());
@@ -313,6 +323,16 @@ fn finalize(folder: &std::path::Path) -> anyhow::Result<()> {
         }
     });
     println!("{}", serde_json::to_string(&outcome)?);
+    Ok(())
+}
+
+/// Asks macOS for Screen Recording and prints the state afterwards. The first ask returns
+/// before the user answers the dialog, so it reads `denied` until the next launch.
+#[cfg(target_os = "macos")]
+fn request_screen_recording() -> anyhow::Result<()> {
+    let state = capture::request_screen_recording();
+    let answer = capture_protocol::PermissionAnswer { state };
+    println!("{}", serde_json::to_string(&answer)?);
     Ok(())
 }
 
