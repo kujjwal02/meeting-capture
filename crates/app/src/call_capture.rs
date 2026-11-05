@@ -29,6 +29,11 @@
 //! audio process records on untouched. The next wake or window hint starts a new video process,
 //! whose preflight checks again: macOS may cache the answer per process.
 //!
+//! At launch on the Mac, `mc-capture request-screen-recording` asks macOS for Screen Recording.
+//! The system dialog shows once, the first time the app asks; a filed refusal shows nothing, and
+//! the tray row stays the way back. The preflight alone never puts the app on the Screen
+//! Recording list, so without this ask every huddle recorded audio only.
+//!
 //! At launch, after repair and finalize, and then once a day, `mc-capture purge-media` deletes
 //! the video of calls that ended more than 90 days ago. The stems stay for transcription.
 
@@ -46,8 +51,9 @@ use capture_protocol::finalize::{
     FinalizeOutcome, MEDIA_PURGE_INTERVAL, MediaPurge, PendingFinalize,
 };
 use capture_protocol::{
-    AudioCommand, AudioErrorKind, AudioReport, MicMoment, PermissionService, PermissionState,
-    Platform, Stem, VideoCommand, VideoErrorKind, VideoReport, WindowChangeCause, WindowHint,
+    AudioCommand, AudioErrorKind, AudioReport, MicMoment, PermissionAnswer, PermissionService,
+    PermissionState, Platform, Stem, VideoCommand, VideoErrorKind, VideoReport, WindowChangeCause,
+    WindowHint,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -86,6 +92,9 @@ const PENDING_LIST_LIMIT: Duration = Duration::from_secs(60);
 const RECORDING_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// The purge reads a few file times per folder and unlinks at most a few thousand fragments.
 const PURGE_LIMIT: Duration = Duration::from_mins(10);
+
+/// The request returns as soon as macOS has filed the ask; the dialog itself outlives the helper.
+const PERMISSION_REQUEST_LIMIT: Duration = Duration::from_secs(30);
 /// The purge interval is time on the wall clock, not the monotonic one, which stops while the
 /// Mac sleeps: a laptop asleep every night would otherwise purge every few days.
 const PURGE_CHECK_INTERVAL: Duration = Duration::from_hours(1);
@@ -526,6 +535,12 @@ pub(crate) fn start(app: &AppHandle) {
     let calls_dir = app_dirs.calls_dir();
     let helper_logs = HelperLogs::new(app_dirs);
     let launch_app = app.clone();
+    // At launch, so the dialog shows while the user is at the Mac they just started the app on,
+    // not in the middle of a call. On its own task, so repair and finalize never wait for it.
+    if cfg!(target_os = "macos") {
+        let ask_logs = helper_logs.clone();
+        tauri::async_runtime::spawn(async move { request_screen_recording(&ask_logs).await });
+    }
     tauri::async_runtime::spawn(async move {
         let repair_dir = calls_dir.clone();
         if let Err(error) =
@@ -687,6 +702,34 @@ async fn purge_media_daily(app: &AppHandle, calls_dir: &Path, helper_logs: &Help
             if is_due {
                 break;
             }
+        }
+    }
+}
+
+/// Asks macOS for Screen Recording through the helper's `request-screen-recording`, so the app
+/// gets on the Screen Recording list the first time it runs. A refusal is the tray's to show when
+/// a huddle starts; here it is only logged.
+async fn request_screen_recording(helper_logs: &HelperLogs) {
+    let run = run_helper(
+        &["request-screen-recording".as_ref()],
+        helper_logs,
+        PERMISSION_REQUEST_LIMIT,
+    )
+    .await;
+    match run.map(|stdout| serde_json::from_str::<PermissionAnswer>(stdout.trim())) {
+        Ok(Ok(answer)) => tracing::info!(
+            permission.service = %PermissionService::ScreenRecording,
+            permission.state = %answer.state,
+            "permission.requested"
+        ),
+        Ok(Err(error)) => {
+            tracing::error!(exception.message = %error, "permission.request_unreadable");
+        }
+        Err(reason) => {
+            tracing::error!(
+                exception.message = reason,
+                "permission.request_helper_failed"
+            );
         }
     }
 }

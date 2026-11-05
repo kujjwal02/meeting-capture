@@ -42,7 +42,7 @@ pub enum PermissionService {
     /// "System Audio Recording Only", which the tap needs.
     AudioCapture,
     /// "Screen & System Audio Recording", which window video needs. Read with
-    /// `CGPreflightScreenCaptureAccess`, which never prompts.
+    /// `CGPreflightScreenCaptureAccess`, which never prompts; the app asks once at launch.
     ScreenRecording,
 }
 

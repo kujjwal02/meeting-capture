@@ -19,6 +19,13 @@ pub use stem_timing::{
 pub use stem_writer::GapCause;
 pub use video_capture::{VideoCodec, VideoGapCause, WindowChangeCause, WindowHint, WindowRecord};
 
+/// What `mc-capture request-screen-recording` prints: the Screen Recording state once macOS
+/// has been asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionAnswer {
+    pub state: PermissionState,
+}
+
 /// One line on the wire: a message and its sequence number. Each side numbers its own lines
 /// from 1.
 #[derive(Debug, Clone, Serialize, Deserialize)]

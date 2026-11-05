@@ -59,10 +59,14 @@ store.
 
 1. Grant Accessibility when macOS asks. Slack huddle captions need it. The grant is in System
    Settings, Privacy & Security, Accessibility.
-2. Load a Google OAuth client and sign in. Follow [Google setup](06-google-setup.md).
-3. Pick the LLM provider in Settings. See [LLM extraction](07-llm-extraction.md).
-4. Pick "Install mc-meet in Chrome…" in the tray. Follow [mc-meet](09-meet-extension.md#install).
-5. Take a Meet call. The note appears in the vault after the call ends, when the call had at least
+2. Grant Screen Recording when macOS asks, at the first launch. Slack huddle video needs it;
+   audio and Meet video record without it. The grant is in System Settings, Privacy & Security,
+   Screen & System Audio Recording. macOS asks once; a later change goes through that pane or the
+   call's "Video off: allow Screen Recording" tray row.
+3. Load a Google OAuth client and sign in. Follow [Google setup](06-google-setup.md).
+4. Pick the LLM provider in Settings. See [LLM extraction](07-llm-extraction.md).
+5. Pick "Install mc-meet in Chrome…" in the tray. Follow [mc-meet](09-meet-extension.md#install).
+6. Take a Meet call. The note appears in the vault after the call ends, when the call had at least
    3 caption lines.
 
 ## Upgrade
