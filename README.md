@@ -121,6 +121,7 @@ just hooks
 | --- | --- |
 | `just dev` | Runs the tray app in dev mode. |
 | `just check` | Runs every format, lint, licence and advisory check. The Check workflow runs it on each push. |
+| `just clean` | Removes build output, caches and unmodified clones of remote repos. `just clean --dry-run` lists them. |
 | `just fmt` | Rewrites files to the formatters' output. |
 | `just signing-cert` | Adds the self-signed code-signing identity to the login keychain, once. macOS keeps the app's permissions across updates only with a stable identity. |
 | `just meet-e2e` | Runs a live Meet call through mc-meet and a dev app, then checks the call log and the note. Needs two Google accounts: see [tools/meet-e2e](tools/meet-e2e/README.md). |

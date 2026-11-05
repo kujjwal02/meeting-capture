@@ -30,6 +30,11 @@ shear:
 hooks:
     lefthook install
 
+# Remove build output, caches and unmodified clones. Pass --dry-run to list them instead.
+[unix]
+clean *flags:
+    scripts/clean.sh {{flags}}
+
 # Run a live Meet call through mc-meet and a dev app, then check the log and note (Mac only).
 meet-e2e:
     cargo build -p meeting-capture -p mc-capture
