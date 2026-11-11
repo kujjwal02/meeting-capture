@@ -3,15 +3,15 @@
 use std::collections::BTreeMap;
 
 use jiff::Timestamp;
-use rusqlite::Row;
-use rusqlite_migration::M;
+use rusqlite::{Connection, Row};
 
 use crate::state::{FailureCause, FailureKind};
 use crate::{ClaimedNote, InputKind, Meeting, MeetingId, NoteOwnership, Step, StoreError};
 
-pub(crate) const MIGRATIONS: &[M<'static>] = &[
-    M::up(
-        "CREATE TABLE meetings (
+/// The schema steps in order. `PRAGMA user_version` holds how many have run. Append only: a step
+/// that shipped never changes.
+const MIGRATIONS: &[&str] = &[
+    "CREATE TABLE meetings (
         id INTEGER PRIMARY KEY,
         input_kind TEXT NOT NULL,
         input_path TEXT NOT NULL,
@@ -34,26 +34,42 @@ pub(crate) const MIGRATIONS: &[M<'static>] = &[
     CREATE UNIQUE INDEX meetings_input_started_at ON meetings (input_kind, started_at);
     CREATE INDEX meetings_started_at ON meetings (started_at);
     CREATE UNIQUE INDEX meetings_note_path ON meetings (note_path);",
-    ),
     // Existing rows read as "no extraction tried yet". Times are UTC milliseconds, which sort as
     // numbers; RFC 3339 text with varying fractions does not.
-    M::up(
-        "ALTER TABLE meetings ADD COLUMN extraction_provider TEXT;
+    "ALTER TABLE meetings ADD COLUMN extraction_provider TEXT;
     ALTER TABLE meetings ADD COLUMN extraction_attempts INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE meetings ADD COLUMN extraction_error TEXT;
     ALTER TABLE meetings ADD COLUMN next_extraction_at_ms INTEGER;",
-    ),
     // One "<section> <sha256>" line per marked section of the note.
-    M::up("ALTER TABLE meetings ADD COLUMN note_section_sha256s TEXT;"),
+    "ALTER TABLE meetings ADD COLUMN note_section_sha256s TEXT;",
     // Set exactly when `failure` is. The backfill applies `FailureKind::inferred`: an extraction
     // that failed for good holds the same text in `failure` and `extraction_error`.
-    M::up(
-        "ALTER TABLE meetings ADD COLUMN failure_kind TEXT;
+    "ALTER TABLE meetings ADD COLUMN failure_kind TEXT;
     UPDATE meetings SET failure_kind =
         CASE WHEN failure = extraction_error THEN 'extraction' ELSE 'step' END
         WHERE failure IS NOT NULL;",
-    ),
 ];
+
+/// Runs the steps the database has not run yet, in one transaction with the version bump.
+pub(crate) fn migrate(connection: &mut Connection) -> Result<(), StoreError> {
+    let known_version = u32::try_from(MIGRATIONS.len()).expect("migration count fits in u32");
+    let transaction = connection.transaction()?;
+    let database_version: u32 =
+        transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    // A newer app version wrote this database. Its columns would read wrong here.
+    if database_version > known_version {
+        return Err(StoreError::SchemaTooNew {
+            database_version,
+            known_version,
+        });
+    }
+    for step in MIGRATIONS.iter().skip(database_version as usize) {
+        transaction.execute_batch(step)?;
+    }
+    transaction.pragma_update(None, "user_version", known_version)?;
+    transaction.commit()?;
+    Ok(())
+}
 
 pub(crate) const MEETING_COLUMNS: &str = "id, input_kind, input_path, input_revision, \
     started_at, title, finished_step, failure, failure_kind, retry_count, calendar_match_json, \

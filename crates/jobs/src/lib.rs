@@ -23,11 +23,10 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use rusqlite_migration::Migrations;
 
 pub use crate::lease::{LeasedRun, RunOutcome, StepError};
 pub use crate::retry_schedule::ErrorPersistence;
-use crate::schema::{MEETING_COLUMNS, MIGRATIONS, read_meeting};
+use crate::schema::{MEETING_COLUMNS, migrate, read_meeting};
 pub use crate::state::{ExtractionRetry, FailureCause, FailureKind, JobState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -231,8 +230,13 @@ pub enum NotePathClaim {
 pub enum StoreError {
     #[error("job store query failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("job store migration failed: {0}")]
-    Migration(#[from] rusqlite_migration::Error),
+    #[error(
+        "job store schema is at version {database_version}, newer than this app's {known_version}"
+    )]
+    SchemaTooNew {
+        database_version: u32,
+        known_version: u32,
+    },
     #[error("could not lock {path} to open the job store: {source}")]
     Lock {
         path: PathBuf,
@@ -288,7 +292,7 @@ impl JobStore {
         connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.set_transaction_behavior(TransactionBehavior::Immediate);
         connection.pragma_update(None, "journal_mode", "WAL")?;
-        Migrations::from_slice(MIGRATIONS).to_latest(&mut connection)?;
+        migrate(&mut connection)?;
         drop(open_lock);
         Ok(Self {
             connection: Mutex::new(connection),
