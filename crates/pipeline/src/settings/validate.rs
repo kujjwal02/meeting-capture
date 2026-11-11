@@ -240,17 +240,15 @@ impl TranscriptionSettings {
                 expected: "\"multi\" or a language code such as \"en\", \"hi\" or \"en-IN\"",
             });
         }
+        // Wispr borrows the desktop app's token, so it needs no `api_key`; Deepgram does.
         match self.provider {
-            None => Ok(()),
-            Some(provider @ stt::ProviderKind::Deepgram) => {
-                if self.api_key.is_none() {
-                    return Err(SettingsError::TranscriptionFieldMissing {
-                        field: "api_key",
-                        provider: provider.as_str(),
-                    });
-                }
-                Ok(())
+            Some(provider) if provider.requires_api_key() && self.api_key.is_none() => {
+                Err(SettingsError::TranscriptionFieldMissing {
+                    field: "api_key",
+                    provider: provider.as_str(),
+                })
             }
+            _ => Ok(()),
         }
     }
 }

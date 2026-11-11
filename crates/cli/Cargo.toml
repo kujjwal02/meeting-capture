@@ -10,6 +10,11 @@ license.workspace = true
 name = "mc"
 path = "src/main.rs"
 
+[features]
+# Build the optional Wispr Flow transcription engine into the CLI.
+wispr = ["pipeline/wispr"]
+
+
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true

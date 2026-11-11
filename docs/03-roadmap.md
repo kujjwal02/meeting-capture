@@ -474,6 +474,36 @@ model = "nova-3"        # optional
 language = "multi"      # optional
 ```
 
+### Wispr Flow
+
+An optional second provider behind the same trait, built only with the `wispr` cargo feature and
+off in released builds. It drives Wispr Flow's own `TranscribeStream` gRPC API with a token
+borrowed from the installed desktop app, the method the app uses for dictation.
+
+- Build with `cargo build --features wispr` (app and CLI). The provider is offered in the settings
+  window only when the engine is built in and `/Applications/Wispr Flow.app` is installed. The
+  settings window shows a warning, which must be acknowledged, before it is turned on.
+- This is unsupported and against Wispr's terms of service, and can get a Wispr account flagged or
+  banned. The desktop app must stay installed and signed in.
+- Auth: it reads the Supabase session the desktop app writes to
+  `~/Library/Application Support/Wispr Flow/session.json`, borrows the access token, and refreshes
+  it from the stored refresh token through the app's public `anon` Supabase key. No key goes in the
+  settings file.
+- Transport: gRPC over HTTP/2 to `inference.wisprflow.com`, which authenticates with the borrowed
+  token alone. Audio goes as 16 kHz mono WAV. The protobuf is hand-rolled, so no `tonic` or `prost`
+  is pulled in; only the Baseten-direct fallback host, which needs Wispr's embedded key, is left
+  out.
+- Limits: Wispr is a dictation transcriber, so a window comes back as plaintext with no speaker
+  labels and no word timings. Each window becomes one utterance spanning the window, and the
+  language check tags words by script, with Devanagari read as Hindi. A request is capped near
+  300 s and 25 MB.
+
+```toml
+[transcription]
+provider = "wispr"      # needs the `wispr` build and the desktop app; no api_key
+language = "multi"      # optional
+```
+
 ### Desert Ant models on the Mac
 
 A later local provider behind the same trait.

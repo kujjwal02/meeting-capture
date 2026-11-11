@@ -299,7 +299,10 @@ fn network_fault(error: &stt::SttError) -> NetworkFault {
         | stt::SttError::RequestRejected { .. }
         | stt::SttError::ReadStem { .. }
         | stt::SttError::Encode { .. }
-        | stt::SttError::UnreadableReply { .. } => NetworkFault::Link,
+        | stt::SttError::UnreadableReply { .. }
+        // Refused-class faults never reach the network schedule, but keep the match total.
+        | stt::SttError::WisprSession { .. }
+        | stt::SttError::EngineNotBuilt { .. } => NetworkFault::Link,
     }
 }
 
@@ -902,14 +905,27 @@ fn fallback(
         );
         return Ok(None);
     };
-    let Some(api_key) = settings.api_key.clone() else {
+    if !kind.is_available() {
         tracing::warn!(
+            provider = kind.as_str(),
+            "the transcription provider is not available in this build on this machine; captions only"
+        );
+        return Ok(None);
+    }
+    if kind.requires_api_key() && settings.api_key.is_none() {
+        tracing::warn!(
+            provider = kind.as_str(),
             "transcription.provider is set without transcription.api_key; captions only"
         );
         return Ok(None);
-    };
-    let provider = stt::Provider::new(kind, api_key, model.to_owned(), language.to_owned())
-        .map_err(TranscribeError::from)?;
+    }
+    let provider = stt::Provider::new(
+        kind,
+        settings.api_key.clone(),
+        model.to_owned(),
+        language.to_owned(),
+    )
+    .map_err(TranscribeError::from)?;
     Ok(Some(Fallback { provider, folder }))
 }
 

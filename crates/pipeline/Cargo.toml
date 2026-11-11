@@ -6,6 +6,11 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# Pass the optional Wispr Flow engine through to the stt crate.
+wispr = ["stt/wispr"]
+
+
 [dependencies]
 call-finalize.workspace = true
 call-folder.workspace = true

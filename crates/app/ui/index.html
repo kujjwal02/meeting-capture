@@ -91,18 +91,22 @@
           Provider
           <select id="transcription-provider">
             <option value="">None</option>
-            <option value="deepgram">Deepgram</option>
           </select>
         </label>
-        <label data-transcription-for="deepgram">
+        <p class="warning" id="transcription-warning" hidden></p>
+        <label class="checkbox" id="transcription-ack-label" hidden>
+          <input type="checkbox" id="transcription-ack">
+          I understand the risk and want to turn this on.
+        </label>
+        <label data-transcription-field="api_key" hidden>
           API key
           <input type="password" id="transcription-api-key" autocomplete="off">
         </label>
-        <label data-transcription-for="deepgram">
+        <label data-transcription-field="model" hidden>
           Model
           <input type="text" id="transcription-model" autocomplete="off" spellcheck="false">
         </label>
-        <label data-transcription-for="deepgram">
+        <label data-transcription-field="language" hidden>
           Language
           <input type="text" id="transcription-language" autocomplete="off" spellcheck="false">
         </label>

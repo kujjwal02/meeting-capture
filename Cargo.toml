@@ -26,6 +26,13 @@ tauri-plugin-updater = { version = "2.14", default-features = false, features = 
 ] }
 anyhow = "1.0"
 base64 = "0.22"
+# gRPC over HTTP/2 for the optional Wispr Flow engine, built only with `--features wispr`.
+bytes = "1.12"
+h2 = "0.4"
+http = "1.5"
+native-tls = { version = "0.2", features = ["alpn"] }
+tokio-native-tls = "0.3"
+uuid = { version = "1.28", features = ["v4"] }
 cidre = { version = "0.29", default-features = false, features = [
   "core_audio",
   "dispatch",
