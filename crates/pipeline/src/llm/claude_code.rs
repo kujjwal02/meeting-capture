@@ -61,7 +61,37 @@ impl ClaudeCode {
     }
 
     pub(super) fn start(&self, label: &str) -> Result<impl Conversation + use<>, ExtractionError> {
-        let schema = extraction::reply_schema().to_string();
+        self.open(
+            label,
+            SYSTEM_PROMPT,
+            &extraction::reply_schema().to_string(),
+        )
+    }
+
+    /// One question and its answer as JSON, in a session of its own.
+    pub(super) fn ask(
+        &self,
+        label: &str,
+        system_prompt: &str,
+        schema: &str,
+        message: &str,
+    ) -> Result<serde_json::Value, ExtractionError> {
+        let turn = self.open(label, system_prompt, schema)?.exchange(message)?;
+        match turn.structured_output {
+            Some(object) => Ok(object),
+            None => serde_json::from_str(&turn.text).map_err(|error| ExtractionError::Transport {
+                provider: label.to_owned(),
+                detail: format!("the reply is not JSON: {error}"),
+            }),
+        }
+    }
+
+    fn open(
+        &self,
+        label: &str,
+        system_prompt: &str,
+        schema: &str,
+    ) -> Result<Session, ExtractionError> {
         let mut command = base_command(&self.binary);
         command
             .args(["-p", "--model", &self.model])
@@ -69,8 +99,8 @@ impl ClaudeCode {
             .args(["--no-session-persistence"])
             .args(["--input-format", "stream-json"])
             .args(["--output-format", "stream-json", "--verbose"])
-            .args(["--system-prompt", SYSTEM_PROMPT])
-            .args(["--json-schema", &schema])
+            .args(["--system-prompt", system_prompt])
+            .args(["--json-schema", schema])
             .current_dir(&self.work_dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -182,8 +212,24 @@ struct TokenUsage {
     output: Option<u64>,
 }
 
+/// One turn's reply: the schema-checked object when Claude Code gave one, else the text.
+struct TurnReply {
+    structured_output: Option<serde_json::Value>,
+    text: String,
+}
+
 impl Conversation for Session {
     fn send(&mut self, message: &str) -> Result<Reply, ExtractionError> {
+        let turn = self.exchange(message)?;
+        Ok(match turn.structured_output {
+            Some(object) => Reply::from_value(object),
+            None => Reply::read(&turn.text),
+        })
+    }
+}
+
+impl Session {
+    fn exchange(&mut self, message: &str) -> Result<TurnReply, ExtractionError> {
         let event = serde_json::json!({
             "type": "user",
             "message": {"role": "user", "content": message},
@@ -255,15 +301,13 @@ impl Conversation for Session {
             }
         }
     }
-}
 
-impl Session {
     fn finish_turn(
         &self,
         event: StreamEvent,
         failure_kind: Option<&str>,
         stopped_at_limit: bool,
-    ) -> Result<Reply, ExtractionError> {
+    ) -> Result<TurnReply, ExtractionError> {
         if let Some(usage) = &event.usage {
             tracing::info!(
                 gen_ai.usage.input_tokens = usage.input.unwrap_or(0),
@@ -296,9 +340,9 @@ impl Session {
                 },
             });
         }
-        Ok(match event.structured_output {
-            Some(object) => Reply::from_value(object),
-            None => Reply::read(&text),
+        Ok(TurnReply {
+            structured_output: event.structured_output,
+            text,
         })
     }
 

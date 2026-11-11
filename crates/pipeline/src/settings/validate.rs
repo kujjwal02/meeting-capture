@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use directories::UserDirs;
 use jiff::tz::TimeZone;
 
-use super::{LlmSettings, ProviderKind, SettingsError, SettingsFile};
+use super::{LlmSettings, ProviderKind, SettingsError, SettingsFile, TranscriptionSettings};
 
-/// The settings that apply at launch. LLM, Google, Slack and Meet settings change while the app runs,
-/// so `SettingsStore` holds them instead.
+/// The settings that apply at launch. LLM, transcription, Google, Slack and Meet settings change
+/// while the app runs, so `SettingsStore` holds them instead.
 #[derive(Debug)]
 pub struct Settings {
     pub vault_dir: PathBuf,
@@ -60,6 +60,7 @@ impl Settings {
             }
         }
         file.llm.validate()?;
+        file.transcription.validate()?;
         file.debug.mode()?;
         Ok(Self {
             vault_dir,
@@ -169,5 +170,87 @@ impl LlmSettings {
             }
         }
         Ok(())
+    }
+}
+
+fn is_model_name(model: &str) -> bool {
+    model.starts_with(|character: char| character.is_ascii_alphanumeric())
+        && model.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || character == '-'
+                || character == '.'
+        })
+}
+
+/// `multi`, or a BCP 47 tag of a 2- or 3-letter language and optional subtags.
+fn is_language_code(language: &str) -> bool {
+    if language == "multi" {
+        return true;
+    }
+    let mut parts = language.split('-');
+    let primary_is_valid = parts.next().is_some_and(|primary| {
+        (2..=3).contains(&primary.len())
+            && primary
+                .chars()
+                .all(|character| character.is_ascii_lowercase())
+    });
+    primary_is_valid
+        && parts.all(|subtag| {
+            (2..=8).contains(&subtag.len())
+                && subtag
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+}
+
+impl TranscriptionSettings {
+    /// # Errors
+    ///
+    /// Returns `SettingsError` naming the first invalid `transcription` field.
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        for (field, value) in [
+            ("api_key", &self.api_key),
+            ("model", &self.model),
+            ("language", &self.language),
+        ] {
+            if value
+                .as_deref()
+                .is_some_and(|value| value.trim().is_empty())
+            {
+                return Err(SettingsError::BlankTranscriptionField { field });
+            }
+        }
+        // Both go into the request's query, and a typo would fail every request.
+        if let Some(model) = self.model.as_deref()
+            && !is_model_name(model)
+        {
+            return Err(SettingsError::TranscriptionFieldShape {
+                field: "model",
+                value: model.to_owned(),
+                expected: "a model name such as \"nova-3\": lowercase letters, digits, '.' and '-'",
+            });
+        }
+        if let Some(language) = self.language.as_deref()
+            && !is_language_code(language)
+        {
+            return Err(SettingsError::TranscriptionFieldShape {
+                field: "language",
+                value: language.to_owned(),
+                expected: "\"multi\" or a language code such as \"en\", \"hi\" or \"en-IN\"",
+            });
+        }
+        match self.provider {
+            None => Ok(()),
+            Some(provider @ stt::ProviderKind::Deepgram) => {
+                if self.api_key.is_none() {
+                    return Err(SettingsError::TranscriptionFieldMissing {
+                        field: "api_key",
+                        provider: provider.as_str(),
+                    });
+                }
+                Ok(())
+            }
+        }
     }
 }

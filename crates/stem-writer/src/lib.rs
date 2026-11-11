@@ -20,7 +20,7 @@ pub use manifest::{
     MANIFEST_SCHEMA_VERSION, RateRecord, SegmentRecord, SegmentRepair, SegmentState, StemFix,
     StemRecord, StemRepair,
 };
-pub use repair::{FolderRepair, repair_folder};
+pub use repair::{FolderRepair, repair_folder, repair_under_lock};
 pub use track::StemProgress;
 pub use wav::{OutputLevel, SILENCE_DBFS};
 

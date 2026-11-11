@@ -8,6 +8,7 @@ pub mod llm;
 mod render;
 pub mod settings;
 mod sweep;
+mod transcribe;
 mod vault;
 
 pub use vault::has_user_edits;
@@ -20,7 +21,8 @@ use std::sync::atomic::AtomicBool;
 use call_folder::media::{CallMedia, MediaLink, MediaTarget};
 use jobs::{
     ErrorPersistence, Extraction, ExtractionAtWrite, ExtractionFailure, InputKind, JobState,
-    JobStore, LeasedRun, Meeting, MeetingId, RunOutcome, Step, StepError, StoreError,
+    JobStore, LeasedRun, Meeting, MeetingId, RunOutcome, Step, StepError, StepRetry, StoreError,
+    TranscriptAtWrite,
 };
 use sources::Transcript;
 
@@ -34,13 +36,17 @@ use crate::settings::{AppDirs, LlmSettings, Settings, SettingsError, SettingsSto
 use crate::vault::{SectionWrite, Vault};
 
 pub use crate::intake::{InputError, Intake, IntakeError, MergeError};
+use crate::transcribe::SettledTranscript;
+pub use crate::transcribe::TranscribeError;
 
 /// One decision event for the transcript the run reads: its source and what it holds. Counts
 /// only: no titles, names or text.
-fn log_source_decision(transcript: &Transcript) {
+fn log_source_decision(settled: &SettledTranscript) {
+    let transcript = &settled.transcript;
     tracing::info!(
         mc.decision.kind = "source_pick",
         mc.decision.chosen = serde_name(&transcript.source),
+        mc.decision.reason = settled.reason(),
         mc.transcript.speaker_naming = serde_name(&transcript.speaker_naming),
         mc.transcript.segment_count = transcript.segments.len(),
         mc.transcript.chat_count = transcript.chat_messages.len(),
@@ -72,6 +78,8 @@ pub enum PipelineError {
     },
     #[error(transparent)]
     Input(#[from] InputError),
+    #[error(transparent)]
+    Transcribe(#[from] TranscribeError),
     #[error("stored step output is not valid JSON: {0}")]
     StepOutput(#[from] serde_json::Error),
     #[error("calendar match failed: {0}")]
@@ -102,6 +110,26 @@ pub enum PipelineError {
 impl StepError for PipelineError {
     fn panicked(message: String) -> Self {
         PipelineError::Panicked(message)
+    }
+
+    fn retry(&self) -> StepRetry {
+        match self {
+            PipelineError::Transcribe(error) => error.retry(),
+            PipelineError::Settings(_)
+            | PipelineError::Store(_)
+            | PipelineError::ReadFile { .. }
+            | PipelineError::Input(_)
+            | PipelineError::StepOutput(_)
+            | PipelineError::Calendar(_)
+            | PipelineError::MissingCalendarMatch(_)
+            | PipelineError::Template(_)
+            | PipelineError::TemplateMarkers(_)
+            | PipelineError::Frontmatter(_)
+            | PipelineError::NoteNameTaken
+            | PipelineError::NoteEdited { .. }
+            | PipelineError::Panicked(_)
+            | PipelineError::WriteNote { .. } => StepRetry::Manual,
+        }
     }
 }
 
@@ -182,7 +210,8 @@ impl Pipeline {
     /// Returns `PipelineError` when the meeting, its input or its stored match cannot be read.
     pub fn extraction_prompt(&self, id: MeetingId) -> Result<Prompt, PipelineError> {
         let meeting = self.store.get(id)?;
-        let transcript = read_transcript(meeting.input_kind, &meeting.input_path)?;
+        let captions = read_transcript(meeting.input_kind, &meeting.input_path)?;
+        let transcript = self.settled_transcript(&meeting, captions).transcript;
         let calendar_match: CalendarMatch = match meeting.calendar_match_json.as_deref() {
             Some(stored) => serde_json::from_str(stored)?,
             None => CalendarMatch { event: None },
@@ -199,9 +228,19 @@ impl Pipeline {
     /// Returns the error that stopped the run.
     pub fn run(&self, id: MeetingId) -> Result<RunOutcome, PipelineError> {
         let _span = tracing::info_span!("pipeline.run", meeting.id = %id).entered();
-        let outcome = self.store.run(id, |run| {
+        let mut outcome = self.store.run(id, |run| {
             self.run_steps(run, WriteTrigger::StepsOwed).map(drop)
         });
+        // A note written from the captions while speech-to-text is owed runs again at once for
+        // it. Once only: a run that fails leaves the meeting to the sweep.
+        if let Ok(RunOutcome::Finished(meeting)) = &outcome
+            && meeting.is_run_due()
+        {
+            tracing::info!("running again for the pending transcript");
+            outcome = self.store.run(id, |run| {
+                self.run_steps(run, WriteTrigger::StepsOwed).map(drop)
+            });
+        }
         if outcome.is_err() {
             // The recorder holds the steps' DEBUG lines, which the log file does not.
             let folder = self.app_dirs.call_debug_dir().join(format!("meeting-{id}"));
@@ -354,14 +393,16 @@ impl Pipeline {
         if trigger == WriteTrigger::RecordingChanged && !is_settled(meeting) {
             return Ok(RecordingWrite::StepsOwed);
         }
-        let transcript = read_transcript(meeting.input_kind, &meeting.input_path)?;
-        log_source_decision(&transcript);
+        let captions = read_transcript(meeting.input_kind, &meeting.input_path)?;
+        let settled = self.transcribe_step(run, captions)?;
+        log_source_decision(&settled);
+        let transcript = &settled.transcript;
 
-        let calendar_match = self.match_step(run, &transcript)?;
+        let calendar_match = self.match_step(run, transcript)?;
 
         let needs_extraction = meeting.is_extraction_owed();
         let extraction = if needs_extraction {
-            self.extract_step(run, &transcript, &calendar_match)?
+            self.extract_step(run, transcript, &calendar_match)?
         } else {
             match meeting.extraction_json.as_deref() {
                 Some(stored) => ExtractOutcome::Notes {
@@ -387,13 +428,14 @@ impl Pipeline {
             let recording = self.call_recording(meeting);
             let note = NoteInput {
                 meeting_id: id,
-                transcript: &transcript,
+                transcript,
                 calendar_match: &calendar_match,
                 notes,
                 extraction_provider,
                 my_name: self.settings.my_name.as_deref(),
                 time_zone: &self.settings.time_zone,
                 recording: recording.as_ref(),
+                transcription: &settled.choice,
             };
             let rendered = render::note(&note, &self.app_dirs.note_template_file())?;
             if !is_write_owed {
@@ -431,6 +473,11 @@ impl Pipeline {
                 note.title(),
                 &rendered,
                 extraction_at_write,
+                if settled.is_pending() {
+                    TranscriptAtWrite::Pending
+                } else {
+                    TranscriptAtWrite::Settled
+                },
             )?;
             // `note.path`, not `file.path`: the file name is the meeting's title, which a
             // debug report without text shortens to its length.
@@ -601,7 +648,7 @@ fn call_folder_name(meeting: &Meeting) -> Option<String> {
     }
 }
 
-fn input_stem(input_path: &Path) -> Option<String> {
+pub(crate) fn input_stem(input_path: &Path) -> Option<String> {
     Some(input_path.file_stem()?.to_str()?.to_owned())
 }
 

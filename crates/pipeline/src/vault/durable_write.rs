@@ -1,5 +1,6 @@
 //! Moves a note into the vault in one rename, so Syncthing never sees a half-written note, and
-//! syncs the folder so the rename survives power loss.
+//! syncs the folder so the rename survives power loss. The transcribe step's `stt/` files use
+//! its folder syncs too.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -48,7 +49,7 @@ pub(super) fn write(
 }
 
 // A new month folder survives power loss only once its parent's entry is on disk too.
-fn create_dir_durably(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn create_dir_durably(dir: &Path) -> std::io::Result<()> {
     let missing: Vec<&Path> = dir.ancestors().take_while(|path| !path.exists()).collect();
     std::fs::create_dir_all(dir)?;
     for created in missing.into_iter().rev() {
@@ -67,7 +68,7 @@ fn create_dir_durably(dir: &Path) -> std::io::Result<()> {
         reason = "callers share one signature with the Unix fsync"
     )
 )]
-fn sync_dir(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     std::fs::File::open(dir)?.sync_all()?;
     #[cfg(not(unix))]

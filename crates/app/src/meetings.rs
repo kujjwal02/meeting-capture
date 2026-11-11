@@ -62,6 +62,14 @@ fn notify_outcome(app: &AppHandle, pipeline: &Pipeline, meeting: &Meeting) {
                 format!("{title}, transcript only: the notes failed; next try at {retry_at}"),
             )
         }
+        // Once per wait: later tries that fail again stay quiet.
+        JobState::NetworkWait { retry } if retry.number() == 1 => {
+            let retry_at = retry.describe(&pipeline.settings().time_zone);
+            (
+                "Waiting for the network",
+                format!("{title}: the call audio could not upload; {retry_at}"),
+            )
+        }
         JobState::Failed {
             cause:
                 FailureCause {
@@ -73,13 +81,16 @@ fn notify_outcome(app: &AppHandle, pipeline: &Pipeline, meeting: &Meeting) {
             format!("{title} keeps the transcript only. The tray shows why."),
         ),
         JobState::Captured
+        | JobState::Transcribed
         | JobState::Matched
         | JobState::Extracted
         | JobState::ExtractionPending { .. }
+        | JobState::NetworkWait { .. }
+        | JobState::Resuming { .. }
         | JobState::Failed {
             cause:
                 FailureCause {
-                    kind: FailureKind::Step,
+                    kind: FailureKind::Step | FailureKind::NetworkWait | FailureKind::Resume,
                     ..
                 },
         } => return,

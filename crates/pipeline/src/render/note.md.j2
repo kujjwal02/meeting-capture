@@ -95,7 +95,7 @@
 %% mc:end my-commitments %%
 
 %% mc:begin caption-fixes %%
-{% if notes and notes.caption_fixes %}
+{% if notes and notes.caption_fixes and shows_caption_fixes %}
 ## Possible caption errors
 
 The notes above read these words as the guess shown. Check them against the call.
@@ -109,6 +109,10 @@ The notes above read these words as the guess shown. Check them against the call
 %% mc:begin transcript %%
 ## Transcript
 
+{% if transcription %}
+_{{ transcription }}_
+
+{% endif %}
 {% for segment in segments %}
 **[{{ segment.at }}] {{ segment.speaker }}:** {{ segment.text }} ^s{{ segment.id }}
 

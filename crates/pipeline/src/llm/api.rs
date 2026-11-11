@@ -15,12 +15,16 @@ use rig_core::providers::openai::wire::{Auth, OPENAI};
 use super::{Conversation, ExtractionError, SYSTEM_PROMPT};
 use crate::extraction::{MeetingNotes, Reply};
 use crate::settings::ProviderKind;
+use crate::transcribe::coherence::{self, CaptionJudgement};
 
 // A 60-minute call's notes come back in well under a minute; a slow local model gets the rest.
 const CALL_TIMEOUT: Duration = Duration::from_mins(3);
 // The notes run to about 3k tokens on an 11k-word call. Anthropic needs a cap; rig's catalog has
 // none for the 5.5 models.
 const MAX_OUTPUT_TOKENS: u64 = 16_000;
+// The caption judgement is one word in a JSON object.
+const MAX_JUDGEMENT_TOKENS: u64 = 200;
+const JUDGEMENT_TIMEOUT: Duration = Duration::from_mins(1);
 
 pub(super) enum Endpoint {
     Anthropic,
@@ -30,6 +34,8 @@ pub(super) enum Endpoint {
 #[derive(Clone)]
 pub(super) struct ApiClient {
     agent: Agent,
+    /// The same model with the caption judge's instructions.
+    judge: Agent,
 }
 
 impl std::fmt::Debug for ApiClient {
@@ -40,31 +46,79 @@ impl std::fmt::Debug for ApiClient {
 
 impl ApiClient {
     pub(super) fn new(
-        endpoint: Endpoint,
-        model: String,
-        api_key: Option<String>,
+        endpoint: &Endpoint,
+        model: &str,
+        api_key: Option<&str>,
     ) -> Result<Self, ExtractionError> {
-        let agent = match endpoint {
-            Endpoint::Anthropic => {
-                let api_key = api_key.ok_or(ExtractionError::NoApiKey {
-                    provider: ProviderKind::Anthropic.as_str(),
-                })?;
-                AgentBuilder::new(AnthropicConfig::new(api_key).client().completion(model))
+        let builder = |preamble: &str, max_tokens: u64| -> Result<Agent, ExtractionError> {
+            Ok(match endpoint {
+                Endpoint::Anthropic => {
+                    let api_key = api_key.ok_or(ExtractionError::NoApiKey {
+                        provider: ProviderKind::Anthropic.as_str(),
+                    })?;
+                    AgentBuilder::new(
+                        AnthropicConfig::new(api_key.to_owned())
+                            .client()
+                            .completion(model.to_owned()),
+                    )
+                }
+                Endpoint::OpenaiCompatible { base_url } => {
+                    // Local servers such as Ollama take no key; an empty one sends no header.
+                    let client =
+                        OpenAIConfig::with_key(&OPENAI, api_key.unwrap_or_default().to_owned())
+                            .with_base_url(base_url.clone())
+                            .with_auth(Auth::OptionalBearer)
+                            .client();
+                    AgentBuilder::new(client.chat(model.to_owned()))
+                }
             }
-            Endpoint::OpenaiCompatible { base_url } => {
-                // Local servers such as Ollama take no key; an empty one sends no header.
-                let client = OpenAIConfig::with_key(&OPENAI, api_key.unwrap_or_default())
-                    .with_base_url(base_url)
-                    .with_auth(Auth::OptionalBearer)
-                    .client();
-                AgentBuilder::new(client.chat(model))
+            .preamble(preamble)
+            .temperature(0.0)
+            .max_tokens(max_tokens)
+            .build())
+        };
+        Ok(Self {
+            agent: builder(SYSTEM_PROMPT, MAX_OUTPUT_TOKENS)?,
+            judge: builder(coherence::SYSTEM_PROMPT, MAX_JUDGEMENT_TOKENS)?,
+        })
+    }
+
+    /// Asks whether caption lines read as sensible English.
+    pub(super) fn judge_captions(
+        &self,
+        label: &str,
+        message: &str,
+    ) -> Result<CaptionJudgement, ExtractionError> {
+        let conversation = ApiConversation {
+            agent: self.judge.clone(),
+            history: Vec::new(),
+            label: label.to_owned(),
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                conversation.transport(format!("could not start a runtime: {error}"))
+            })?;
+        let run = self
+            .judge
+            .prompt_typed::<CaptionJudgement>(message.to_owned());
+        let outcome = runtime
+            .block_on(async { tokio::time::timeout(JUDGEMENT_TIMEOUT, run).await })
+            .map_err(|_| ExtractionError::Timeout {
+                provider: label.to_owned(),
+                limit_s: JUDGEMENT_TIMEOUT.as_secs(),
+            })?;
+        match outcome {
+            Ok(response) => Ok(response.output),
+            Err(StructuredOutputError::Deserialization { error, .. }) => {
+                Err(conversation.transport(format!("the reply does not fit: {error}")))
             }
+            Err(StructuredOutputError::EmptyResponse) => {
+                Err(conversation.transport("the reply was empty".to_owned()))
+            }
+            Err(StructuredOutputError::Prompt(error)) => Err(conversation.prompt_error(&error)),
         }
-        .preamble(SYSTEM_PROMPT)
-        .temperature(0.0)
-        .max_tokens(MAX_OUTPUT_TOKENS)
-        .build();
-        Ok(Self { agent })
     }
 
     pub(super) fn start(&self, label: &str) -> impl Conversation + use<> {

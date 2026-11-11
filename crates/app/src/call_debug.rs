@@ -904,7 +904,10 @@ fn job_record_of(meeting: &jobs::Meeting) -> JobRecord {
     let state = meeting.state();
     let failure = match &state {
         jobs::JobState::Failed { cause } => Some(cause.message.clone()),
+        jobs::JobState::NetworkWait { retry } => Some(retry.last_error().to_owned()),
+        jobs::JobState::Resuming { message } => Some(message.clone()),
         jobs::JobState::Captured
+        | jobs::JobState::Transcribed
         | jobs::JobState::Matched
         | jobs::JobState::Extracted
         | jobs::JobState::Written { .. }

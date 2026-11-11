@@ -24,10 +24,10 @@ use std::time::Duration;
 use jiff::Timestamp;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-pub use crate::lease::{LeasedRun, RunOutcome, StepError};
+pub use crate::lease::{LeasedRun, NetworkFault, RunOutcome, StepError, StepRetry};
 pub use crate::retry_schedule::ErrorPersistence;
 use crate::schema::{MEETING_COLUMNS, migrate, read_meeting};
-pub use crate::state::{ExtractionRetry, FailureCause, FailureKind, JobState};
+pub use crate::state::{ExtractionRetry, FailureCause, FailureKind, JobState, NetworkRetry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MeetingId(i64);
@@ -54,14 +54,17 @@ impl fmt::Display for MeetingId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Step {
     Captured,
+    /// The transcript is settled: the captions, or speech-to-text of the call's stems.
+    Transcribed,
     Matched,
     Extracted,
     Written,
 }
 
 impl Step {
-    const ALL: [Step; 4] = [
+    const ALL: [Step; 5] = [
         Step::Captured,
+        Step::Transcribed,
         Step::Matched,
         Step::Extracted,
         Step::Written,
@@ -72,6 +75,7 @@ impl Step {
     pub fn as_str(self) -> &'static str {
         match self {
             Step::Captured => "captured",
+            Step::Transcribed => "transcribed",
             Step::Matched => "matched",
             Step::Extracted => "extracted",
             Step::Written => "written",
@@ -207,6 +211,15 @@ pub enum ExtractionAtWrite<'a> {
     Recorded,
     /// The note is written without notes.
     Failed(ExtractionFailure<'a>),
+}
+
+/// Whether the note's transcript is final when it is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptAtWrite {
+    Settled,
+    /// The note holds the captions while speech-to-text is owed. The meeting runs again at once
+    /// for it, and that run extracts the notes again from the new transcript.
+    Pending,
 }
 
 /// A failed extraction, as recorded with the note written without notes.
@@ -389,7 +402,8 @@ impl JobStore {
 
     /// Meetings to run again, oldest first: those that stopped before their note was written
     /// without a recorded failure (the app quit or crashed mid-run, or a capture arrived while it
-    /// was down), and written ones whose extraction retry is due.
+    /// was down), written ones whose extraction retry is due, ones waiting for the network
+    /// whose next try is due, and ones to resume.
     ///
     /// # Errors
     ///
@@ -398,12 +412,18 @@ impl JobStore {
         let connection = self.connection();
         let mut statement = connection.prepare(&format!(
             "SELECT {MEETING_COLUMNS} FROM meetings
-             WHERE failure IS NULL
-                AND (finished_step != ?1 OR next_extraction_at_ms <= ?2)
+             WHERE (failure IS NULL
+                    AND (finished_step != ?1 OR next_extraction_at_ms <= ?2))
+                OR (failure_kind IN (?3, ?4) AND next_extraction_at_ms <= ?2)
              ORDER BY started_at"
         ))?;
         let rows = statement.query_map(
-            params![Step::Written.as_str(), Timestamp::now().as_millisecond()],
+            params![
+                Step::Written.as_str(),
+                Timestamp::now().as_millisecond(),
+                FailureKind::NetworkWait.as_str(),
+                FailureKind::Resume.as_str()
+            ],
             read_meeting,
         )?;
         rows.map(|row| row?).collect()
@@ -425,7 +445,8 @@ impl JobStore {
         rows.map(|row| row?).collect()
     }
 
-    /// Meetings whose last run failed, oldest first.
+    /// Meetings whose last run failed, oldest first. Those waiting for the network or to resume
+    /// are not failed: the sweep runs them.
     ///
     /// # Errors
     ///
@@ -433,9 +454,17 @@ impl JobStore {
     pub fn failed(&self) -> Result<Vec<Meeting>, StoreError> {
         let connection = self.connection();
         let mut statement = connection.prepare(&format!(
-            "SELECT {MEETING_COLUMNS} FROM meetings WHERE failure IS NOT NULL ORDER BY started_at"
+            "SELECT {MEETING_COLUMNS} FROM meetings WHERE failure IS NOT NULL
+                AND (failure_kind IS NULL OR failure_kind NOT IN (?1, ?2))
+             ORDER BY started_at"
         ))?;
-        let rows = statement.query_map([], read_meeting)?;
+        let rows = statement.query_map(
+            [
+                FailureKind::NetworkWait.as_str(),
+                FailureKind::Resume.as_str(),
+            ],
+            read_meeting,
+        )?;
         rows.map(|row| row?).collect()
     }
 
@@ -558,10 +587,27 @@ fn section_lines(section_sha256s: &BTreeMap<String, String>) -> String {
         .join("\n")
 }
 
+// What a rewind clears: every step output, so each step runs again. The note hashes stay.
+const REWOUND: &str = "failure = NULL, failure_kind = NULL, calendar_match_json = NULL,
+    extraction_json = NULL, extraction_provider = NULL, extraction_attempts = 0,
+    extraction_error = NULL, next_extraction_at_ms = NULL";
+
 const NOTE_WRITTEN: &str = "finished_step = ?6, note_sha256 = ?7, pending_note_sha256s = NULL,
     note_section_sha256s = ?8";
 
 impl LeasedRun<'_> {
+    /// Records the transcribe step as done. Its output lives in the call folder, not here.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Superseded` or `StoreError::LeaseLost` when the run must stop.
+    pub fn record_transcription(&self) -> Result<(), StoreError> {
+        self.update(
+            "finished_step = ?6, failure = NULL, failure_kind = NULL",
+            &[&Step::Transcribed.as_str()],
+        )
+    }
+
     /// `title` is the calendar event title, else the title the call app showed.
     ///
     /// # Errors
@@ -675,13 +721,19 @@ impl LeasedRun<'_> {
         note_sha256: &str,
         section_sha256s: &BTreeMap<String, String>,
         extraction: ExtractionAtWrite<'_>,
+        transcript: TranscriptAtWrite,
     ) -> Result<(), StoreError> {
         let section_lines = section_lines(section_sha256s);
         let written = Step::Written.as_str();
+        let now_ms = Timestamp::now().as_millisecond();
+        let rerun_at_ms = match transcript {
+            TranscriptAtWrite::Settled => None,
+            TranscriptAtWrite::Pending => Some(now_ms),
+        };
         match extraction {
             ExtractionAtWrite::Recorded => self.update(
-                &format!("{NOTE_WRITTEN}, failure = NULL, failure_kind = NULL"),
-                &[&written, &note_sha256, &section_lines],
+                &format!("{NOTE_WRITTEN}, next_extraction_at_ms = ?9, failure = NULL, failure_kind = NULL"),
+                &[&written, &note_sha256, &section_lines, &rerun_at_ms],
             ),
             ExtractionAtWrite::Failed(ExtractionFailure {
                 provider,
@@ -689,7 +741,8 @@ impl LeasedRun<'_> {
                 persistence,
             }) => {
                 let next = retry_schedule::after_failure(self.meeting(), persistence);
-                let retry_at_ms = next.retry_at.map(Timestamp::as_millisecond);
+                // A pending transcript reruns the meeting now, and that run extracts again.
+                let retry_at_ms = rerun_at_ms.or(next.retry_at.map(Timestamp::as_millisecond));
                 self.update(
                     &format!(
                         "{NOTE_WRITTEN}, extraction_provider = ?9, extraction_attempts = ?10,
@@ -709,6 +762,22 @@ impl LeasedRun<'_> {
                     ],
                 )
             }
+        }
+    }
+
+    /// Sends the meeting back to `Captured` from inside its run, as `JobStore::rewind` does
+    /// without discarding note edits, and stops this run. `JobStore::run` then runs every step
+    /// again under the same lease. For a step whose saved output no longer matches its input.
+    /// Returns the error the step returns: `StoreError::Superseded` once the meeting is rewound,
+    /// or the error that stopped the rewind.
+    #[must_use]
+    pub fn restart(&self) -> StoreError {
+        match self.update(
+            &format!("finished_step = ?6, input_revision = input_revision + 1, {REWOUND}"),
+            &[&Step::Captured.as_str()],
+        ) {
+            Ok(()) => self.superseded(),
+            Err(error) => error,
         }
     }
 }

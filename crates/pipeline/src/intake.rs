@@ -9,8 +9,10 @@ use sources::Transcript;
 
 use crate::Pipeline;
 
-// A call with almost no captions was most likely a misclick or a quick check.
-const MIN_CAPTION_SEGMENTS: usize = 3;
+/// A call with fewer caption lines was most likely a misclick or a quick check, and makes no
+/// note on its own. The transcribe step sends such a call to
+/// speech-to-text when it can.
+pub(crate) const MIN_CAPTION_SEGMENTS: usize = 3;
 
 /// What intake did with a call log the tray passed.
 #[derive(Debug, Clone, Copy)]
@@ -18,7 +20,8 @@ pub enum Intake {
     Recorded(MeetingId),
     /// Shorter than the tray's minimum. Intake logs the length.
     TooShort,
-    /// Long enough, with fewer than `MIN_CAPTION_SEGMENTS` caption segments. Intake logs both.
+    /// Long enough, with fewer than `MIN_CAPTION_SEGMENTS` caption segments and no call audio to
+    /// transcribe. Intake logs both.
     TooFewCaptions,
 }
 
@@ -86,9 +89,10 @@ impl Pipeline {
         self.record(kind, input_path, &input, &transcript)
     }
 
-    /// Takes in a call log as `take_in` does, but skips a call shorter than `min_call_seconds`
-    /// or with fewer than `MIN_CAPTION_SEGMENTS` caption segments. The tray does this. The log
-    /// stays, so `mc ingest` can still write its note.
+    /// Takes in a call log as `take_in` does, but skips a call shorter than `min_call_seconds`,
+    /// or one with fewer than `MIN_CAPTION_SEGMENTS` caption segments and no call audio a
+    /// speech-to-text provider could transcribe. The tray does this. The log stays, so
+    /// `mc ingest` can still write its note.
     ///
     /// # Errors
     ///
@@ -110,7 +114,13 @@ impl Pipeline {
             );
             return Ok(Intake::TooShort);
         }
-        if segments < MIN_CAPTION_SEGMENTS {
+        if segments < MIN_CAPTION_SEGMENTS && self.can_transcribe_log(log_path) {
+            tracing::info!(
+                call.length_s = length_s,
+                caption.segments = segments,
+                "too few captions; the call audio will be transcribed"
+            );
+        } else if segments < MIN_CAPTION_SEGMENTS {
             tracing::info!(
                 call.length_s = length_s,
                 caption.segments = segments,

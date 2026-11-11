@@ -10,6 +10,7 @@ use crate::{Meeting, Step};
 #[derive(Debug, Clone)]
 pub enum JobState {
     Captured,
+    Transcribed,
     Matched,
     Extracted,
     Written {
@@ -19,6 +20,17 @@ pub enum JobState {
     /// queued when a provider was set after the note was written.
     ExtractionPending {
         retry: Option<ExtractionRetry>,
+    },
+    /// A step could not reach a service, such as speech-to-text on a weak uplink. The sweep
+    /// tries again on a schedule; nothing is wrong with the meeting.
+    NetworkWait {
+        retry: NetworkRetry,
+    },
+    /// A step saved part of its work and ran out of run time. The next sweep resumes it with no
+    /// delay; nothing is wrong with the meeting.
+    Resuming {
+        /// What the step said when it stopped.
+        message: String,
     },
     Failed {
         cause: FailureCause,
@@ -30,10 +42,13 @@ impl JobState {
     pub fn label(&self) -> &'static str {
         match self {
             JobState::Captured => "Captured",
+            JobState::Transcribed => "Transcribed",
             JobState::Matched => "Matched",
             JobState::Extracted => "Extracted",
             JobState::Written { .. } => "Written",
             JobState::ExtractionPending { .. } => "Extraction pending",
+            JobState::NetworkWait { .. } => "Waiting for the network",
+            JobState::Resuming { .. } => "Resuming",
             JobState::Failed { .. } => "Failed",
         }
     }
@@ -80,6 +95,43 @@ impl ExtractionRetry {
     }
 }
 
+/// The next try of a step that failed on the network. Only `jobs` builds one.
+#[derive(Debug, Clone)]
+pub struct NetworkRetry {
+    number: u32,
+    at: Timestamp,
+    last_error: String,
+}
+
+impl NetworkRetry {
+    #[must_use]
+    pub fn number(&self) -> u32 {
+        self.number
+    }
+
+    #[must_use]
+    pub fn last_error(&self) -> &str {
+        &self.last_error
+    }
+
+    /// "retry 2 at 14:05 IST" with the time in `time_zone`, the weekday too when it is not
+    /// today, or "retry 4 at the next sweep" when the try is due already.
+    #[must_use]
+    pub fn describe(&self, time_zone: &TimeZone) -> String {
+        let now = Timestamp::now();
+        if self.at <= now {
+            return format!("retry {} at the next sweep", self.number);
+        }
+        let at = self.at.to_zoned(time_zone.clone());
+        let format = if at.date() == now.to_zoned(time_zone.clone()).date() {
+            "%H:%M %Z"
+        } else {
+            "%a %H:%M %Z"
+        };
+        format!("retry {} at {}", self.number, at.strftime(format))
+    }
+}
+
 /// Why the last attempt failed. A step that next succeeds clears it.
 #[derive(Debug, Clone)]
 pub struct FailureCause {
@@ -95,15 +147,29 @@ pub enum FailureKind {
     /// Extraction failed for good: the last retry failed, or the error would recur on every
     /// retry. The note keeps the transcript only.
     Extraction,
+    /// A step could not reach a service. The schedule in `next_extraction_at_ms` runs it again,
+    /// and `extraction_attempts` counts the tries, since a waiting meeting owes its extraction
+    /// too.
+    NetworkWait,
+    /// A step saved part of its work and ran out of run time. `next_extraction_at_ms` holds the
+    /// time it stopped, so the next sweep runs it.
+    Resume,
 }
 
 impl FailureKind {
-    pub(crate) const ALL: [FailureKind; 2] = [FailureKind::Step, FailureKind::Extraction];
+    pub(crate) const ALL: [FailureKind; 4] = [
+        FailureKind::Step,
+        FailureKind::Extraction,
+        FailureKind::NetworkWait,
+        FailureKind::Resume,
+    ];
 
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             FailureKind::Step => "step",
             FailureKind::Extraction => "extraction",
+            FailureKind::NetworkWait => "network-wait",
+            FailureKind::Resume => "resume",
         }
     }
 
@@ -123,6 +189,23 @@ impl Meeting {
     #[must_use]
     pub fn state(&self) -> JobState {
         if let Some(cause) = &self.failure {
+            match cause.kind {
+                FailureKind::NetworkWait => {
+                    return JobState::NetworkWait {
+                        retry: NetworkRetry {
+                            number: self.extraction_attempts.max(1),
+                            at: self.next_extraction_at.unwrap_or(self.updated_at),
+                            last_error: cause.message.clone(),
+                        },
+                    };
+                }
+                FailureKind::Resume => {
+                    return JobState::Resuming {
+                        message: cause.message.clone(),
+                    };
+                }
+                FailureKind::Step | FailureKind::Extraction => {}
+            }
             return JobState::Failed {
                 cause: cause.clone(),
             };
@@ -143,6 +226,7 @@ impl Meeting {
         }
         match self.finished_step {
             Step::Captured => JobState::Captured,
+            Step::Transcribed => JobState::Transcribed,
             Step::Matched => JobState::Matched,
             Step::Extracted => JobState::Extracted,
             Step::Written => JobState::Written {
@@ -158,5 +242,15 @@ impl Meeting {
         self.finished_step < Step::Extracted
             || self.next_extraction_at.is_some()
             || (self.failure.is_some() && self.extraction_error.is_some())
+    }
+
+    /// Whether the meeting, not failed, has a run due now: a pending transcript or a retry
+    /// whose time has come.
+    #[must_use]
+    pub fn is_run_due(&self) -> bool {
+        self.failure.is_none()
+            && self
+                .next_extraction_at
+                .is_some_and(|at| at <= Timestamp::now())
     }
 }
