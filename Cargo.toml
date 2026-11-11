@@ -66,8 +66,7 @@ tracing-subscriber = { version = "0.3", features = ["json"] }
 clap = { version = "4.6", features = ["derive"] }
 directories = "6.0"
 minijinja = { version = "3.0", features = ["serde"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
-rusqlite_migration = "2.6"
+rusqlite = { version = "0.42", features = ["bundled"] }
 schemars = "1.2"
 slug = "0.1"
 # Process CPU and memory, and disk free, on Mac and Windows with no unsafe code here.
