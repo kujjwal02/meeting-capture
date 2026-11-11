@@ -628,7 +628,6 @@
     // While the leave grace runs, the call controls are gone and would read as captions off.
     if (!call || !isInCall) return;
     if (nowMs - call.last_seen_ms >= 5000) storeSession();
-    captionBox.apply();
 
     const button = globalThis.mcMeetReadCaptionsButton();
     const decision = captionSource.decide({

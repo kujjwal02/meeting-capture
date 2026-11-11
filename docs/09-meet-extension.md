@@ -233,8 +233,11 @@ stored value the content script hides the caption region.
   clock, so it also runs in Node. `content/main.js` feeds it timestamped facts and runs the
   reader it picks.
 - Hidden captions. Meet's caption box covers a shared screen. With `hide_captions` on, the
-  once-a-second check gives the caption region `display: none`, whichever reader is the source,
-  so the box can show for up to 1 s. Meet keeps writing captions into the hidden region. Turning
+  content script's stylesheet gives Meet's caption panel `display: none` from its first frame,
+  whichever reader is the source. Meet measures the panel once, when captions turn on, and shrinks
+  the video area by its height, so a panel hidden later would leave an empty band. A change of
+  `hide_captions` mid-call moves the video area at the next captions on. Meet keeps writing
+  captions into the hidden region. Turning
   captions off makes Meet close its own caption channel, and the page hook blocks `close()` on
   caption channels it did not open.
 - The DOM reader makes one utterance of each speaker turn. Meet did not trim a 1200-character
