@@ -9,12 +9,13 @@ vault.
 ![Platform: macOS](https://img.shields.io/badge/platform-macOS%20(Apple%20silicon)-lightgrey)
 
 > [!NOTE]
-> v0.11.4 is an early release for Apple silicon Macs. It turns Google Meet captions, read by the
+> v0.12.0 is an early release for Apple silicon Macs. It turns Google Meet captions, read by the
 > mc-meet extension, and Slack huddle captions into notes, and logs when each call starts and ends.
 > It records each call's mic and call audio, with video of the Meet tab or the Slack huddle window,
 > into one `call.mp4` that is kept for 90 days. The app installs mc-meet and updates it. A tray
-> toggle turns on 24 h of debug logging, and `mc debug timeline` reads a saved debug report. Teams
-> and Zoom detection, local speech-to-text and the Windows build are on the
+> toggle turns on 24 h of debug logging, and `mc debug timeline` reads a saved debug report. When
+> captions are missing, in Hindi or garbled, it transcribes those parts of the call audio with
+> Deepgram. Teams and Zoom detection, local speech-to-text and the Windows build are on the
 > [roadmap](docs/03-roadmap.md).
 > The app is built for one person's machines, so expect rough edges.
 
