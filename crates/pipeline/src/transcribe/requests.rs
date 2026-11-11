@@ -121,7 +121,7 @@ impl<'a> Uploader<'a> {
                 reply: saved.reply,
             }));
         }
-        let audio = stt::ogg_opus::encode(&samples)?;
+        let audio = self.provider.encode(&samples)?;
         let _span = tracing::info_span!(
             "stt.request",
             file.name = file_name,

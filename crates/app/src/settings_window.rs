@@ -68,8 +68,43 @@ pub(crate) struct TranscriptionView {
     language: Option<String>,
     /// The view never carries a secret, only whether one is stored.
     has_api_key: bool,
-    deepgram_default_model: &'static str,
-    deepgram_default_language: &'static str,
+    /// The providers this build offers on this machine. Wispr is absent unless its engine is
+    /// built in and the desktop app is installed.
+    providers: Vec<TranscriptionProviderOption>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TranscriptionProviderOption {
+    /// The value the form sends back, such as `deepgram`.
+    kind: &'static str,
+    /// The name shown in the menu.
+    label: &'static str,
+    requires_api_key: bool,
+    default_model: &'static str,
+    default_language: &'static str,
+    /// Shown, and acknowledged, before the provider is turned on.
+    warning: Option<&'static str>,
+}
+
+fn transcription_provider_label(kind: stt::ProviderKind) -> &'static str {
+    match kind {
+        stt::ProviderKind::Deepgram => "Deepgram",
+        stt::ProviderKind::Wispr => "Wispr Flow",
+    }
+}
+
+fn transcription_provider_options() -> Vec<TranscriptionProviderOption> {
+    stt::ProviderKind::selectable()
+        .into_iter()
+        .map(|kind| TranscriptionProviderOption {
+            kind: kind.as_str(),
+            label: transcription_provider_label(kind),
+            requires_api_key: kind.requires_api_key(),
+            default_model: kind.default_model(),
+            default_language: kind.default_language(),
+            warning: kind.activation_warning(),
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -187,8 +222,7 @@ pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, 
         model: file.transcription.model.clone(),
         language: file.transcription.language.clone(),
         has_api_key: file.transcription.api_key.is_some(),
-        deepgram_default_model: stt::ProviderKind::Deepgram.default_model(),
-        deepgram_default_language: stt::ProviderKind::Deepgram.default_language(),
+        providers: transcription_provider_options(),
     };
     let accounts = account_statuses(&state, &file)
         .into_iter()

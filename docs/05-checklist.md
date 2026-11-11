@@ -460,6 +460,9 @@ Done when:
 - [x] Saved replies that no longer match the stems send the meeting back to its first step.
 - [x] `mc transcribe <id>` sends every window.
 - [x] The note says which source its transcript came from and how many minutes Deepgram wrote.
+- [x] Wispr Flow as an optional provider behind the `wispr` cargo feature: borrows the desktop
+  app's session token, gRPC over HTTP/2, WAV upload, proxy host only. Offered in settings only when
+  built in and installed, with a warning to acknowledge before it is turned on.
 - [ ] Local models (Desert Ant Voz and Who) as a second provider.
 
 Done when:

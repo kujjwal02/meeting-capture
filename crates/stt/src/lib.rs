@@ -6,11 +6,15 @@
 
 mod deepgram;
 pub mod ogg_opus;
+#[cfg(feature = "wispr")]
+mod wispr;
 
 use serde::{Deserialize, Serialize};
 
 pub use crate::deepgram::Deepgram;
 pub use crate::ogg_opus::EncodedAudio;
+#[cfg(feature = "wispr")]
+pub use crate::wispr::Wispr;
 
 /// The speech-to-text services the settings can name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -18,6 +22,9 @@ pub use crate::ogg_opus::EncodedAudio;
 pub enum ProviderKind {
     /// Deepgram's prerecorded API, with a key from the settings file.
     Deepgram,
+    /// Wispr Flow's dictation API, with a token borrowed from the installed desktop app. Built
+    /// only with the `wispr` feature.
+    Wispr,
 }
 
 impl ProviderKind {
@@ -25,6 +32,7 @@ impl ProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Deepgram => "deepgram",
+            Self::Wispr => "wispr",
         }
     }
 
@@ -33,6 +41,8 @@ impl ProviderKind {
     pub fn default_model(self) -> &'static str {
         match self {
             Self::Deepgram => "nova-3",
+            // Wispr has no model to choose; this names it in labels only.
+            Self::Wispr => "flow",
         }
     }
 
@@ -41,8 +51,54 @@ impl ProviderKind {
     #[must_use]
     pub fn default_language(self) -> &'static str {
         match self {
-            Self::Deepgram => "multi",
+            Self::Deepgram | Self::Wispr => "multi",
         }
+    }
+
+    /// Whether this provider reads its key from `transcription.api_key`. Wispr borrows the
+    /// desktop app's token instead, so it needs none.
+    #[must_use]
+    pub fn requires_api_key(self) -> bool {
+        match self {
+            Self::Deepgram => true,
+            Self::Wispr => false,
+        }
+    }
+
+    /// Whether this provider can be used in this build on this machine: the engine is compiled
+    /// in and anything it needs locally is present.
+    #[must_use]
+    pub fn is_available(self) -> bool {
+        match self {
+            Self::Deepgram => true,
+            #[cfg(feature = "wispr")]
+            Self::Wispr => wispr::is_installed(),
+            #[cfg(not(feature = "wispr"))]
+            Self::Wispr => false,
+        }
+    }
+
+    /// A warning to show before this provider is turned on, if any.
+    #[must_use]
+    pub fn activation_warning(self) -> Option<&'static str> {
+        match self {
+            Self::Deepgram => None,
+            Self::Wispr => Some(
+                "Wispr Flow transcription is unsupported: it uses Wispr's own API with a token \
+                 borrowed from the desktop app, against Wispr's terms of service, and may get your \
+                 Wispr account flagged or banned. The desktop app must stay installed and signed \
+                 in.",
+            ),
+        }
+    }
+
+    /// The providers that can be used in this build on this machine, for a settings menu.
+    #[must_use]
+    pub fn selectable() -> Vec<Self> {
+        [Self::Deepgram, Self::Wispr]
+            .into_iter()
+            .filter(|kind| kind.is_available())
+            .collect()
     }
 
     /// Reads the utterances from a reply this provider sent, now or in an earlier run. Needs no
@@ -54,6 +110,10 @@ impl ProviderKind {
     pub fn utterances(self, reply: &serde_json::Value) -> Result<Vec<Utterance>, SttError> {
         match self {
             Self::Deepgram => deepgram::read_utterances(reply),
+            #[cfg(feature = "wispr")]
+            Self::Wispr => wispr::read_utterances(reply),
+            #[cfg(not(feature = "wispr"))]
+            Self::Wispr => Err(SttError::EngineNotBuilt { provider: self }),
         }
     }
 
@@ -65,6 +125,10 @@ impl ProviderKind {
     pub fn word_languages(self, reply: &serde_json::Value) -> Result<Vec<TaggedWord>, SttError> {
         match self {
             Self::Deepgram => deepgram::read_word_languages(reply),
+            #[cfg(feature = "wispr")]
+            Self::Wispr => wispr::read_word_languages(reply),
+            #[cfg(not(feature = "wispr"))]
+            Self::Wispr => Err(SttError::EngineNotBuilt { provider: self }),
         }
     }
 }
@@ -150,6 +214,13 @@ pub enum SttError {
     Encode { detail: String },
     #[error("{provider} sent a reply this app cannot read: {detail}")]
     UnreadableReply { provider: String, detail: String },
+    #[error("no Wispr Flow session: {detail}")]
+    WisprSession { detail: String },
+    #[error(
+        "the {} engine is not built into this app; rebuild with its feature enabled",
+        provider.as_str()
+    )]
+    EngineNotBuilt { provider: ProviderKind },
 }
 
 impl SttError {
@@ -163,7 +234,9 @@ impl SttError {
             Self::KeyRefused { .. }
             | Self::KeyMalformed { .. }
             | Self::OutOfCredit { .. }
-            | Self::RequestRejected { .. } => FailureClass::Refused,
+            | Self::RequestRejected { .. }
+            | Self::WisprSession { .. }
+            | Self::EngineNotBuilt { .. } => FailureClass::Refused,
             Self::ReadStem { .. } | Self::Encode { .. } | Self::UnreadableReply { .. } => {
                 FailureClass::Local
             }
@@ -177,6 +250,13 @@ pub trait SpeechToText {
 
     /// `<provider>/<model>`, as the note and the logs name it.
     fn label(&self) -> String;
+
+    /// Encodes a stretch of 16 kHz mono samples the way this provider wants it uploaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SttError::Encode` when the samples cannot be encoded.
+    fn encode(&self, samples: &[i16]) -> Result<EncodedAudio, SttError>;
 
     /// What a saved transcript reply must have been asked with to be reused: the provider,
     /// model, language, options for `voices` and the audio encoding.
@@ -226,61 +306,80 @@ pub trait SpeechToText {
 #[derive(Debug, Clone)]
 pub enum Provider {
     Deepgram(Deepgram),
+    #[cfg(feature = "wispr")]
+    Wispr(Wispr),
 }
 
 impl Provider {
-    /// The provider for `kind`, asking `model` in `language`.
+    /// The provider for `kind`, asking `model` in `language`. `api_key` is required for a
+    /// provider whose `requires_api_key` is true.
     ///
     /// # Errors
     ///
-    /// Returns `SttError::Network` when the HTTP client cannot be built.
+    /// Returns `SttError::KeyRefused` when a key is needed but missing, `SttError::EngineNotBuilt`
+    /// when the engine is not compiled in, or `SttError::Network` when the HTTP client cannot be
+    /// built.
     pub fn new(
         kind: ProviderKind,
-        api_key: String,
+        api_key: Option<String>,
         model: String,
         language: String,
     ) -> Result<Self, SttError> {
         match kind {
-            ProviderKind::Deepgram => Ok(Self::Deepgram(Deepgram::new(api_key, model, language)?)),
+            ProviderKind::Deepgram => {
+                let api_key = api_key.ok_or(SttError::KeyRefused {
+                    provider: kind.as_str().to_owned(),
+                    status: 401,
+                })?;
+                Ok(Self::Deepgram(Deepgram::new(api_key, model, language)?))
+            }
+            #[cfg(feature = "wispr")]
+            ProviderKind::Wispr => Ok(Self::Wispr(Wispr::new(&model, &language)?)),
+            #[cfg(not(feature = "wispr"))]
+            ProviderKind::Wispr => Err(SttError::EngineNotBuilt { provider: kind }),
         }
     }
 }
 
+/// Forwards each trait method to the chosen engine. The `wispr` arms compile only with the
+/// feature.
+macro_rules! forward {
+    ($self:ident, $engine:ident => $call:expr) => {
+        match $self {
+            Self::Deepgram($engine) => $call,
+            #[cfg(feature = "wispr")]
+            Self::Wispr($engine) => $call,
+        }
+    };
+}
+
 impl SpeechToText for Provider {
     fn kind(&self) -> ProviderKind {
-        match self {
-            Self::Deepgram(deepgram) => deepgram.kind(),
-        }
+        forward!(self, engine => engine.kind())
     }
 
     fn label(&self) -> String {
-        match self {
-            Self::Deepgram(deepgram) => deepgram.label(),
-        }
+        forward!(self, engine => engine.label())
+    }
+
+    fn encode(&self, samples: &[i16]) -> Result<EncodedAudio, SttError> {
+        forward!(self, engine => engine.encode(samples))
     }
 
     fn request_key(&self, voices: StemVoices) -> String {
-        match self {
-            Self::Deepgram(deepgram) => deepgram.request_key(voices),
-        }
+        forward!(self, engine => engine.request_key(voices))
     }
 
     fn request_timeout(&self, audio_bytes: usize) -> std::time::Duration {
-        match self {
-            Self::Deepgram(deepgram) => deepgram.request_timeout(audio_bytes),
-        }
+        forward!(self, engine => engine.request_timeout(audio_bytes))
     }
 
     fn language_check_key(&self, voices: StemVoices) -> String {
-        match self {
-            Self::Deepgram(deepgram) => deepgram.language_check_key(voices),
-        }
+        forward!(self, engine => engine.language_check_key(voices))
     }
 
     fn check_reachable(&self) -> Result<(), SttError> {
-        match self {
-            Self::Deepgram(deepgram) => deepgram.check_reachable(),
-        }
+        forward!(self, engine => engine.check_reachable())
     }
 
     fn transcribe(
@@ -288,9 +387,7 @@ impl SpeechToText for Provider {
         audio: &EncodedAudio,
         voices: StemVoices,
     ) -> Result<serde_json::Value, SttError> {
-        match self {
-            Self::Deepgram(deepgram) => deepgram.transcribe(audio, voices),
-        }
+        forward!(self, engine => engine.transcribe(audio, voices))
     }
 
     fn language_check(
@@ -298,8 +395,6 @@ impl SpeechToText for Provider {
         audio: &EncodedAudio,
         voices: StemVoices,
     ) -> Result<serde_json::Value, SttError> {
-        match self {
-            Self::Deepgram(deepgram) => deepgram.language_check(audio, voices),
-        }
+        forward!(self, engine => engine.language_check(audio, voices))
     }
 }

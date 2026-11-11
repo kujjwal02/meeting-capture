@@ -430,9 +430,11 @@ flowchart LR
   window's stems to `stt` only when its captions are empty, sparse, in another language, or the
   call fails a language check on its audio or an LLM reads its captions as garbled. The
   [roadmap](03-roadmap.md#when-a-meeting-uses-deepgram) has the rules.
-- `stt` has one `SpeechToText` trait and a closed provider type. Deepgram is the only provider
-  today; local models come later behind the same trait. Audio goes out as Ogg Opus with long
-  silences cut, one request at a time. The pipeline places the utterances on the call timeline
+- `stt` has one `SpeechToText` trait and a closed provider type. Deepgram is the default provider;
+  Wispr Flow is an optional second provider behind the `wispr` cargo feature, off in released
+  builds, and local models come later behind the same trait. Each provider picks its own upload
+  encoding: Deepgram takes Ogg Opus, Wispr takes WAV. Audio goes out with long silences cut, one
+  request at a time. The pipeline places the utterances on the call timeline
   and puts them in place of the caption lines of the windows sent. Remote speakers take caption
   names by time overlap.
 - A call with caption lines gets its note from the captions at once, marked pending, and the
@@ -525,7 +527,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 | call-folder | 3 | The per-process lock on a call folder and the walk over `calls/`, shared by every capture process and repair. The media a person opens in a folder, the purge record, and the `meetingcapture://` media links the note writer builds and the app opens | std file locks, `serde` |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV placed by host time, fsynced every 4.5 s, and `audio.json` | `rubato` |
 | call-finalize | 3c | Place a call's video parts and stems on one timeline, mix the stems, write `call.mp4`. Purge call video after 90 days. The planning, mixing and purge are portable | Mac: AVFoundation via `cidre` |
-| stt | 4 | Transcribe a call's stems through one `SpeechToText` trait. Deepgram today, local models later | `reqwest` |
+| stt | 4 | Transcribe a call's stems through one `SpeechToText` trait. Deepgram, optional Wispr Flow behind the `wispr` feature, local models later | `reqwest`; `h2`, `tokio`, `native-tls`, `uuid` under `wispr` |
 | video-capture | 3c | Record one window through ScreenCaptureKit, encode it with VideoToolbox, cut 2 s HLS fragments with AVAssetWriter, write `video.json`, repair dead segments. The writer and repair are portable | Mac: `cidre` |
 | telemetry | 3d | One subscriber for every binary: OpenTelemetry-shaped JSON lines into daily log files, trace ids derived from `call.id` and `meeting.id`, the flight recorder and its dumps, the panic hook. Portable. [Telemetry](10-telemetry.md) | `tracing-subscriber`, `sha2` |
 | browser-shortcut | 3c | Press mc-meet's shortcut into one Chrome process: parse Chrome's shortcut text, find the key on the current keyboard layout, read the Accessibility grant, post the key events. Builds everywhere; only the Mac presses | Mac: `objc2-core-graphics`, `objc2-app-kit`, `objc2-application-services`, `dispatch2`, Carbon's `UCKeyTranslate` |
@@ -542,8 +544,8 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 - Transcript text and model output are data. The note escapes both, so neither can add Markdown
   structure, wikilinks or section markers.
 - Secrets live in `settings.toml`: Google refresh tokens, the OAuth client secret, the LLM and
-  transcription API keys.
-  The file is owner-only and stays out of the vault and git.
+  transcription API keys. The Wispr Flow provider stores no key; it borrows the desktop app's
+  session token at request time. The file is owner-only and stays out of the vault and git.
 - Stored times are UTC.
 - Every binary logs through `telemetry::init`, never its own subscriber. A field takes its
   OpenTelemetry semantic convention name where one exists, such as `file.path`. Otherwise it takes

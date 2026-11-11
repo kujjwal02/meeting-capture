@@ -245,6 +245,10 @@ impl SpeechToText for Deepgram {
         format!("deepgram/{}", self.model)
     }
 
+    fn encode(&self, samples: &[i16]) -> Result<EncodedAudio, SttError> {
+        crate::ogg_opus::encode(samples)
+    }
+
     fn request_key(&self, voices: StemVoices) -> String {
         key_of(&self.transcribe_query(&self.language, voices))
     }

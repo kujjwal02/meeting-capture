@@ -53,6 +53,12 @@ select {
   margin: 4px 0;
 }
 
+.warning {
+  color: #b3261e;
+  font-size: 12px;
+  margin: 4px 0;
+}
+
 #accounts {
   list-style: none;
   padding: 0;
