@@ -114,29 +114,27 @@ globalThis.mcMeetCreateDomCaptions = ({ emit, selfName }) => {
 // Keeps Meet's caption box off screen, whichever reader is the source: Meet renders the box when
 // it sends captions to its own channel, and the channel reader then reads them with no DOM reader.
 // Meet keeps writing captions into a hidden region, so the DOM reader works with the box gone.
+//
+// Meet measures the caption panel once, when captions turn on, and shrinks the video area by that
+// height for as long as they stay on. A panel hidden later leaves an empty band of about 216 px.
+// So a stylesheet hides the panel from its first frame, and Meet measures 0. The stylesheet goes
+// in at document_start, before Meet can turn captions on. A change of the setting mid-call takes
+// effect on the video area at the next captions on.
 globalThis.mcMeetCreateCaptionBoxHider = () => {
-  // The app's [meet] hide_captions. The worker stores it; on until the app says otherwise.
-  let isHiding = true;
-  let hiddenRegion = null;
+  const HIDING_ATTRIBUTE = "data-mc-meet-hide-captions";
+  const style = document.createElement("style");
+  style.textContent =
+    `html[${HIDING_ATTRIBUTE}] ${globalThis.mcMeetSelectors.captionPanel} ` +
+    "{ display: none !important; }";
+  document.documentElement.append(style);
 
-  // Meet creates the region at its first caption and can replace it, so the check loop calls this.
-  function apply() {
-    const region = isHiding
-      ? document.querySelector(globalThis.mcMeetSelectors.captionRegion)
-      : null;
-    if (region === hiddenRegion) return;
-    if (hiddenRegion) hiddenRegion.style.display = "";
-    if (region) region.style.display = "none";
-    hiddenRegion = region;
+  function setHiding(isOn) {
+    document.documentElement.toggleAttribute(HIDING_ATTRIBUTE, isOn);
   }
 
-  return {
-    apply,
-    setHiding(isOn) {
-      isHiding = isOn;
-      apply();
-    },
-  };
+  // The app's [meet] hide_captions. The worker stores it; on until the app says otherwise.
+  setHiding(true);
+  return { setHiding };
 };
 
 // Reads participants from the People panel when it is open, else from the video tiles.
@@ -244,7 +242,7 @@ const MC_MEET_REGION_DEPTH = 5;
 const MC_MEET_REGION_NODES = 60;
 
 // Whether Meet's caption box takes up space on screen. Meet's captions button can read on with
-// no box, and mc-meet's hide_captions sets the box to display none.
+// no box, and mc-meet's hide_captions hides the caption panel.
 globalThis.mcMeetIsCaptionBoxShown = () => {
   const region = document.querySelector(globalThis.mcMeetSelectors.captionRegion);
   if (!region) return false;

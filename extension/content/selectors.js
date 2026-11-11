@@ -31,6 +31,10 @@ globalThis.mcMeetSelectors = Object.freeze({
   icon: "i.google-symbols, i.material-icons-extended, i.material-symbols-outlined, i[aria-hidden='true']",
   // The caption region. Its children are speaker blocks: a name node, then a text node.
   captionRegion: 'div[role="region"][tabindex="0"], div[role="region"][aria-label="Captions"]',
+  // The caption panel: the region's great-grandparent, which also holds the language picker and
+  // the caption settings bar. Meet sizes the video area by this element's height.
+  captionPanel:
+    'div:has(> div > div > div[role="region"]:is([tabindex="0"], [aria-label="Captions"]))',
   // People panel rows, when the user has the panel open.
   peopleRow: '[role="list"] [role="listitem"][aria-label]',
   // Video tiles. data-self-name is set on the local user's tile.
