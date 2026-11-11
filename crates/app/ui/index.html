@@ -81,6 +81,34 @@
       </section>
 
       <section>
+        <h2>Transcription fallback</h2>
+        <p class="hint">
+          Captions are the main source. When they are missing, in Hindi or garbled, the call's audio
+          goes to the provider for those parts of the call. Without a provider, notes use captions
+          only.
+        </p>
+        <label>
+          Provider
+          <select id="transcription-provider">
+            <option value="">None</option>
+            <option value="deepgram">Deepgram</option>
+          </select>
+        </label>
+        <label data-transcription-for="deepgram">
+          API key
+          <input type="password" id="transcription-api-key" autocomplete="off">
+        </label>
+        <label data-transcription-for="deepgram">
+          Model
+          <input type="text" id="transcription-model" autocomplete="off" spellcheck="false">
+        </label>
+        <label data-transcription-for="deepgram">
+          Language
+          <input type="text" id="transcription-language" autocomplete="off" spellcheck="false">
+        </label>
+      </section>
+
+      <section>
         <h2>Google Meet</h2>
         <label class="checkbox">
           <input type="checkbox" id="meet-hide-captions">

@@ -44,6 +44,7 @@ function renderAccounts(accounts) {
 }
 
 let llm = null;
+let transcription = null;
 let savedClient = null;
 
 // The stored secret belongs to the saved client ID; saving another drops it.
@@ -74,6 +75,27 @@ function showProviderFields() {
     : provider === "openai-compatible"
       ? "Leave blank for a local server"
       : "";
+}
+
+// Shows the fields the chosen transcription provider takes, with its defaults and key state.
+function showTranscriptionFields() {
+  const provider = field("transcription-provider").value;
+  for (const element of document.querySelectorAll("[data-transcription-for]")) {
+    element.hidden = !element.dataset.transcriptionFor.split(" ").includes(provider);
+  }
+  const defaults = {
+    deepgram: {
+      model: transcription?.deepgram_default_model,
+      language: transcription?.deepgram_default_language,
+    },
+  };
+  field("transcription-model").placeholder = defaults[provider]?.model ?? "";
+  field("transcription-language").placeholder = defaults[provider]?.language ?? "";
+  // The stored key belongs to the saved provider; saving another drops it.
+  const hasKey =
+    transcription?.has_api_key &&
+    (transcription?.provider === provider || transcription?.provider === null);
+  field("transcription-api-key").placeholder = hasKey ? "Saved in the settings file" : "Required";
 }
 
 async function checkClaudeCode() {
@@ -114,6 +136,12 @@ async function load() {
     field("llm-base-url").value = llm.base_url ?? "";
     field("llm-api-key").value = "";
     showProviderFields();
+    transcription = settings.transcription;
+    field("transcription-provider").value = transcription.provider ?? "";
+    field("transcription-model").value = transcription.model ?? "";
+    field("transcription-language").value = transcription.language ?? "";
+    field("transcription-api-key").value = "";
+    showTranscriptionFields();
     field("slack-read-captions").checked = settings.slack.read_captions;
     field("slack-auto-start-captions").checked = settings.slack.auto_start_captions;
     showSlackFields();
@@ -136,6 +164,10 @@ async function save(event) {
     llm_model: field("llm-model").value,
     llm_base_url: field("llm-base-url").value,
     llm_api_key: field("llm-api-key").value,
+    transcription_provider: field("transcription-provider").value || null,
+    transcription_model: field("transcription-model").value,
+    transcription_language: field("transcription-language").value,
+    transcription_api_key: field("transcription-api-key").value,
     slack_read_captions: field("slack-read-captions").checked,
     slack_auto_start_captions: field("slack-auto-start-captions").checked,
     meet_hide_captions: field("meet-hide-captions").checked,
@@ -198,6 +230,7 @@ field("llm-provider").addEventListener("change", () => {
   showProviderFields();
 });
 field("llm-base-url").addEventListener("input", showProviderFields);
+field("transcription-provider").addEventListener("change", showTranscriptionFields);
 field("client-id").addEventListener("input", showClientSecretState);
 field("check-claude-code").addEventListener("click", checkClaudeCode);
 field("slack-read-captions").addEventListener("change", showSlackFields);
