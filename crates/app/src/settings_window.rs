@@ -1,6 +1,6 @@
 //! The settings window: plain HTML in `ui/`, calling the commands here. It edits the settings
-//! file through `SettingsStore`. Google account, LLM, Slack and Meet changes apply at once; the
-//! rest after a restart.
+//! file through `SettingsStore`. Google account, LLM, transcription, Slack and Meet changes apply
+//! at once; the rest after a restart.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -44,6 +44,7 @@ pub(crate) struct SettingsView {
     has_client_secret: bool,
     accounts: Vec<AccountView>,
     llm: LlmView,
+    transcription: TranscriptionView,
     slack: SlackSettings,
     meet: MeetSettings,
     settings_file: PathBuf,
@@ -58,6 +59,17 @@ pub(crate) struct LlmView {
     has_api_key: bool,
     anthropic_default_model: Option<&'static str>,
     claude_code_default_model: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct TranscriptionView {
+    provider: Option<stt::ProviderKind>,
+    model: Option<String>,
+    language: Option<String>,
+    /// The view never carries a secret, only whether one is stored.
+    has_api_key: bool,
+    deepgram_default_model: &'static str,
+    deepgram_default_language: &'static str,
 }
 
 #[derive(Serialize)]
@@ -79,6 +91,11 @@ pub(crate) struct SettingsForm {
     llm_base_url: String,
     /// For `llm_provider`. Blank keeps the stored key while the provider and base URL stay.
     llm_api_key: String,
+    transcription_provider: Option<stt::ProviderKind>,
+    transcription_model: String,
+    transcription_language: String,
+    /// Blank keeps the stored key while the provider stays.
+    transcription_api_key: String,
     slack_read_captions: bool,
     slack_auto_start_captions: bool,
     meet_hide_captions: bool,
@@ -127,9 +144,26 @@ impl SettingsForm {
         {
             file.llm.api_key = Some(api_key);
         }
+        self.apply_transcription_to(file);
         file.slack.read_captions = self.slack_read_captions;
         file.slack.auto_start_captions = self.slack_auto_start_captions;
         file.meet.hide_captions = self.meet_hide_captions;
+    }
+
+    fn apply_transcription_to(&self, file: &mut SettingsFile) {
+        let transcription = &mut file.transcription;
+        // A key belongs to one provider. Turning the fallback off keeps it for turning it on.
+        if let (Some(old), Some(new)) = (transcription.provider, self.transcription_provider)
+            && old != new
+        {
+            transcription.api_key = None;
+        }
+        transcription.provider = self.transcription_provider;
+        transcription.model = non_blank(&self.transcription_model);
+        transcription.language = non_blank(&self.transcription_language);
+        if let Some(api_key) = non_blank(&self.transcription_api_key) {
+            transcription.api_key = Some(api_key);
+        }
     }
 }
 
@@ -148,6 +182,14 @@ pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, 
         anthropic_default_model: ProviderKind::Anthropic.default_model(),
         claude_code_default_model: ProviderKind::ClaudeCode.default_model(),
     };
+    let transcription = TranscriptionView {
+        provider: file.transcription.provider,
+        model: file.transcription.model.clone(),
+        language: file.transcription.language.clone(),
+        has_api_key: file.transcription.api_key.is_some(),
+        deepgram_default_model: stt::ProviderKind::Deepgram.default_model(),
+        deepgram_default_language: stt::ProviderKind::Deepgram.default_language(),
+    };
     let accounts = account_statuses(&state, &file)
         .into_iter()
         .map(|account| AccountView {
@@ -163,6 +205,7 @@ pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, 
         client_id: file.google.client_id().map(str::to_owned),
         accounts,
         llm,
+        transcription,
         slack: file.slack,
         meet: file.meet,
         settings_file: state.settings.app_dirs().settings_file(),
