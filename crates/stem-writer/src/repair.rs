@@ -59,6 +59,19 @@ pub fn repair_folder(folder: &Path) -> Result<FolderRepair, StemWriterError> {
     repair_locked(folder)
 }
 
+/// Repairs one call folder whose lock the caller already holds, such as a step that waited for
+/// the writer to let go. `_lock` must be the folder's `LOCK_FILE_NAME` lock.
+///
+/// # Errors
+///
+/// As `repair_folder`.
+pub fn repair_under_lock(
+    folder: &Path,
+    _lock: &FolderLock,
+) -> Result<FolderRepair, StemWriterError> {
+    repair_locked(folder)
+}
+
 /// Repairs the folder. The caller holds its lock.
 pub(crate) fn repair_locked(folder: &Path) -> Result<FolderRepair, StemWriterError> {
     let mut manifest = AudioManifest::load_or_new(folder)?;

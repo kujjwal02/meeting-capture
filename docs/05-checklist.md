@@ -440,17 +440,35 @@ Done when:
 - [ ] One debug report from a bad call names the failing layer, with no second call.
 - [ ] Under 1% CPU and 20 MB of memory per process with debug mode off, on a 30-minute call.
 
-## Phase 4: local speech-to-text
+## Phase 4: speech-to-text fallback
 
-- [ ] `stt`: VAD, Parakeet TDT 0.6B v3, diarization of the remote stem.
-- [ ] Caption names merged onto diarized speakers.
-- [ ] `sources` picks the best transcript per meeting.
-- [ ] Measure Parakeet int8 speed on the M2 CPU.
+- [x] `stt` crate: `SpeechToText` trait, closed provider type, Deepgram provider.
+- [x] `[transcription]` settings: provider, API key, model, language; model and language shape
+  checked at load.
+- [x] Free caption checks: empty, too few, failed, sparse per window, other script or language.
+- [x] Language check on 2 loud 30 s clips per stem; non-English share of 20% flags the call.
+- [x] LLM garbled check, cached by prompt and sample.
+- [x] 5-minute windows; only the windows the checks send go to Deepgram.
+- [x] Ogg Opus at 24 kbps with silences over 1 s cut; one request at a time; timeout from size.
+- [x] Retries in the run, then a network wait the sweep retries on a schedule.
+- [x] A refused key or a local audio error keeps the captions and says so in the frontmatter.
+- [x] Captions-first: a pending note from the captions, rewritten once the windows are back.
+- [x] Remote speakers named from the captions by time overlap; mic echo dropped word by word.
+- [ ] Remove remote echo from the mic stem before the silence trim. On speakers the trim keeps 94
+  to 97% of the mic, so a call with no captions bills about 1.7 times its length.
+- [x] Deepgram replies, offset maps and the coherence verdict saved under the call folder's `stt/`.
+- [x] Saved replies that no longer match the stems send the meeting back to its first step.
+- [x] `mc transcribe <id>` sends every window.
+- [x] The note says which source its transcript came from and how many minutes Deepgram wrote.
+- [ ] Local models (Desert Ant Voz and Who) as a second provider.
 
 Done when:
 
-- [ ] A 1 h call transcribes in under 10 min on the M2.
-- [ ] Names match captions on 3 Meet calls.
+- [x] A Meet call with captions off gets a Deepgram transcript: my lines named, others numbered.
+- [x] A Hinglish call gets a Deepgram transcript.
+- [x] A call with good English captions makes no Deepgram request beyond the language check.
+- [x] A rerun of a Deepgram meeting makes no Deepgram request.
+- [x] A killed upload resumes on the next run without sending finished windows again.
 
 ## Phase 5: Windows capture
 

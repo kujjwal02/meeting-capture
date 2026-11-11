@@ -12,7 +12,7 @@ pub use app_dirs::AppDirs;
 pub use edit::{SettingsChange, SettingsStore};
 pub use file::{
     DebugSettings, Effort, GoogleSettings, LlmSettings, MeetSettings, ProviderKind, SettingsFile,
-    SlackSettings,
+    SlackSettings, TranscriptionSettings,
 };
 pub use validate::Settings;
 
@@ -76,6 +76,19 @@ pub enum SettingsError {
     LlmGlossary { max: usize },
     #[error("settings field llm.claude_path: {path} is not a file{hint}")]
     ClaudePath { path: PathBuf, hint: &'static str },
+    #[error("settings field transcription.{field}: required for provider {provider}")]
+    TranscriptionFieldMissing {
+        field: &'static str,
+        provider: &'static str,
+    },
+    #[error("settings field transcription.{field}: must not be blank")]
+    BlankTranscriptionField { field: &'static str },
+    #[error("settings field transcription.{field}: {value:?} is not {expected}")]
+    TranscriptionFieldShape {
+        field: &'static str,
+        value: String,
+        expected: &'static str,
+    },
     #[error(
         "settings field debug.enabled_until: {value:?} is not an RFC 3339 time such as \"2026-11-01T04:10:00Z\"; remove it to turn debug mode off"
     )]

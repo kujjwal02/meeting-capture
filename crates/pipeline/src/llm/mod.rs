@@ -9,6 +9,7 @@ use jobs::ErrorPersistence;
 
 use crate::extraction::{CheckedNotes, Prompt, Reply, Turn, Verdict};
 use crate::settings::{AppDirs, LlmSettings, ProviderKind};
+use crate::transcribe::coherence::{self, CaptionJudgement};
 
 /// Why an extraction produced no notes. Each message names the provider and model.
 #[derive(Debug, thiserror::Error)]
@@ -100,19 +101,19 @@ impl Provider {
             .unwrap_or_default();
         let backend = match kind {
             ProviderKind::Anthropic => Backend::Api(Box::new(api::ApiClient::new(
-                api::Endpoint::Anthropic,
-                model,
-                llm.api_key.clone(),
+                &api::Endpoint::Anthropic,
+                &model,
+                llm.api_key.as_deref(),
             )?)),
             ProviderKind::OpenaiCompatible => Backend::Api(Box::new(api::ApiClient::new(
-                api::Endpoint::OpenaiCompatible {
+                &api::Endpoint::OpenaiCompatible {
                     base_url: llm
                         .base_url()
                         .map(str::to_owned)
                         .expect("settings validation requires llm.base_url for openai-compatible"),
                 },
-                model,
-                llm.api_key.clone(),
+                &model,
+                llm.api_key.as_deref(),
             )?)),
             ProviderKind::ClaudeCode => {
                 Backend::ClaudeCode(claude_code::ClaudeCode::new(llm, model, app_dirs)?)
@@ -139,6 +140,35 @@ impl Provider {
         match &self.backend {
             Backend::Api(client) => self.converse(client.start(&self.label), prompt),
             Backend::ClaudeCode(cli) => self.converse(cli.start(&self.label)?, prompt),
+        }
+    }
+
+    /// Asks the model whether a sample of caption lines reads as sensible English. One turn, no
+    /// repair: a reply that does not fit is an error, and the captions stay.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ExtractionError` naming the provider when no fitting reply came.
+    pub(crate) fn judge_captions(
+        &self,
+        message: &str,
+    ) -> Result<CaptionJudgement, ExtractionError> {
+        let _span =
+            tracing::info_span!("llm.judge_captions", gen_ai.request.model = %self.label).entered();
+        match &self.backend {
+            Backend::Api(client) => client.judge_captions(&self.label, message),
+            Backend::ClaudeCode(cli) => {
+                let reply = cli.ask(
+                    &self.label,
+                    coherence::SYSTEM_PROMPT,
+                    &coherence::judgement_schema().to_string(),
+                    message,
+                )?;
+                serde_json::from_value(reply).map_err(|error| ExtractionError::Transport {
+                    provider: self.label.clone(),
+                    detail: format!("the reply does not fit: {error}"),
+                })
+            }
         }
     }
 

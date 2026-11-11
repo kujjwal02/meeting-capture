@@ -182,6 +182,57 @@ impl Effort {
     }
 }
 
+/// The speech-to-text service that transcribes the parts of a call its captions got wrong. A
+/// save from the settings window applies to the next run; a hand edit of the file applies after
+/// the app restarts.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TranscriptionSettings {
+    /// No provider: captions only, no fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<stt::ProviderKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// The provider's default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The provider's default when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+}
+
+impl std::fmt::Debug for TranscriptionSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TranscriptionSettings")
+            .field("provider", &self.provider)
+            .field("api_key", &secret_marker(self.api_key.as_ref()))
+            .field("model", &self.model)
+            .field("language", &self.language)
+            .finish()
+    }
+}
+
+impl TranscriptionSettings {
+    /// The model the provider is asked for, or `None` when no provider is set.
+    #[must_use]
+    pub fn model(&self) -> Option<&str> {
+        let provider = self.provider?;
+        Some(self.model.as_deref().unwrap_or(provider.default_model()))
+    }
+
+    /// The language the provider is asked for, or `None` when no provider is set.
+    #[must_use]
+    pub fn language(&self) -> Option<&str> {
+        let provider = self.provider?;
+        Some(
+            self.language
+                .as_deref()
+                .unwrap_or(provider.default_language()),
+        )
+    }
+}
+
 /// The client ID changes only through `set_client_id`, which drops the secret and the grants of
 /// the old client.
 #[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -237,6 +288,8 @@ pub struct SettingsFile {
     pub google: GoogleSettings,
     #[serde(default)]
     pub llm: LlmSettings,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub transcription: TranscriptionSettings,
     #[serde(default)]
     pub slack: SlackSettings,
     #[serde(default)]
@@ -263,6 +316,10 @@ const SETTINGS_HEADER: &str = "\
 # [llm] effort: low, medium or high, claude-code only.
 # [llm] glossary: names and terms the captions often mishear.
 # [llm] claude_path: the claude binary, when it is not in a standard install folder.
+# [transcription] provider: deepgram. Absent: captions only. When a call's captions are empty,
+#   failed, in another language or garbled, the provider transcribes the call's audio.
+# [transcription] api_key: the key for the provider.
+# [transcription] model, language: default nova-3 and multi (deepgram).
 # [slack] read_captions: read Slack huddle captions from the Slack desktop app (macOS).
 # [slack] auto_start_captions: press the huddle's Captions tab when its caption panel is hidden.
 # [slack] min_huddle_seconds: a shorter huddle writes no note. Default 120.
@@ -333,6 +390,10 @@ impl SettingsFile {
             .map_err(|error| write_error(error.error))?;
         Ok(())
     }
+}
+
+fn is_default(transcription: &TranscriptionSettings) -> bool {
+    *transcription == TranscriptionSettings::default()
 }
 
 impl SettingsFile {

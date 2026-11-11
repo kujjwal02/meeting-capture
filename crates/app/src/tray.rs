@@ -712,7 +712,22 @@ fn meeting_submenu(
             submenu.append(&label_entry(app, &last_error)?)?;
             false
         }
+        // Retry is offered, so the user can try now on a better network.
+        JobState::NetworkWait { retry } => {
+            let label = format!("Waiting for the network, {}", retry.describe(time_zone));
+            submenu.append(&label_entry(app, &label)?)?;
+            let last_error = shorten(retry.last_error(), MAX_FAILURE_CHARS);
+            submenu.append(&label_entry(app, &last_error)?)?;
+            true
+        }
+        // Retry is offered, so the user can resume now instead of at the sweep.
+        JobState::Resuming { message } => {
+            submenu.append(&label_entry(app, "Resuming at the next sweep")?)?;
+            submenu.append(&label_entry(app, &shorten(message, MAX_FAILURE_CHARS))?)?;
+            true
+        }
         JobState::Captured
+        | JobState::Transcribed
         | JobState::Matched
         | JobState::Extracted
         | JobState::Written { .. }

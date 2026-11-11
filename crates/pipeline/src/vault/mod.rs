@@ -4,7 +4,7 @@
 //! A note whose contents match a write the pipeline made, or started, is still the pipeline's
 //! own. Hashes, unlike file times, survive Syncthing and git rewriting the time.
 
-mod durable_write;
+pub(crate) mod durable_write;
 mod note_path;
 mod splice;
 
@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use jiff::Zoned;
-use jobs::{ExtractionAtWrite, LeasedRun, NoteOwnership};
+use jobs::{ExtractionAtWrite, LeasedRun, NoteOwnership, TranscriptAtWrite};
 
 use crate::PipelineError;
 
@@ -48,6 +48,7 @@ impl Vault {
         title: &str,
         rendered: &str,
         extraction: ExtractionAtWrite<'_>,
+        transcript: TranscriptAtWrite,
     ) -> Result<PathBuf, PipelineError> {
         let ownership = &run.meeting().note;
         let note_path = match ownership.path() {
@@ -67,7 +68,7 @@ impl Vault {
             run.confirm_current_input()?;
             check_note_unchanged(&note_path, ownership, edited_sha256.as_deref())
         })?;
-        run.mark_written(&note_sha256, &section_sha256s, extraction)?;
+        run.mark_written(&note_sha256, &section_sha256s, extraction, transcript)?;
         Ok(note_path)
     }
 

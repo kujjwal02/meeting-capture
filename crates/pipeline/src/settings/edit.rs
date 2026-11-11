@@ -3,11 +3,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError, RwLock};
 
 use super::{
     AppDirs, LlmSettings, MeetSettings, Settings, SettingsError, SettingsFile, SlackSettings,
+    TranscriptionSettings,
 };
 use crate::calendar::GoogleAccounts;
 
-/// The settings file and the sections that apply while the app runs: LLM, Google, Slack and
-/// Meet.
+/// The settings file and the sections that apply while the app runs: LLM, transcription, Google,
+/// Slack and Meet.
 /// Every edit of the file goes through `edit`, which also hands the new sections to their
 /// readers.
 pub struct SettingsStore {
@@ -17,6 +18,7 @@ pub struct SettingsStore {
     /// last write. It guards this process only; `mc` never writes the file.
     file_lock: Mutex<()>,
     llm: RwLock<LlmSettings>,
+    transcription: RwLock<TranscriptionSettings>,
     slack: RwLock<SlackSettings>,
     meet: RwLock<MeetSettings>,
     google: GoogleAccounts,
@@ -43,6 +45,7 @@ impl SettingsStore {
             app_dirs,
             file_lock: Mutex::new(()),
             llm: RwLock::new(LlmSettings::default()),
+            transcription: RwLock::new(TranscriptionSettings::default()),
             slack: RwLock::new(SlackSettings::default()),
             meet: RwLock::new(MeetSettings::default()),
             google: GoogleAccounts::default(),
@@ -106,6 +109,15 @@ impl SettingsStore {
             .clone()
     }
 
+    /// The speech-to-text settings the next transcribe step uses.
+    #[must_use]
+    pub fn transcription(&self) -> TranscriptionSettings {
+        self.transcription
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// The huddle watcher reads these before each step, so a change applies to the next huddle.
     #[must_use]
     pub fn slack(&self) -> SlackSettings {
@@ -126,6 +138,20 @@ impl SettingsStore {
 
     fn take_live_sections(&self, file: &SettingsFile) {
         *self.llm.write().unwrap_or_else(PoisonError::into_inner) = file.llm.clone();
+        // A `[debug]`-only edit validates that table alone, so it can carry a hand edit of
+        // `[transcription]` that never passed validation.
+        match file.transcription.validate() {
+            Ok(()) => {
+                *self
+                    .transcription
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner) = file.transcription.clone();
+            }
+            Err(error) => tracing::warn!(
+                exception.message = %error,
+                "transcription settings invalid; the previous ones stay in use"
+            ),
+        }
         *self.slack.write().unwrap_or_else(PoisonError::into_inner) = file.slack;
         *self.meet.write().unwrap_or_else(PoisonError::into_inner) = file.meet;
         self.google.replace(&file.google);

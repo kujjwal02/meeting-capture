@@ -46,7 +46,7 @@ their state. You can open a note or retry a failed meeting from there.
 | Transcript text for extraction | Sent to the LLM provider you choose. With no provider, notes hold the transcript only. |
 | Calendar events | Read from Google Calendar with a read-only scope, through your own OAuth client. |
 | Settings, API keys, OAuth tokens | Stored in plain text in `settings.toml` in the app's config folder. |
-| Audio | v0.1.0 records no audio. |
+| Call audio | Stays on your Mac. With a `[transcription]` provider set, the parts of a call whose captions failed the checks, and two 30 s clips per side for the language check, go to that provider as Opus, with Deepgram's model-improvement program opted out. |
 
 The app sends no telemetry. Logs are written locally to `logs/` in the app data folder, one file
 per program per day, kept 14 days.
@@ -101,6 +101,7 @@ after a change.
 | `mc ingest <file>` | Adds a saved input: a browser call log, a Slack huddle log or a TranscripTonic body (`--kind`). |
 | `mc retry <id>` | Resumes a failed meeting. |
 | `mc reprocess <id>` | Reruns every step. It keeps a note you edited; `--discard-edits` overwrites it. |
+| `mc transcribe <id>` | Transcribes the call audio with the speech-to-text provider, even when the captions pass, and reruns the later steps. `--discard-edits` overwrites an edited note. |
 | `mc debug timeline <report>` | Prints a saved debug report on one IST clock. `--by-minute` sums each minute. |
 | `mc debug export-otlp <report> --out <file>` | Writes the report as OTLP/JSON lines for an OpenTelemetry Collector. |
 | `mc debug replay <report>` | Runs the app's call detectors over a saved debug report and names the failing layer. |

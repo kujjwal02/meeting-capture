@@ -242,6 +242,63 @@ pub fn summarize(lines: &[LogLine]) -> LogSummary {
     }
 }
 
+/// The time Meet refused captions, and the caption events that still arrived in it. Meet can
+/// report captions unavailable while its data channels keep sending them, so the refusal alone
+/// does not mean the captions failed.
+#[derive(Debug, Clone, Copy)]
+pub struct CaptionRefusal {
+    pub refused_for: SignedDuration,
+    pub caption_event_count: usize,
+}
+
+/// Adds up each stretch from a health report with `captions_unavailable` to the next one
+/// without it, or to the call's last event.
+#[must_use]
+pub fn caption_refusal(lines: &[LogLine]) -> CaptionRefusal {
+    let mut refused_for = SignedDuration::ZERO;
+    let mut caption_event_count = 0;
+    let mut refused_since: Option<Timestamp> = None;
+    let mut last_at: Option<Timestamp> = None;
+    for line in lines {
+        let Some(at) = line.event.at() else {
+            continue;
+        };
+        last_at = Some(last_at.map_or(at, |last_at| last_at.max(at)));
+        match &line.event {
+            CallEvent::Health {
+                captions_unavailable,
+                ..
+            } => match (refused_since, *captions_unavailable) {
+                (None, true) => refused_since = Some(at),
+                (Some(since), false) => {
+                    refused_for += at.duration_since(since).max(SignedDuration::ZERO);
+                    refused_since = None;
+                }
+                (None, false) | (Some(_), true) => {}
+            },
+            CallEvent::Caption { .. } => {
+                if refused_since.is_some() {
+                    caption_event_count += 1;
+                }
+            }
+            CallEvent::CallStarted { .. }
+            | CallEvent::Chat { .. }
+            | CallEvent::Roster { .. }
+            | CallEvent::RecordingStopped { .. }
+            | CallEvent::RecordingResumed { .. }
+            | CallEvent::CallEnded { .. }
+            | CallEvent::Unknown => {}
+        }
+    }
+    if let (Some(since), Some(last_at)) = (refused_since, last_at) {
+        refused_for += last_at.duration_since(since).max(SignedDuration::ZERO);
+    }
+    CaptionRefusal {
+        refused_for,
+        caption_event_count,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CallPlatform {

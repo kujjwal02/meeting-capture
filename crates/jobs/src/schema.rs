@@ -48,6 +48,10 @@ const MIGRATIONS: &[&str] = &[
     UPDATE meetings SET failure_kind =
         CASE WHEN failure = extraction_error THEN 'extraction' ELSE 'step' END
         WHERE failure IS NOT NULL;",
+    // No change of columns. `finished_step` may hold "transcribed" and `failure_kind`
+    // "network-wait" or "resume", which a build from before this step cannot read; the version bump makes
+    // such a build refuse the database at open instead of failing on those rows.
+    "-- 5: transcribe step and network wait",
 ];
 
 /// Runs the steps the database has not run yet, in one transaction with the version bump.

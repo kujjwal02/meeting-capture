@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use jiff::Timestamp;
 use rusqlite::{OptionalExtension, ToSql, params};
 
+use crate::retry_schedule;
 use crate::state::FailureKind;
 use crate::{JobStore, Meeting, MeetingId, StoreError};
 
@@ -21,7 +22,9 @@ const LEASE_EXPIRY: Duration = Duration::from_mins(2);
 #[expect(clippy::cast_possible_truncation, reason = "two minutes fits in i64")]
 const LEASE_EXPIRY_MS: i64 = LEASE_EXPIRY.as_millis() as i64;
 
-// Longer than any step should take, LLM call included.
+// Longer than any step should take, LLM call included. Renewal of the lease stops this long after
+// it was taken, so a step that can run long, such as an upload, checks
+// `LeasedRun::renewal_ends_at`.
 const MAX_RUN_TIME: Duration = Duration::from_mins(15);
 
 /// How a call to `JobStore::run` ended.
@@ -38,6 +41,37 @@ pub enum RunOutcome {
 pub trait StepError: From<StoreError> + fmt::Display {
     /// The error for steps that panicked with `message`. It is recorded as the failure.
     fn panicked(message: String) -> Self;
+
+    /// How the meeting runs again after this error.
+    fn retry(&self) -> StepRetry {
+        StepRetry::Manual
+    }
+}
+
+/// How a meeting runs again after a step failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepRetry {
+    /// The meeting fails, and the tray offers a retry.
+    Manual,
+    /// The step could not reach a service. The meeting waits for the network, and the sweep
+    /// runs it on a schedule.
+    AfterNetworkWait {
+        /// The try saved some of its work, so the schedule starts again at its shortest delay.
+        has_progressed: bool,
+        fault: NetworkFault,
+    },
+    /// The step saved some of its work and stopped before the run's lease ran out. The next
+    /// sweep resumes it, with no delay: nothing failed.
+    Resume,
+}
+
+/// Which side of the link failed a step that waits for the network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkFault {
+    /// No answer came: offline, a failed lookup, a dropped connection or a timeout.
+    Link,
+    /// The service answered with an error of its own, such as HTTP 5xx or a rate limit.
+    Service,
 }
 
 /// One attempt at a meeting's steps under its lease, on the input the attempt started from.
@@ -57,6 +91,13 @@ impl LeasedRun<'_> {
     #[must_use]
     pub fn meeting(&self) -> &Meeting {
         &self.meeting
+    }
+
+    /// When the lease stops being renewed. It counts from when the lease was taken, so steps
+    /// before this one, and an earlier attempt on a superseded input, have used part of it.
+    #[must_use]
+    pub fn renewal_ends_at(&self) -> Instant {
+        self.lease.renew_until
     }
 
     /// Checks that this attempt still holds the lease and that no new capture superseded its
@@ -95,6 +136,10 @@ impl LeasedRun<'_> {
         }
     }
 
+    pub(crate) fn superseded(&self) -> StoreError {
+        self.record_stop(LeaseStop::Superseded)
+    }
+
     fn record_stop(&self, stop: LeaseStop) -> StoreError {
         self.stop.set(Some(stop));
         stop.error(self.lease.id)
@@ -107,11 +152,42 @@ impl LeasedRun<'_> {
 
     // Records a failed run and gives the lease back, in one step, so a capture that arrives in
     // between is never left without a run.
-    fn fail(&self, failure: &str) -> Result<LeaseRelease, StoreError> {
-        self.release_leased(
-            "failure = ?6, failure_kind = ?7",
-            &[&failure, &FailureKind::Step.as_str()],
-        )
+    fn fail(&self, failure: &str, retry: StepRetry) -> Result<LeaseRelease, StoreError> {
+        match retry {
+            StepRetry::Manual => self.release_leased(
+                "failure = ?6, failure_kind = ?7",
+                &[&failure, &FailureKind::Step.as_str()],
+            ),
+            StepRetry::AfterNetworkWait {
+                has_progressed,
+                fault,
+            } => {
+                let next = retry_schedule::after_network_failure(
+                    &self.meeting,
+                    has_progressed,
+                    fault,
+                    failure,
+                );
+                self.release_leased(
+                    "failure = ?6, failure_kind = ?7, extraction_attempts = ?8,
+                        next_extraction_at_ms = ?9",
+                    &[
+                        &failure,
+                        &FailureKind::NetworkWait.as_str(),
+                        &next.attempts,
+                        &next.retry_at.as_millisecond(),
+                    ],
+                )
+            }
+            StepRetry::Resume => self.release_leased(
+                "failure = ?6, failure_kind = ?7, next_extraction_at_ms = ?8",
+                &[
+                    &failure,
+                    &FailureKind::Resume.as_str(),
+                    &Timestamp::now().as_millisecond(),
+                ],
+            ),
+        }
     }
 
     fn release_leased(
@@ -272,8 +348,24 @@ impl JobStore {
                         return Err(error);
                     }
                     None => {
-                        tracing::error!(exception.message = %error, "pipeline run failed");
-                        match run.fail(&error.to_string()) {
+                        match error.retry() {
+                            StepRetry::Manual => {
+                                tracing::error!(exception.message = %error, "pipeline run failed");
+                            }
+                            StepRetry::AfterNetworkWait { .. } => {
+                                tracing::warn!(
+                                    exception.message = %error,
+                                    "pipeline run waits for the network"
+                                );
+                            }
+                            StepRetry::Resume => {
+                                tracing::info!(
+                                    exception.message = %error,
+                                    "pipeline run resumes at the next sweep"
+                                );
+                            }
+                        }
+                        match run.fail(&error.to_string(), error.retry()) {
                             Ok(LeaseRelease::Released) => held.released(),
                             Ok(LeaseRelease::Superseded) => continue,
                             Err(store_error) => tracing::error!(
@@ -302,10 +394,13 @@ impl JobStore {
     // an older input overwrites a later run's output.
     fn keep_lease_alive(&self, lease: &RunLease, is_run_over: &Receiver<()>) {
         let _span = tracing::info_span!("pipeline.lease", meeting.id = %lease.id).entered();
-        let renew_until = Instant::now() + MAX_RUN_TIME;
+        let renew_until = lease.renew_until;
         while let Err(RecvTimeoutError::Timeout) = is_run_over.recv_timeout(LEASE_EXPIRY / 4) {
             if Instant::now() > renew_until {
-                tracing::error!("run is still going after 15 minutes; letting the lease expire");
+                tracing::error!(
+                    "run is still going after {} minutes; letting the lease expire",
+                    MAX_RUN_TIME.as_secs() / 60
+                );
                 return;
             }
             match self.renew_lease(lease) {
@@ -339,7 +434,11 @@ impl JobStore {
             self.get(id)?;
             return Ok(None);
         }
-        Ok(Some(RunLease { id, token }))
+        Ok(Some(RunLease {
+            id,
+            token,
+            renew_until: Instant::now() + MAX_RUN_TIME,
+        }))
     }
 
     // Returns whether `lease` still held the meeting, and so was renewed.
@@ -375,6 +474,7 @@ enum StepFailure {
 struct RunLease {
     id: MeetingId,
     token: String,
+    renew_until: Instant,
 }
 
 // Why a step update or renewal stopped the run.

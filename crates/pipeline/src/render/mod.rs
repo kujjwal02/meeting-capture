@@ -14,6 +14,7 @@ use sources::{SlackHuddle, Transcript};
 use crate::PipelineError;
 use crate::calendar::CalendarMatch;
 use crate::extraction::{CheckedCitation, CheckedNotes, CommitmentStrength};
+use crate::transcribe::{FallbackReason, SavedChoice, SpeechChoice};
 
 const BUILT_IN_TEMPLATE: &str = include_str!("note.md.j2");
 pub(crate) const UNTITLED_CALL: &str = "Untitled call";
@@ -33,6 +34,8 @@ pub(crate) struct NoteInput<'a> {
     pub time_zone: &'a TimeZone,
     /// `None` when the meeting has no call folder on this machine.
     pub recording: Option<&'a CallRecording>,
+    /// What the transcribe step settled on.
+    pub transcription: &'a SavedChoice,
 }
 
 /// A meeting's call folder and the media in it.
@@ -74,6 +77,23 @@ struct Frontmatter<'a> {
     invited: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     extraction: Option<&'a str>,
+    /// Where the transcript's lines came from: `captions`, the provider such as `deepgram`,
+    /// `mixed`, or `pending` while speech-to-text is owed. Absent when the captions passed
+    /// every check.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcription: Option<&'static str>,
+    /// The speech-to-text `<provider>/<model>`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcription_provider: Option<&'a str>,
+    /// Why lines of the captions were replaced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcription_reason: Option<&'static str>,
+    /// Minutes of the call whose lines came from speech-to-text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcription_minutes: Option<f64>,
+    /// Why the provider refused, when the captions stayed for that reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcription_error: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     slack_workspace: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -97,7 +117,7 @@ struct SlackAttendee<'a> {
 }
 
 // The frontmatter keys the app writes. On a rerun these are rewritten; any other key stays.
-pub(crate) const APP_KEYS: [&str; 18] = [
+pub(crate) const APP_KEYS: [&str; 23] = [
     "title",
     "date",
     "created",
@@ -109,6 +129,11 @@ pub(crate) const APP_KEYS: [&str; 18] = [
     "attendees",
     "invited",
     "extraction",
+    "transcription",
+    "transcription_provider",
+    "transcription_reason",
+    "transcription_minutes",
+    "transcription_error",
     "slack_workspace",
     "slack_channel",
     "slack_attendees",
@@ -232,8 +257,78 @@ pub(crate) fn note(
             segments => minijinja::value::Serde(&segments),
             notes => minijinja::value::Serde(&notes),
             chat_messages => minijinja::value::Serde(&chat_messages),
+            transcription => transcription_line(note.transcription, transcript),
+            shows_caption_fixes => has_caption_lines(note.transcription),
         })?;
     Ok(rendered)
+}
+
+/// The `transcription` frontmatter value.
+fn transcription_source(choice: &SavedChoice) -> Option<&'static str> {
+    match choice {
+        SavedChoice::Captions => None,
+        SavedChoice::CaptionsKept { .. } => Some("captions"),
+        SavedChoice::Pending { .. } => Some("pending"),
+        SavedChoice::Speech(speech) if speech.has_caption_lines => Some("mixed"),
+        SavedChoice::Speech(speech) => Some(speech.provider.as_str()),
+    }
+}
+
+/// Whether caption lines remain, so caption fixes still apply.
+fn has_caption_lines(choice: &SavedChoice) -> bool {
+    match choice {
+        SavedChoice::Captions | SavedChoice::Pending { .. } | SavedChoice::CaptionsKept { .. } => {
+            true
+        }
+        SavedChoice::Speech(speech) => speech.has_caption_lines,
+    }
+}
+
+/// The line above the transcript: where its lines came from and why, when not all captions.
+fn transcription_line(choice: &SavedChoice, transcript: &Transcript) -> Option<String> {
+    match choice {
+        SavedChoice::Captions => None,
+        SavedChoice::Pending { provider_label, .. } => Some(format!(
+            "These lines are the captions. A transcript from the call audio by {provider_label} replaces them once the audio uploads."
+        )),
+        SavedChoice::CaptionsKept {
+            provider_label,
+            error,
+            ..
+        } => Some(format!(
+            "These lines are the captions: the call audio got no transcript from {provider_label} ({error})."
+        )),
+        SavedChoice::Speech(speech) => {
+            let why = match speech.reason {
+                FallbackReason::Empty => "the captions were empty",
+                FallbackReason::TooFew => "the captions had almost no lines",
+                FallbackReason::Failed => "the captions failed",
+                FallbackReason::Sparse => "the captions missed speech",
+                FallbackReason::OtherLanguage => "the captions were in another language",
+                FallbackReason::NonEnglishSpeech => "the call was partly not in English",
+                FallbackReason::Garbled => "the captions were garbled",
+                FallbackReason::Forced => "`mc transcribe` asked for it",
+            };
+            let source = if speech.has_caption_lines {
+                format!(
+                    "{:.0} minutes of this transcript come from the call audio, transcribed by {} since {why}. The rest are the captions.",
+                    speech.speech_min, speech.provider_label
+                )
+            } else {
+                format!(
+                    "Transcribed from the call audio by {}, since {why}.",
+                    speech.provider_label
+                )
+            };
+            let numbering = match transcript.speaker_naming {
+                sources::SpeakerNaming::Diarized => {
+                    " Speakers the captions could not name are numbered within each 5-minute part."
+                }
+                sources::SpeakerNaming::Real | sources::SpeakerNaming::MeVsThem => "",
+            };
+            Some(format!("{source}{numbering}"))
+        }
+    }
 }
 
 /// The name a transcript speaker goes by in the note and the prompt: the settings name for the
@@ -441,6 +536,32 @@ fn frontmatter_yaml(note: &NoteInput<'_>, attendees: &[String]) -> Result<String
         attendees: attendees.to_vec(),
         invited: invited(note.calendar_match),
         extraction: note.notes.and(note.extraction_provider),
+        transcription: transcription_source(note.transcription),
+        transcription_provider: match note.transcription {
+            SavedChoice::Captions => None,
+            SavedChoice::Pending { provider_label, .. }
+            | SavedChoice::CaptionsKept { provider_label, .. }
+            | SavedChoice::Speech(SpeechChoice { provider_label, .. }) => {
+                Some(provider_label.as_str())
+            }
+        },
+        transcription_reason: match note.transcription {
+            SavedChoice::Captions => None,
+            SavedChoice::Pending { reason, .. } | SavedChoice::CaptionsKept { reason, .. } => {
+                reason.map(FallbackReason::as_str)
+            }
+            SavedChoice::Speech(speech) => Some(speech.reason.as_str()),
+        },
+        transcription_minutes: match note.transcription {
+            SavedChoice::Captions
+            | SavedChoice::Pending { .. }
+            | SavedChoice::CaptionsKept { .. } => None,
+            SavedChoice::Speech(speech) => Some((speech.speech_min * 10.0).round() / 10.0),
+        },
+        transcription_error: match note.transcription {
+            SavedChoice::Captions | SavedChoice::Pending { .. } | SavedChoice::Speech(_) => None,
+            SavedChoice::CaptionsKept { error, .. } => Some(error.as_str()),
+        },
         slack_workspace: huddle.map(|huddle| huddle.workspace.as_str()),
         slack_channel: huddle.map(|huddle| huddle.channel.as_str()),
         slack_attendees: huddle

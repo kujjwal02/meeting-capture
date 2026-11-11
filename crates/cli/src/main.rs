@@ -46,6 +46,14 @@ enum Command {
     },
     /// Resume a failed meeting at the step that failed.
     Retry { meeting_id: i64 },
+    /// Transcribe a meeting's call audio with the [transcription] provider, whatever its
+    /// captions, then rewrite its note. Later reruns keep the speech transcript.
+    Transcribe {
+        meeting_id: i64,
+        /// Overwrite the note even if it was edited after the last write.
+        #[arg(long)]
+        discard_edits: bool,
+    },
     /// Run only the extraction for a meeting and print the checked notes as JSON. Writes nothing.
     Extract {
         meeting_id: i64,
@@ -130,6 +138,17 @@ fn main() -> anyhow::Result<()> {
             let id = MeetingId::new(meeting_id);
             print_outcome(id, &pipeline.run(id)?, &time_zone);
         }
+        Command::Transcribe {
+            meeting_id,
+            discard_edits,
+        } => {
+            let id = MeetingId::new(meeting_id);
+            print_outcome(
+                id,
+                &pipeline.transcribe_again(id, discard_edits)?,
+                &time_zone,
+            );
+        }
         Command::Extract {
             meeting_id,
             reply,
@@ -142,21 +161,9 @@ fn main() -> anyhow::Result<()> {
                 print!("{}", prompt.render());
                 return Ok(());
             }
-            let checked = if let Some(reply_file) = reply {
-                check_saved_reply(&prompt, &reply_file)?
-            } else {
-                let mut llm = settings_store.llm();
-                if let Some(provider) = provider.map(ProviderKind::from) {
-                    let base_url = llm.base_url().map(str::to_owned);
-                    llm.set_endpoint(Some(provider), base_url);
-                }
-                if model.is_some() {
-                    llm.model = model;
-                }
-                llm.validate()?;
-                let provider = Provider::from_settings(&llm, &app_dirs)?
-                    .context("no LLM provider is set; pass --provider or set llm.provider")?;
-                provider.extract(&prompt)?
+            let checked = match reply {
+                Some(reply_file) => check_saved_reply(&prompt, &reply_file)?,
+                None => extract(&settings_store, &app_dirs, &prompt, provider, model)?,
             };
             println!("{}", serde_json::to_string_pretty(&checked)?);
         }
@@ -195,6 +202,28 @@ impl From<InputKindArg> for InputKind {
             InputKindArg::BrowserCallLog => InputKind::BrowserCallLog,
         }
     }
+}
+
+/// Calls the LLM in settings, or the provider and model given instead.
+fn extract(
+    settings_store: &SettingsStore,
+    app_dirs: &AppDirs,
+    prompt: &Prompt,
+    provider: Option<ProviderArg>,
+    model: Option<String>,
+) -> anyhow::Result<CheckedNotes> {
+    let mut llm = settings_store.llm();
+    if let Some(provider) = provider.map(ProviderKind::from) {
+        let base_url = llm.base_url().map(str::to_owned);
+        llm.set_endpoint(Some(provider), base_url);
+    }
+    if model.is_some() {
+        llm.model = model;
+    }
+    llm.validate()?;
+    let provider = Provider::from_settings(&llm, app_dirs)?
+        .context("no LLM provider is set; pass --provider or set llm.provider")?;
+    Ok(provider.extract(prompt)?)
 }
 
 fn check_saved_reply(prompt: &Prompt, reply_file: &Path) -> anyhow::Result<CheckedNotes> {
@@ -266,7 +295,14 @@ fn print_meeting(meeting: &Meeting, time_zone: &TimeZone) {
             retry.describe(time_zone),
             retry.last_error()
         ),
+        JobState::NetworkWait { retry } => println!(
+            "      waiting for the network, {}: {}",
+            retry.describe(time_zone),
+            retry.last_error()
+        ),
+        JobState::Resuming { message } => println!("      resuming at the next sweep: {message}"),
         JobState::Captured
+        | JobState::Transcribed
         | JobState::Matched
         | JobState::Extracted
         | JobState::Written { .. }

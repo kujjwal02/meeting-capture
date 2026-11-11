@@ -12,7 +12,7 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 | 3b | Mic detection | Calls in native apps such as Teams and Zoom, from the app that holds the mic, on both OSes. Also ends a Meet call at once when the browser crashes | Teams and Zoom each log start and end within 5 s, on the Mac and the PC | 2 |
 | 3c | Mac video | A Slack huddle's own window from a supervised `mc-capture video`: ScreenCaptureKit, VideoToolbox HEVC, 2 s HLS fragments, repair at launch. Meet video from mc-meet tab capture, armed by one click per Meet tab. One MP4 per call at finalize | Lips match voices within 100 ms on 3 calls; a `kill -9` of the video helper leaves fragments that play; revoking Screen Recording keeps audio recording | 8.5 |
 | 3d | Telemetry | One `telemetry` crate in every binary: OpenTelemetry-shaped JSON lines, daily log files, correlation ids, a 10-minute flight recorder dumped on a problem, a panic, a failed job or a failed helper. Then debug mode, metrics, environment snapshots, report bundles and detectors. [Design](10-telemetry.md) | A debug report from one bad call names the failing layer with no second call; the recorder dumps cost under 1% CPU and 20 MB per process | 6 |
-| 4 | Local STT | Parakeet, VAD, remote diarization, caption-name merge | A 1 h call transcribes in under 10 min on the M2; names match captions on 3 Meet calls | 4 |
+| 4 | STT fallback | `stt` crate with one provider trait. Deepgram transcribes the 5-minute windows of a call whose captions are empty, sparse, failed, in another language or garbled, as Opus with silences cut, one request at a time, and waits out a poor network. Local models come later as more providers | A Meet call with captions off and a Hinglish call each get a Deepgram transcript; a call with good English captions and a rerun make no Deepgram request | 4 |
 | 5 | Windows capture | WASAPI loopback, mic | Phase 3 checks pass on the PC | 4 |
 | 6 | Extra sources | Soniox routing, dropped audio files, calendar from a secret iCal address | A Hinglish call gets a Soniox transcript; an iCal address matches a call with no Google sign-in | 3 |
 | 7 | Recording | Audio and video archive, Drive folder | Video and audio for 3 calls land in the Drive folder, none in the vault | 2 |
@@ -322,8 +322,8 @@ Progress is tracked in the [checklist](05-checklist.md).
 - The tap keeps running at 48 kHz across a switch to AirPods Pro, with no dropped samples. The
   switch also moves the default input to the AirPods; an open built-in mic stream stays on the
   built-in mic. The AirPods mic, once open, records at 24 kHz mono and the tap stays at 48 kHz.
-- No echo cancellation: it was 63 to 76% of Muesli's CPU. Phase 4 drops mic segments whose text
-  matches an overlapping remote segment.
+- No echo cancellation: it was 63 to 76% of Muesli's CPU. Phase 4 drops mic words that match a
+  remote word said at the same moment.
 
 ### Build order
 
@@ -340,7 +340,143 @@ Progress is tracked in the [checklist](05-checklist.md).
 
 ## Phase 4 detail
 
+Captions stay the main source. They are free, they carry real names, and they need no upload.
+Deepgram is the fallback, the first provider behind the `stt` trait. It bills each second of
+audio sent, so the step sends only the parts of a call the captions got wrong.
+
+### When a meeting uses Deepgram
+
+The step cuts the call's timeline into 5-minute windows, counted from the captions' start. The
+first window reaches back to the start of the audio when the recorder began before the captions.
+Each window keeps its caption lines unless the checks send it to Deepgram. Free checks run first:
+
+1. Empty: the call has no caption lines. Every window goes.
+2. Too few: the call has fewer than 3 caption lines, the minimum intake keeps a call for. Every
+   window goes.
+3. Failed: Meet reported `captions_unavailable` for over 2 minutes in total, and fewer than 2
+   caption events per minute arrived in that time. Meet often reports captions unavailable while
+   its data channels keep sending them, so the report alone is not a failure. For a huddle, the
+   worst health was `captions-off` or `broken`.
+4. Sparse, per window: fewer than 30 caption words per minute of speech in the window. Calls with
+   working captions measured 42 to 216. A frame of either stem louder than -40 dBFS counts as
+   speech.
+5. Another language, per window and for the call: over 20% of caption letters are outside the
+   Latin script, or `whatlang` reads the caption text as a language other than English with
+   confidence.
+
+Two call-level checks follow, unless the free checks already send every window:
+
+1. Language check: two 30 s clips per stem, the loudest stretches with at least half speech, go
+   to Deepgram with `language=multi`, which tags each word with a language. A stem with 20 or
+   more words, of which 20% or more are not tagged `en`, flags the call. Any tag other than `en`
+   counts, since Deepgram tags some Hindi as Telugu or another Indian language. The log lists
+   the count per tag.
+2. Garbled: an LLM reads a sample of caption lines and answers `coherent`, `garbled` or
+   `other_language`. Meet's English captions on Hinglish speech give English words that make no
+   sense. The sample is up to 60 lines of 3 words or more, spread evenly over the call, with
+   Slack huddle events left out. The check runs with any `[llm]` provider, only when the other
+   checks passed, since it costs a call.
+
+A flagged call sends every window with speech, except windows with over 100 caption words per
+minute of speech whose own language-check clips, if any fell in them, were under 20% non-English.
+Failed and other-language captions flag the call the same way.
+
+A fallback also needs a call folder with stems and a transcription provider in settings. The
+tray skips a call with fewer than 3 caption lines, unless such a fallback is possible.
+`mc transcribe <id>` sends every window for one meeting. It writes `stt/forced` in the call
+folder, so later reruns keep the Deepgram transcript; delete that file to go back to the checks.
+With the provider removed from settings since, the mark is ignored with a warning.
+
+### Captions first
+
+A call with caption lines gets its note at once. When any window goes to Deepgram, or the
+language check cannot reach Deepgram, the note holds the captions with `transcription: pending`
+and a line that says so. The meeting then runs again at once: it sends the windows, extracts the
+notes again from the new transcript and rewrites the note. A call with no caption lines waits for
+Deepgram before its first note.
+
+### Low network
+
+- Each request is one window of one stem, encoded to Ogg Opus at 24 kbps mono by `opus-rs`, a
+  pure Rust port of libopus. A 5-minute stem is 0.9 MB, against 9.6 MB of WAV.
+- Silences over 1 s are cut out before encoding, with 0.3 s kept on each side of speech. Each
+  saved reply keeps the map from the audio sent back to the call's clock.
+- Requests go out one at a time. Each may take 60 s plus 1 s per 20 KB of audio, upload included.
+- A network error, a timeout, HTTP 429 or a 5xx is tried 3 times in the run, 10 s and 30 s
+  apart. After that the meeting waits for the network: the tray shows "Waiting for the network"
+  with the next try, and the sweep tries again after 5 minutes, 30 minutes, 2 hours, then at each
+  sweep. Past that schedule, an HTTP 5xx or 429 that repeats the last failure word for word
+  doubles the wait, up to 24 hours. A waiting meeting first opens a connection to the provider's
+  host, with no request, and reads the stems only if it opens. A try that saved a reply starts
+  the schedule again. A run stops starting requests 1
+  minute before its 15-minute lease ends. If it saved a reply, the tray shows "Resuming" and the
+  next sweep runs it with no delay; if not, it waits for the network.
+- A refused key (401 or 403), no credit (402) or another refused request keeps the captions when
+  they have lines. So does a local error: audio still recording, stems that cannot be placed or
+  read, audio that cannot be encoded, or a reply that cannot be read. The note's frontmatter
+  records it as `transcription: captions` with `transcription_error`. A forced call, or one with
+  no caption lines, fails instead, and the tray offers a retry.
+- The step waits up to 60 s for the audio writer to close the call's last segment; a call still
+  recording after that is a local error. Holding the folder's lock, the step repairs a segment a
+  dead writer left open, since the launch repair skips a folder whose lock the step holds. A
+  segment repair cannot close is a local error too.
+
+### Deepgram
+
+- Prerecorded `POST /v1/listen` with model `nova-3`, `language=multi`, `smart_format`,
+  `utterances`, and `mip_opt_out=true`, since calls carry client data. The opt-out leaves the
+  price as it is: $0.0052 per minute for multilingual Nova-3, pay as you go.
+- The mic stem is the local user's lines. The remote stem adds `diarize_model=v2`, since
+  `diarize` is deprecated.
+- Each remote speaker of a request takes the name of the caption speaker whose lines overlap
+  theirs most in time, with captions in neighbouring windows counted too. With no overlap and one
+  other attendee, the speaker takes that attendee's name. Otherwise speakers are "Speaker 1",
+  "Speaker 2", and so on, numbered within each window, since Deepgram cannot tell the same voice
+  across requests.
+- On speakers, remote voices also reach the mic. A mic word is dropped when a remote word with
+  the same text is centred within 0.4 s of it, and a neighbouring mic word matches too, or it is
+  the utterance's only word.
+- Stems are placed on the call's timeline by `call-finalize`'s plan, the one `call.mp4` uses, so
+  segment times match the captions and the video.
+- The call folder's `stt/` holds the step's output, since the job store keeps none of it:
+  - `wNNN-mic.json` and `wNNN-remote.json`: a window's reply as Deepgram sent it, with the
+    request options, the trimmed audio's offset map, the stem files' sizes, the SHA-256 of the
+    samples read and the SHA-256 of the Opus file sent. A rerun with the same options, sizes and
+    samples reads it and makes no request.
+  - `clips-mic.json` and `clips-remote.json`: the language check's replies. They are the
+    transcript of their seconds in windows sent, so those seconds are not billed twice.
+  - `coherence.json`: the garbled-caption verdict, reused while the prompt and sample are the
+    same.
+  - `choice.json`: what the step settled on. Runs after the step, such as an extraction retry
+    or a Recording section rewrite, read it and the saved replies and make no request. When a
+    stem file's size or samples changed since its reply, the meeting goes back to its first
+    step, since the note's citations point at transcript lines.
+- Deepgram lines replace the caption lines inside the windows sent. Title, attendees and chat
+  still come from the call log. Words go to the window that holds their middle, both Deepgram's
+  words and caption words, which are spread evenly over their line. A line across a window edge
+  is cut there, so no stretch of the call shows twice or goes missing.
+- The frontmatter gains `transcription` (`deepgram`, `mixed` or `pending`),
+  `transcription_provider`, `transcription_reason` and `transcription_minutes`, and the
+  transcript section opens with a line that says how many minutes came from Deepgram and why.
+  "Possible caption errors" is left out when no caption lines remain.
+- `language=multi` covers Hindi-English code-switching. Phase 6's Soniox routing stays only if
+  Deepgram's Hinglish is poor.
+
+Settings. A save from the settings window applies to the next run; a hand edit applies after a
+restart. The model takes lowercase letters, digits, `.` and `-`; the language is `multi` or a
+code such as `en`, `hi` or `en-IN`.
+
+```toml
+[transcription]
+provider = "deepgram"   # no table: captions only, no fallback
+api_key = "..."
+model = "nova-3"        # optional
+language = "multi"      # optional
+```
+
 ### Desert Ant models on the Mac
+
+A later local provider behind the same trait.
 
 [Desert Ant Labs](https://desertant.com/models/) ships on-device speech models that run on the
 Neural Engine through Core ML. Three of them cover phase 4 and phase 6 work. Each is free up to

@@ -56,6 +56,12 @@ stateDiagram-v2
     Extracted --> ExtractionPending: extraction failed
     ExtractionPending --> Written: a retry succeeds
     ExtractionPending --> Failed: retry 3 fails
+    Captured --> NetworkWait: speech-to-text unreachable
+    Written --> NetworkWait: speech-to-text unreachable
+    NetworkWait --> Written: a retry succeeds
+    Captured --> Resuming: run time spent mid-upload
+    Written --> Resuming: run time spent mid-upload
+    Resuming --> Written: the next sweep finishes
     Written --> [*]
     Captured --> Failed
     Transcribed --> Failed
@@ -79,7 +85,9 @@ rerun over an edited note replaces only the sections between the app's `%% mc:be
 names the note, and the tray offers "Overwrite my edits".
 
 Captions from mc-meet and Slack huddles are already a transcript, so their job passes
-`Transcribed` without running STT.
+`Transcribed` without running STT, unless they fail the caption checks. The job store records
+only that the step finished. Its output, the speech-to-text replies and the source it settled
+on, stays in the call folder's `stt/`, and later runs read it from there.
 
 ## 1. Capture
 
@@ -411,14 +419,28 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    CAP["captions"] --> SRC["sources"]
-    STEMS["WAV stems"] --> STT["stt"] --> SRC
-    FILE["dropped audio file"] --> STT
-    SRC --> T["common transcript"]
+    CAP["captions"] --> SRC["sources"] --> CHK["caption checks"]
+    CHK -->|pass| T["common transcript"]
+    CHK -->|fail| STT["stt"]
+    STEMS["WAV stems"] --> STT
+    STT --> T
 ```
 
-- `stt` runs VAD, Parakeet TDT 0.6B v3 and diarization of the remote stem, locally.
-- Hinglish calls go to Soniox instead of Parakeet.
+- Captions are the main source. The pipeline cuts the call into 5-minute windows and sends a
+  window's stems to `stt` only when its captions are empty, sparse, in another language, or the
+  call fails a language check on its audio or an LLM reads its captions as garbled. The
+  [roadmap](03-roadmap.md#when-a-meeting-uses-deepgram) has the rules.
+- `stt` has one `SpeechToText` trait and a closed provider type. Deepgram is the only provider
+  today; local models come later behind the same trait. Audio goes out as Ogg Opus with long
+  silences cut, one request at a time. The pipeline places the utterances on the call timeline
+  and puts them in place of the caption lines of the windows sent. Remote speakers take caption
+  names by time overlap.
+- A call with caption lines gets its note from the captions at once, marked pending, and the
+  next run rewrites it from the speech. A provider that cannot be reached puts the meeting in
+  `NetworkWait`; the sweep tries again after 5 minutes, 30 minutes, 2 hours, then at each sweep,
+  or at doubling waits up to 24 hours while the provider repeats the same server error.
+  A run that saved replies and ran out of its 15 minutes shows `Resuming`, and the next sweep
+  goes on with no delay.
 - `sources` turns every input into the common transcript format below.
 
 ## 3. Process (phase 1)
@@ -480,8 +502,8 @@ flowchart TB
 
 Later crates attach in their phase: the app depends on `detect`, `capture-protocol`,
 `stem-writer`, `video-capture` and `browser-shortcut`; `mc-capture` on `capture`, `stem-writer`,
-`video-capture` and `call-finalize`; `pipeline` on `call-folder`;
-`sources` depends on `stt`. The app, `mc-capture`, `cli` and `pipeline` depend on `telemetry`.
+`video-capture` and `call-finalize`; `pipeline` on `call-folder` and `call-finalize`;
+`pipeline` depends on `stt`. The app, `mc-capture`, `cli` and `pipeline` depend on `telemetry`.
 
 - The two binaries own the wiring. Library crates never depend on `meeting-capture` or `cli`.
 - Only `meeting-capture` depends on Tauri.
@@ -493,7 +515,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 | native-host | 1b | Host mode for Chrome native messaging, the app socket, frame codecs, host manifest registration | `tokio`; adapted from Anarlog `crates/chrome-native-host` |
 | huddle-captions | 1 | Read Slack huddle captions from the Slack desktop app, write the huddle log, report health | Mac: accessibility API via `objc2-application-services` |
 | sources | 1 | Turn each input into the common transcript format. Provide the append-only log both call log writers use | Captions, own stems, dropped audio files |
-| pipeline | 1 | Pick the best source, merge names, calendar match, Soniox for Hinglish, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `minijinja`, `toml`, `directories` |
+| pipeline | 1 | Caption checks and the speech-to-text fallback, calendar match, LLM extraction and quote check, vault write and splice, settings file | `rig-core`, `rig-agent`, `schemars`, `oauth2`, `reqwest`, `minijinja`, `toml`, `directories`, `whatlang` |
 | jobs | 1 | One row per meeting with a closed state enum and the extraction retry schedule. Runs a meeting's steps under its lease: one run per meeting across processes, renewed from a second thread, given back however the run ends | `rusqlite`, `tracing` |
 | cli | 1 | `mc`: rerun any job step or ingest a file, without Tauri | `clap` |
 | app | 1 | Tray, call status, debug reports, settings, notifications, permission prompts, review of extracted commitments, media links in notes | Tauri 2, plugins `notification` 2 and `deep-link` 2 |
@@ -503,7 +525,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 | call-folder | 3 | The per-process lock on a call folder and the walk over `calls/`, shared by every capture process and repair. The media a person opens in a folder, the purge record, and the `meetingcapture://` media links the note writer builds and the app opens | std file locks, `serde` |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV placed by host time, fsynced every 4.5 s, and `audio.json` | `rubato` |
 | call-finalize | 3c | Place a call's video parts and stems on one timeline, mix the stems, write `call.mp4`. Purge call video after 90 days. The planning, mixing and purge are portable | Mac: AVFoundation via `cidre` |
-| stt | 4 | VAD, Parakeet TDT 0.6B v3 int8, diarization of the remote stem | `sherpa-onnx` |
+| stt | 4 | Transcribe a call's stems through one `SpeechToText` trait. Deepgram today, local models later | `reqwest` |
 | video-capture | 3c | Record one window through ScreenCaptureKit, encode it with VideoToolbox, cut 2 s HLS fragments with AVAssetWriter, write `video.json`, repair dead segments. The writer and repair are portable | Mac: `cidre` |
 | telemetry | 3d | One subscriber for every binary: OpenTelemetry-shaped JSON lines into daily log files, trace ids derived from `call.id` and `meeting.id`, the flight recorder and its dumps, the panic hook. Portable. [Telemetry](10-telemetry.md) | `tracing-subscriber`, `sha2` |
 | browser-shortcut | 3c | Press mc-meet's shortcut into one Chrome process: parse Chrome's shortcut text, find the key on the current keyboard layout, read the Accessibility grant, post the key events. Builds everywhere; only the Mac presses | Mac: `objc2-core-graphics`, `objc2-app-kit`, `objc2-application-services`, `dispatch2`, Carbon's `UCKeyTranslate` |
@@ -519,7 +541,8 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 - Media never goes into the vault.
 - Transcript text and model output are data. The note escapes both, so neither can add Markdown
   structure, wikilinks or section markers.
-- Secrets live in `settings.toml`: Google refresh tokens, the OAuth client secret, the LLM API key.
+- Secrets live in `settings.toml`: Google refresh tokens, the OAuth client secret, the LLM and
+  transcription API keys.
   The file is owner-only and stays out of the vault and git.
 - Stored times are UTC.
 - Every binary logs through `telemetry::init`, never its own subscriber. A field takes its

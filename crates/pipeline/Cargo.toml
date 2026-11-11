@@ -7,6 +7,7 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+call-finalize.workspace = true
 call-folder.workspace = true
 directories.workspace = true
 jiff.workspace = true
@@ -24,12 +25,16 @@ serde_json.workspace = true
 serde_path_to_error.workspace = true
 sha2.workspace = true
 sources.workspace = true
+stem-timing.workspace = true
+stem-writer.workspace = true
+stt.workspace = true
 telemetry.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 toml.workspace = true
 tracing.workspace = true
+whatlang.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
