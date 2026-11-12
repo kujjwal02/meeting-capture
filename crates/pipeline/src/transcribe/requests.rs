@@ -11,7 +11,7 @@ use stem_timing::Stem;
 use stt::{FailureClass, SpeechToText, StemVoices, SttError};
 
 use super::audio::{AudioCut, CallAudio, CallSpan, samples_sha256};
-use super::{TranscribeError, read_json, stt_dir, write_json};
+use super::{StemsStanding, TranscribeError, read_json, stt_dir, write_json};
 
 /// Tries per request within one run. The job's network schedule takes over after the last.
 const TRIES_PER_REQUEST: usize = 3;
@@ -359,12 +359,18 @@ pub(super) fn clips_file_name(stem: Stem) -> String {
     format!("clips-{}.json", stem.as_str())
 }
 
-/// A saved reply's audio and reply, with no request: for a finished step.
-pub(super) fn saved_answer(folder: &Path, file_name: &str) -> Result<Answered, TranscribeError> {
+/// A saved reply's audio and reply, with no request: for a finished step. Checked against the
+/// stems while they are here; once the archive took them, the reply stands as saved.
+pub(super) fn saved_answer(
+    folder: &Path,
+    file_name: &str,
+    stems: StemsStanding,
+) -> Result<Answered, TranscribeError> {
     let path = stt_dir(folder).join(file_name);
     let saved = read_json::<SavedReply>(&path)?.ok_or(TranscribeError::StaleReplies)?;
-    if !saved.cut.has_current_sizes(folder)
-        || samples_sha256(&saved.cut.samples(folder)?) != saved.samples_sha256
+    if !stems.is_archived()
+        && (!saved.cut.has_current_sizes(folder)
+            || samples_sha256(&saved.cut.samples(folder)?) != saved.samples_sha256)
     {
         return Err(TranscribeError::StaleReplies);
     }

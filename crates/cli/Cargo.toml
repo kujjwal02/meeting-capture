@@ -17,6 +17,7 @@ wispr = ["pipeline/wispr"]
 
 [dependencies]
 anyhow.workspace = true
+call-folder.workspace = true
 clap.workspace = true
 detectors.workspace = true
 jiff.workspace = true

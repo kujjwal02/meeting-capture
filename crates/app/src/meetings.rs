@@ -30,6 +30,13 @@ fn report_run(
         Ok(RunOutcome::Finished(meeting)) => {
             tracing::info!(meeting.id = %id, meeting.state = meeting.state().label(), "run finished");
             notify_outcome(app, pipeline, meeting);
+            // Gated like the media purge: only the Mac records media to archive.
+            if cfg!(target_os = "macos") && matches!(meeting.state(), JobState::Written { .. }) {
+                crate::drive_archive::start_sweep(
+                    app,
+                    crate::drive_archive::SweepTrigger::NoteWritten,
+                );
+            }
         }
         Ok(RunOutcome::AlreadyRunning) => {}
         // Step failures are logged and recorded by the pipeline; this covers store errors too.

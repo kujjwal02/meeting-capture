@@ -113,6 +113,31 @@
       </section>
 
       <section>
+        <h2>Media archive</h2>
+        <p class="hint">
+          An hour after a call's note is written, its video and audio go to a folder on Google
+          Drive, and the copies on this computer are deleted. Notes then link the Drive copies.
+          Transcripts and notes stay here.
+        </p>
+        <label class="checkbox">
+          <input type="checkbox" id="drive-enabled">
+          Archive call media to Google Drive
+        </label>
+        <label>
+          Drive account
+          <select id="drive-account"></select>
+        </label>
+        <p id="drive-sign-in-status" class="hint" hidden>
+          Finish signing in to Drive in the browser. This waits up to 5 minutes.
+        </p>
+        <label>
+          Folder in My Drive
+          <input type="text" id="drive-root-folder" autocomplete="off" spellcheck="false">
+        </label>
+        <p id="drive-status" class="hint" role="status"></p>
+      </section>
+
+      <section>
         <h2>Google Meet</h2>
         <label class="checkbox">
           <input type="checkbox" id="meet-hide-captions">

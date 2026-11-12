@@ -151,9 +151,11 @@ impl CallMedia {
     }
 }
 
-// `001-mic.wav` is segment 1's mic stem. Only a name the stem writer would give counts, so each
-// link the note gets opens the file it was built from.
-fn stem_of(file_name: &str) -> Option<(u32, StemSide)> {
+/// The segment and side of a stem file name: `001-mic.wav` is segment 1's mic stem. Only a name
+/// the stem writer would give counts, so each link the note gets opens the file it was built
+/// from.
+#[must_use]
+pub fn stem_of(file_name: &str) -> Option<(u32, StemSide)> {
     let (number, rest) = file_name.split_once('-')?;
     let number: u32 = number.parse().ok().filter(|number| *number > 0)?;
     let side = StemSide::ALL

@@ -155,6 +155,12 @@ in the `detectors` crate and read the app's own event lines and call metric rows
   problem or a missing huddle permission. Audio that records turns an idle dot red. A refused
   microphone, system audio or Screen Recording permission, or a failed Meet tab video, turns it
   amber.
+- With the media archive on, one tray line under the calendar accounts says where it stands:
+  "Drive: 12 calls archived", with ", uploading" during a sweep. "Drive full", "Drive: sign in
+  again" and the last sweep's error turn the icon amber and show in the tooltip. "Sign in again"
+  and a missing Drive sign-in open the settings window. "Drive: 2 calls wait for <account>"
+  names folders whose uploads are on another account's Drive; it opens the settings window and
+  leaves the icon as it is.
 - On macOS only, each open call has an audio row, and a huddle that records video has a video
   row. Each capture problem adds a row under its call, such as "Audio problem: your mic is lost,
   since 10:35 IST". Each open call has "Stop recording this call". A stopped call shows "Resume
@@ -333,11 +339,12 @@ flowchart LR
   segment start runs its process's repair on its own folder. `mc-capture repair --folder` runs
   both by hand.
 - `call-folder` holds what every capture process shares about a call folder: the OS file lock
-  that marks a live writer (`audio.lock`, `video.lock`) and the walk over `calls/`.
+  that marks a live writer (`audio.lock`, `video.lock`), the walk over `calls/`, and the
+  `drive.json` record.
 - Finalize writes `call.mp4` in the call folder: the video segments as one track, and the mic
   and remote stems mixed into one 16 kHz mono AAC track at 48 kbps. The file has no faststart:
   its index sits at the end, so it plays from disk but not progressively over a network. The
-  stems and fragments stay.
+  stems stay. The fragments stay until the fragment cleanup deletes them.
 - When a call that recorded ends, `call_capture` runs `mc-capture finalize --folder` once the
   call's processes have stopped. At launch, after repair, it runs `mc-capture pending-finalize
   --calls-dir` for the list of folders to finalize, then one `finalize --folder` per folder,
@@ -357,7 +364,22 @@ flowchart LR
   phase 4 transcribes the stems. A call ended at the newest change to its capture files: the
   stems, both manifests and the fragments. Lock files, finalize output and the purge's own
   files do not count.
-- Fragments stay until a finalize succeeds. The purge deletes only where the finalize record on
+- `mc-capture delete-finalized-fragments --calls-dir` deletes the `NNN-video` folders whose
+  frames `call.mp4` holds, once the call ended more than 1 hour ago on the purge clock
+  (`FRAGMENT_KEEP_AFTER_CALL_END`). It reads the purge clock and never moves it; before the first
+  purge it deletes nothing. A Meet rejoin up to 10 minutes after the end resumes the call in the
+  same folder, and its finalize reads every segment from the fragments again. The app passes the
+  folder of each call it holds open, recording or stopped, as `--keep`, and the cleanup skips
+  those. The app runs the cleanup after finalize at launch, then every hour. It deletes only
+  where the finalize record on the current manifests says written, with `call.mp4` still there,
+  and keeps the same segment folders and folders the purge keeps. `finalize.json` records the
+  length of the `call.mp4` it wrote; a `call.mp4` of another length, or an empty one under an
+  older record, keeps the fragments and logs `fragments.call_file_mismatch`. The cleanup keeps
+  `call.mp4` and writes no `media-purge.json`, so finalize still counts the folder as finalized
+  and the note still links the video. The 90-day purge deletes `call.mp4` later.
+- Once the cleanup deleted a call's fragments, a lost or deleted `call.mp4` cannot be rebuilt.
+- Fragments stay until a finalize succeeds. The purge and the fragment cleanup share one rule,
+  apart from the call's age. The purge deletes only where the finalize record on
   the current manifests says written, with `call.mp4` still there, or no video. A failed or
   killed finalize with no retry left, or fragments with no `video.json`, keep everything as
   `finalize_failed`. A folder still waiting for its `call.mp4` keeps everything, however old.
@@ -367,13 +389,13 @@ flowchart LR
   list. A `finalize.json` of version 1 has no such list, so it counts as no record: the folder
   waits as `finalize_pending` and the next launch finalizes it again. A folder with only such segments
   left is kept as `unplaced_video`, and logged at every run.
-- The purge holds `audio.lock`, `video.lock` and `finalize.lock` while it works, and keeps a
-  folder where any is taken. It writes and syncs `media-purge.json` before it deletes. Finalize
-  refuses a folder with that record, and the next purge finishes a half-purged one. It deletes
-  only inside the calls folder: call folders that are links are not listed, each folder must
-  resolve to a child of the calls folder, and a `call.mp4` or segment folder that is a link is
-  left and counted. Each `call.mp4` and segment folder deleted is a log event with its path and
-  size.
+- The purge and the fragment cleanup hold `audio.lock`, `video.lock` and `finalize.lock` while
+  they work, and keep a folder where any is taken. The purge writes and syncs `media-purge.json`
+  before it deletes. Finalize refuses a folder with that record, and the next purge finishes a
+  half-purged one. Both delete only inside the calls folder: call folders that are links are not
+  listed, each folder must resolve to a child of the calls folder, and a `call.mp4` or segment
+  folder that is a link is left and counted. Each `call.mp4` and segment folder deleted is a log
+  event with its path, size and `purge.cause`: `retention_expired` or `finalized`.
 - The purge ages calls against its own clock, stored in UTC in `media-purge-run.json` in the
   calls folder with the wall clock of the last run. Each run moves it forward by the wall time
   since the last run, at most 48 h and never past the wall clock. A clock set back pulls it back
@@ -392,6 +414,116 @@ flowchart LR
   a call folder with video writes `media-first-seen.json` in it, at the purge clock. A call ages
   from the later of its end and that stamp. The first run of the purge stamps every existing
   folder, so it deletes nothing, and those calls go 90 days later.
+- `drive.json` in a call folder records what of its media is on Google Drive. It holds a
+  `version` (1; a reader refuses any other), the Drive account, the call's Drive folder ID and
+  path, a state, each uploaded file, the stems `call.mp4` mixed, the resumable session of each
+  upload under way, and the last restore time. Each file has its kind (`video` or `stem`), Drive
+  ID, size, Drive MD5, the local file's MD5 and its upload time. `call-folder` owns the type.
+  Each write goes through a synced partial file, a rename and a folder sync. The session URIs
+  grant their uploads, so no log holds them.
+- The state is closed:
+  - `uploading`: uploads land, each recorded once verified. Nothing is deleted.
+  - `uploaded`: every planned file is verified and recorded. It is written before any deletion.
+  - `media_deleted`: the local copies are gone, with the time.
+- `mc archive <call folder or meeting ID>` archives one call folder, and `mc archive --all` every
+  one. `--dry-run` prints each folder's eligibility, the reason when it is held, and the bytes
+  it would free; it uploads nothing and needs no Drive sign-in.
+- With `[drive] enabled` and a Drive token, the app sweeps every call folder through the same
+  archive. A sweep follows the fragment cleanup at each hourly media check, and also runs when
+  a meeting's note is written, when the settings window saves the archive on, and after a Drive
+  sign-in. Like the purge, it runs on the Mac only. One sweep runs at a time, off the async
+  runtime, and reads `[drive]` from the file first, since `mc drive sign-in` writes it from
+  another process. The folders of calls the app holds open are its keep list. It reads the job
+  store's meetings once per sweep, and checks each folder's eligibility before it connects, so a
+  sweep with nothing to do makes no Google call.
+- The sweep reads `[drive]` again before each folder and right before each deletion. Once the
+  archive is off or its account changed, the folder keeps its media and the sweep stops.
+- The app writes `open-calls.json` in the data folder at launch and whenever a call opens or
+  ends: the call folder names it holds open, replaced in one rename. `mc archive` reads it as its
+  keep list before each folder. A missing file is an empty list. A list a quit left only keeps
+  more folders, until the next launch writes it again.
+- An archive or restore run holds the folder's `archive.lock` from start to end, so the app and
+  `mc` never work on one folder at once. A folder whose lock is taken is held.
+- A full Drive or a Drive account that must sign in again ends the sweep and pauses the archive
+  until the next hourly check or a new sign-in. A network fault ends the sweep, and the next
+  check goes on from each `drive.json`. Any other error fails that folder only.
+- After a sweep or `mc archive` deletes a folder's media, the note's Recording section is
+  rewritten, as after finalize, so the note links the Drive copies.
+- A folder is eligible when all of these hold:
+  - Its call ended over 1 hour ago on the purge clock, the fragment cleanup's rule and constant.
+  - The app does not hold the call open, by its own list or `open-calls.json`.
+  - The fragment cleanup has no `NNN-video` folder left to delete in it.
+  - Every meeting that names the folder in the job store is `Written`, with no extraction
+    retry, network wait or resume ahead, and `stt/choice.json` is not pending.
+  - `drive.json` is absent or `uploading`.
+- What a run takes depends on finalize:
+  - `call.mp4` written from the current manifests, of the recorded length, and a complete MP4:
+    its top-level boxes run from the start to exactly the end of the file, with `moov` and
+    `mdat`. The run plans the manifests again, as finalize does, to learn which stems the mix
+    holds. It uploads `call.mp4` and, as FLAC, each stem finalize left out, such as a segment
+    with no clock reading. It then deletes every stem and `call.mp4`. A video archive therefore
+    keeps only the mixed track of the stems it mixed. If the manifests cannot be planned, the
+    folder is held.
+  - No `video.json`, no video to place, or `media-purge.json` with `call.mp4` gone: the run
+    uploads each stem as lossless FLAC, such as `001-mic.flac`, then deletes the WAVs.
+  - Each FLAC is decoded back before its upload and must give the WAV's MD5. A stem whose header
+    is not the one the stem writer writes for its length is not archived. `flacenc` encodes and
+    `claxon` decodes, both pure Rust.
+  - Finalize pending or failed, a `call.mp4` of another length or incomplete, or a purge that
+    left `call.mp4`: the run holds the folder and says why.
+- Manifests, `stt/`, `finalize.json`, lock files, purge files and `NNN-video` folders are never
+  uploaded or deleted by the archive. `NNN-video` folders finalize could not place stay in an
+  archived folder, since the fragment cleanup skips it.
+- Files go to `<root_folder>/<YYYY>/<MM>/<YYYY-MM-DD HHMM> <title>/` on the Drive account, dated
+  by the call start in the notes' time zone, titled by the meeting, or by the call folder name
+  when it has no title. `/` and control characters are dropped from the title.
+- Order of a run:
+  1. Each verified upload is recorded as it lands. Its FLAC in `.drive-archive/` is deleted
+     then.
+  2. Each recorded copy a local file needs is confirmed against Drive's size, MD5 and trash
+     flag, this run's uploads too, with one request each.
+  3. The run takes `audio.lock`, `video.lock` and `finalize.lock`. Under them it reads only local
+     state: it plans the folder again (job state, transcript and finalize) and checks each saved
+     speech-to-text reply against the stems, as a transcribe run does. A plan that changed, or a
+     reply that no longer matches, holds the folder.
+  4. The record is written as `uploaded`, with every planned file.
+  5. Each uploaded file's MD5 is checked again, and the run deletes the stems, then `call.mp4`
+     last, since it covers the mixed stems. Deletion takes only copies confirmed in step 2. A
+     file that changed since its upload holds the folder; the next run uploads it again.
+  6. The record is written as `media_deleted`.
+- A run cut short in `uploading` confirms each recorded upload against Drive's size and MD5
+  instead of uploading again, and resumes an upload from its saved session. A run in `uploaded`
+  never plans again: it confirms each Drive copy and deletes the recorded files still there.
+  An entry is dropped only when its local file is still there: changed since its upload, or its
+  Drive copy gone or in the trash. When the record's Drive folder is gone or in the trash, the
+  run makes the folder path again and uploads those files again. A record of another account
+  starts over and logs the Drive file IDs it leaves; while any of its files is gone locally, it
+  holds the folder until that account signs in again.
+- A network or quota error stops the folder; whatever was deleted is on Drive. A full Drive or
+  a Drive account that must sign in again stops `--all` at once.
+- A run in `uploaded` confirms each Drive copy first, then takes the folder's locks and holds
+  the deletion while any meeting of the call is not `Written`, its transcript is pending, or a
+  saved reply no longer matches the stems. A rerun after a restore reads the stems with no lock
+  once its meeting has left `Written`. A record of another account than the signed-in one holds
+  the folder until that account signs in again.
+- When a run in `uploaded` finds a Drive copy gone, in the trash or not as uploaded while its
+  local file is still there, it drops that entry and writes the record back to `uploading`. The
+  folder is held, and the next run uploads the file again. Dropping `call.mp4`'s entry drops the
+  mixed stem names too. A lost copy whose local file is gone fails the run, since that copy was
+  the only one.
+- Once `drive.json` is `uploaded` or `media_deleted`, or cannot be read, the archive owns the
+  folder: finalize returns `archived` without reading it, `pending-finalize` does not list it,
+  audio and video repair leave it, and the 90-day purge and the fragment cleanup skip it.
+- `mc restore <call folder or meeting ID>` downloads each recorded file into `.drive-archive/`
+  under the folder's locks, and checks its MD5 against the record. A Drive file in the trash
+  fails the restore. A record still `uploading` deleted nothing, so the restore refuses it. Before
+  the first download, each local file is checked: one whose MD5 differs from the record refuses
+  the whole restore, and one that matches stays. The restore then records its time with the
+  record `uploaded`, before the first file is written, so a restore cut short leaves files the
+  archive deletes again. A FLAC is decoded to a WAV with the stem writer's header, and written only
+  when its MD5 equals the original WAV's. `call.mp4` is moved in as downloaded. Stems `call.mp4`
+  mixed were never uploaded, so they stay gone. `mc archive` leaves the restored files for 7
+  days, then deletes them with no second upload.
 - Offsets come from the call timeline, in UTC nanoseconds. A video part starts at its first
   frame's host time, read through the clock reading of the audio segment it pairs with, or its
   own when no audio pairs. Segments whose readings agree on UTC minus host time within 500 ms
@@ -430,6 +562,19 @@ flowchart LR
   window's stems to `stt` only when its captions are empty, sparse, in another language, or the
   call fails a language check on its audio or an LLM reads its captions as garbled. The
   [roadmap](03-roadmap.md#when-a-meeting-uses-deepgram) has the rules.
+- Once the Drive archive took a call's stems, its saved replies in `stt/` are the transcript. A
+  rerun reuses the saved choice and reads each saved reply without the check against the stems,
+  and sends no request. A meeting with no saved choice and archived stems keeps its captions.
+- `mc transcribe` on an archived call refuses: when its stems are on Drive as FLAC, it says to
+  run `mc restore <id>` first; when only `call.mp4`'s mix holds them, it says "stems archived;
+  only the mixed recording remains". A restored call transcribes as before.
+- The archive deletes stems only under `audio.lock`. A rerun decides whether its stems are gone
+  under that lock, after any deletion under way has finished; its meeting has left `Written`, so
+  no later deletion starts. Saved replies are read against the stems under the lock too, so a
+  refresh of a written note never meets a stem half deleted. When the lock stays taken past the
+  60-second wait, the run stops and the next sweep resumes it; it never reads without the lock.
+  The job store counts such tries in a row in `extraction_attempts`. After 12, about an hour of
+  sweeps, the meeting fails, and the tray names the held `audio.lock`.
 - `stt` has one `SpeechToText` trait and a closed provider type. Deepgram is the default provider;
   Wispr Flow is an optional second provider behind the `wispr` cargo feature, off in released
   builds, and local models come later behind the same trait. Each provider picks its own upload
@@ -476,14 +621,33 @@ flowchart LR
   app through `tauri-plugin-single-instance`. A click opens the file in its default app. When
   the file is gone, the app shows why in a notification and opens the call folder. A purged
   video shows its purge date instead of a link.
+- Once the Drive archive deleted a file, the Recording section links its Drive `webViewLink`
+  from `drive.json`, marked "on Google Drive". A link that does not start with
+  `https://drive.google.com/` is neither rendered nor opened. A stem kept only in `call.mp4`'s
+  mix gets no link of its own. A `meetingcapture://` link in a note not rewritten yet opens the
+  Drive copy when the local file is gone; a link to a mixed stem opens the video's copy and says
+  why. A debug report copies `drive.json` with its upload sessions redacted.
 - The app rewrites the Recording section when the call folder changes: at launch after
-  finalize, after a call's finalize, and for each folder the purge emptied. The rewrite uses the
-  stored notes and never calls the LLM, and a failed rewrite never marks the meeting failed. A
-  meeting that owes a step gets its own run instead. In a note the user edited, only the
-  Recording section is replaced, and the note still counts as edited. The rewrite skips a note
-  whose Recording section the user deleted or edited.
+  finalize, after a call's finalize, and for each folder the purge or the Drive archive
+  emptied. The rewrite uses the stored notes and never calls the LLM, and a failed rewrite never
+  marks the meeting failed. A meeting that owes a step gets its own run instead. In a note the
+  user edited, only the Recording section is replaced, and the note still counts as edited. The
+  rewrite skips a note whose Recording section the user deleted or edited.
 - `pipeline` also owns the settings file. The app and `mc` load settings through it, so both read
   the same TOML with the same validation.
+- `[drive]` names one Google Drive account with its own refresh token for the `drive.file`
+  scope, apart from the calendar accounts in `[google]`. Both use the same OAuth client, and
+  Google keeps one grant per account and client, so a token is revoked only when no other stored
+  token has its account. `pipeline::drive`
+  finds or creates folders under `root_folder`, uploads in resumable 8 MiB chunks, and downloads
+  through a temp file and a rename. An upload or download checks Drive's size and MD5. `mc drive` signs
+  the account in and moves single files. `pipeline::archive` moves a call folder's media to Drive
+  and back, as the audio and video section describes.
+- The settings window's "Media archive" section turns `[drive] enabled` on and sets
+  `root_folder`. Its account picker lists the calendar accounts and the Drive account. Picking
+  an account with no Drive token, or "Add another account…", runs the Drive sign-in with that
+  email as the login hint and stores the account and token in `[drive]`. A status line shows
+  the archive's tray line.
 
 ## Crate dependencies
 
@@ -526,7 +690,7 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 | stem-timing | 3 | The types `capture` and `stem-writer` share: stem, buffer stamp, ring losses, clock reading. Portable, no audio API | `serde` |
 | call-folder | 3 | The per-process lock on a call folder and the walk over `calls/`, shared by every capture process and repair. The media a person opens in a folder, the purge record, and the `meetingcapture://` media links the note writer builds and the app opens | std file locks, `serde` |
 | stem-writer | 3 | Write mic and remote stems as 16 kHz mono WAV placed by host time, fsynced every 4.5 s, and `audio.json` | `rubato` |
-| call-finalize | 3c | Place a call's video parts and stems on one timeline, mix the stems, write `call.mp4`. Purge call video after 90 days. The planning, mixing and purge are portable | Mac: AVFoundation via `cidre` |
+| call-finalize | 3c | Place a call's video parts and stems on one timeline, mix the stems, write `call.mp4`. Delete the fragments `call.mp4` holds after 1 hour, and call video after 90 days. The planning, mixing and purge are portable | Mac: AVFoundation via `cidre` |
 | stt | 4 | Transcribe a call's stems through one `SpeechToText` trait. Deepgram, optional Wispr Flow behind the `wispr` feature, local models later | `reqwest`; `h2`, `tokio`, `native-tls`, `uuid` under `wispr` |
 | video-capture | 3c | Record one window through ScreenCaptureKit, encode it with VideoToolbox, cut 2 s HLS fragments with AVAssetWriter, write `video.json`, repair dead segments. The writer and repair are portable | Mac: `cidre` |
 | telemetry | 3d | One subscriber for every binary: OpenTelemetry-shaped JSON lines into daily log files, trace ids derived from `call.id` and `meeting.id`, the flight recorder and its dumps, the panic hook. Portable. [Telemetry](10-telemetry.md) | `tracing-subscriber`, `sha2` |
@@ -543,9 +707,10 @@ Later crates attach in their phase: the app depends on `detect`, `capture-protoc
 - Media never goes into the vault.
 - Transcript text and model output are data. The note escapes both, so neither can add Markdown
   structure, wikilinks or section markers.
-- Secrets live in `settings.toml`: Google refresh tokens, the OAuth client secret, the LLM and
-  transcription API keys. The Wispr Flow provider stores no key; it borrows the desktop app's
-  session token at request time. The file is owner-only and stays out of the vault and git.
+- Secrets live in `settings.toml`: Google refresh tokens for calendar and Drive, the OAuth client
+  secret, the LLM and transcription API keys. The Wispr Flow provider stores no key; it borrows
+  the desktop app's session token at request time. The file is owner-only and stays out of the
+  vault and git.
 - Stored times are UTC.
 - Every binary logs through `telemetry::init`, never its own subscriber. A field takes its
   OpenTelemetry semantic convention name where one exists, such as `file.path`. Otherwise it takes

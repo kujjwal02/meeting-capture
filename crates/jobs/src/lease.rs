@@ -63,6 +63,9 @@ pub enum StepRetry {
     /// The step saved some of its work and stopped before the run's lease ran out. The next
     /// sweep resumes it, with no delay: nothing failed.
     Resume,
+    /// Another process holds what the step needs, such as a call's audio lock. The next sweep
+    /// tries again with no delay, and `extraction_attempts` counts such tries in a row.
+    WhenFree,
 }
 
 /// Which side of the link failed a step that waits for the network.
@@ -187,6 +190,19 @@ impl LeasedRun<'_> {
                     &Timestamp::now().as_millisecond(),
                 ],
             ),
+            StepRetry::WhenFree => {
+                let attempts = retry_schedule::tries_while_held(&self.meeting, failure) + 1;
+                self.release_leased(
+                    "failure = ?6, failure_kind = ?7, extraction_attempts = ?8,
+                        next_extraction_at_ms = ?9",
+                    &[
+                        &failure,
+                        &FailureKind::Resume.as_str(),
+                        &attempts,
+                        &Timestamp::now().as_millisecond(),
+                    ],
+                )
+            }
         }
     }
 
@@ -358,7 +374,7 @@ impl JobStore {
                                     "pipeline run waits for the network"
                                 );
                             }
-                            StepRetry::Resume => {
+                            StepRetry::Resume | StepRetry::WhenFree => {
                                 tracing::info!(
                                     exception.message = %error,
                                     "pipeline run resumes at the next sweep"

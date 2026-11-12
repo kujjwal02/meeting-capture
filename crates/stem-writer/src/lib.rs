@@ -22,7 +22,7 @@ pub use manifest::{
 };
 pub use repair::{FolderRepair, repair_folder, repair_under_lock};
 pub use track::StemProgress;
-pub use wav::{OutputLevel, SILENCE_DBFS};
+pub use wav::{OutputLevel, SILENCE_DBFS, STEM_WAV_HEADER_BYTES, stem_wav_header};
 
 use call_folder::FolderLock;
 use track::StemTrack;

@@ -1,9 +1,12 @@
 //! Renders a meeting note to a string. Only the template override is read from disk; the vault
 //! module writes the note.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
-use call_folder::media::{CallMedia, CallVideo, MediaLink, MediaTarget, StemSide};
+use call_folder::media::{
+    CallMedia, CallVideo, MediaLink, MediaTarget, StemSide, VIDEO_FILE_NAME, stem_of,
+};
 use jiff::tz::TimeZone;
 use jiff::{Timestamp, Zoned};
 use jobs::MeetingId;
@@ -43,6 +46,15 @@ pub(crate) struct CallRecording {
     /// The link to the folder itself; each file's link is built from it.
     pub folder_link: MediaLink,
     pub media: CallMedia,
+    /// The Drive copies of archived files no longer in the folder, by local name such as
+    /// `call.mp4` or `001-mic.wav`.
+    pub drive_copies: BTreeMap<String, DriveCopy>,
+}
+
+/// A file the Drive archive holds in place of the local one.
+pub(crate) struct DriveCopy {
+    pub web_view_link: String,
+    pub size_bytes: u64,
 }
 
 impl NoteInput<'_> {
@@ -443,12 +455,23 @@ struct RecordingPartView {
     label: Option<String>,
     mic_url: Option<String>,
     remote_url: Option<String>,
+    /// A link opens the Drive copy.
+    is_on_drive: bool,
+}
+
+/// One segment's stem links, local or on Drive.
+#[derive(Default)]
+struct PartLinks {
+    mic_url: Option<String>,
+    remote_url: Option<String>,
+    is_on_drive: bool,
 }
 
 fn recording_view(note: &NoteInput<'_>, recording: &CallRecording) -> RecordingView {
     let url = |target: MediaTarget| recording.folder_link.with_target(target).url();
-    let (video_url, video_length, video_purged_on) = match recording.media.video {
-        CallVideo::Kept { bytes } => (
+    let drive_video = recording.drive_copies.get(VIDEO_FILE_NAME);
+    let (video_url, video_length, video_purged_on) = match (recording.media.video, drive_video) {
+        (CallVideo::Kept { bytes }, _) => (
             Some(url(MediaTarget::Video)),
             Some(format!(
                 "{} min, {}",
@@ -457,7 +480,16 @@ fn recording_view(note: &NoteInput<'_>, recording: &CallRecording) -> RecordingV
             )),
             None,
         ),
-        CallVideo::Purged { purged_at } => (
+        (CallVideo::Purged { .. } | CallVideo::Missing, Some(copy)) => (
+            Some(copy.web_view_link.clone()),
+            Some(format!(
+                "{} min, {}, on Google Drive",
+                duration_min(note.transcript),
+                file_size_label(copy.size_bytes)
+            )),
+            None,
+        ),
+        (CallVideo::Purged { purged_at }, None) => (
             None,
             None,
             Some(
@@ -467,20 +499,41 @@ fn recording_view(note: &NoteInput<'_>, recording: &CallRecording) -> RecordingV
                     .to_string(),
             ),
         ),
-        CallVideo::Missing => (None, None, None),
+        (CallVideo::Missing, None) => (None, None, None),
     };
-    let has_parts = recording.media.audio_segments.len() > 1;
-    let stem_url = |number: u32, side: StemSide, is_present: bool| {
-        is_present.then(|| url(MediaTarget::Stem { number, side }))
-    };
-    let parts = recording
-        .media
-        .audio_segments
-        .iter()
-        .map(|segment| RecordingPartView {
-            label: has_parts.then(|| format!("Part {}", segment.number)),
-            mic_url: stem_url(segment.number, StemSide::Mic, segment.has_mic),
-            remote_url: stem_url(segment.number, StemSide::Remote, segment.has_remote),
+    let mut part_links: BTreeMap<u32, PartLinks> = BTreeMap::new();
+    for segment in &recording.media.audio_segments {
+        let links = part_links.entry(segment.number).or_default();
+        for (side, is_present) in [
+            (StemSide::Mic, segment.has_mic),
+            (StemSide::Remote, segment.has_remote),
+        ] {
+            if is_present {
+                links.set(
+                    side,
+                    url(MediaTarget::Stem {
+                        number: segment.number,
+                        side,
+                    }),
+                );
+            }
+        }
+    }
+    for (local_name, copy) in &recording.drive_copies {
+        if let Some((number, side)) = stem_of(local_name) {
+            let links = part_links.entry(number).or_default();
+            links.set(side, copy.web_view_link.clone());
+            links.is_on_drive = true;
+        }
+    }
+    let has_parts = part_links.len() > 1;
+    let parts = part_links
+        .into_iter()
+        .map(|(number, links)| RecordingPartView {
+            label: has_parts.then(|| format!("Part {number}")),
+            mic_url: links.mic_url,
+            remote_url: links.remote_url,
+            is_on_drive: links.is_on_drive,
         })
         .collect();
     RecordingView {
@@ -489,6 +542,15 @@ fn recording_view(note: &NoteInput<'_>, recording: &CallRecording) -> RecordingV
         video_purged_on,
         parts,
         folder_url: recording.folder_link.url(),
+    }
+}
+
+impl PartLinks {
+    fn set(&mut self, side: StemSide, url: String) {
+        match side {
+            StemSide::Mic => self.mic_url = Some(url),
+            StemSide::Remote => self.remote_url = Some(url),
+        }
     }
 }
 

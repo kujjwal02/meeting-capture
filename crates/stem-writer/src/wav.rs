@@ -158,6 +158,16 @@ pub(crate) fn data_bytes(samples: u64) -> Option<u32> {
         .filter(|bytes| bytes.checked_add(HEADER_BYTES).is_some())
 }
 
+/// The header length of every stem.
+pub const STEM_WAV_HEADER_BYTES: u32 = HEADER_BYTES;
+
+/// The header the stem writer puts on a stem holding `data_bytes` of samples, so a stem rebuilt
+/// from its samples is byte-identical to the one written.
+#[must_use]
+pub fn stem_wav_header(data_bytes: u32) -> [u8; HEADER_BYTES as usize] {
+    wav_header(data_bytes)
+}
+
 pub(crate) fn wav_header(data_bytes: u32) -> [u8; HEADER_BYTES as usize] {
     let byte_rate = OUTPUT_RATE_HZ * BYTES_PER_SAMPLE;
     let mut header = [0_u8; HEADER_BYTES as usize];

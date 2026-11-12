@@ -39,14 +39,16 @@ pub enum VideoFolderRepair {
     Repaired { segments: Vec<VideoSegmentRecord> },
 }
 
-/// Repairs the video segments of one call folder, unless its writer is alive.
+/// Repairs the video segments of one call folder, unless its writer is alive. A folder the
+/// Drive archive owns is left as it is.
 ///
 /// # Errors
 ///
 /// Fails when the folder or its lock cannot be read, or `video.json` is unreadable, from a newer
 /// schema or cannot be stored. `video.json` then stays as it was, so the next run tries again.
 pub fn repair_folder(folder: &Path) -> Result<VideoFolderRepair, VideoWriterError> {
-    if !has_video(folder)? {
+    // The archive owns the folder; a repair would rewrite what it recorded.
+    if call_folder::drive_record::is_archived(folder) || !has_video(folder)? {
         return Ok(VideoFolderRepair::Clean);
     }
     let lock =

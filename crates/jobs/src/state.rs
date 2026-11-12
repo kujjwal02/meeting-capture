@@ -151,8 +151,9 @@ pub enum FailureKind {
     /// and `extraction_attempts` counts the tries, since a waiting meeting owes its extraction
     /// too.
     NetworkWait,
-    /// A step saved part of its work and ran out of run time. `next_extraction_at_ms` holds the
-    /// time it stopped, so the next sweep runs it.
+    /// A step saved part of its work and ran out of run time, or another process held what it
+    /// needs. `next_extraction_at_ms` holds the time it stopped, so the next sweep runs it. For a
+    /// held resource, `extraction_attempts` counts the tries in a row.
     Resume,
 }
 
@@ -242,6 +243,13 @@ impl Meeting {
         self.finished_step < Step::Extracted
             || self.next_extraction_at.is_some()
             || (self.failure.is_some() && self.extraction_error.is_some())
+    }
+
+    /// Tries in a row, before the coming one, that stopped because another process held what the
+    /// step needs, with `failure` as their message.
+    #[must_use]
+    pub fn tries_while_held(&self, failure: &str) -> u32 {
+        crate::retry_schedule::tries_while_held(self, failure)
     }
 
     /// Whether the meeting, not failed, has a run due now: a pending transcript or a retry

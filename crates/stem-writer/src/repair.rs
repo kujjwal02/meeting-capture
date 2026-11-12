@@ -39,7 +39,8 @@ pub enum FolderRepair {
     Repaired { segments: Vec<SegmentRecord> },
 }
 
-/// Repairs one call folder, unless its writer is alive.
+/// Repairs one call folder, unless its writer is alive. A folder the Drive archive owns is
+/// left as it is.
 ///
 /// # Errors
 ///
@@ -47,6 +48,10 @@ pub enum FolderRepair {
 /// schema or cannot be stored. Then `audio.json` stays as it was, so the next run tries again. A
 /// stem file that cannot be repaired does not fail the folder: it is listed as skipped.
 pub fn repair_folder(folder: &Path) -> Result<FolderRepair, StemWriterError> {
+    // A repair would rewrite stems whose MD5 the archive recorded.
+    if call_folder::drive_record::is_archived(folder) {
+        return Ok(FolderRepair::Clean);
+    }
     let lock =
         FolderLock::try_take(folder, LOCK_FILE_NAME).map_err(|source| StemWriterError::Io {
             path: folder.join(LOCK_FILE_NAME),

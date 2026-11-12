@@ -549,6 +549,7 @@ impl CallDebug {
         for file_name in CAPTURE_RECORD_FILES {
             output.copy_json_document(&capture_folder.join(file_name), &folder.join(file_name))?;
         }
+        output.copy_drive_record(&capture_folder, &folder)?;
 
         if let Some(job) = &request.job {
             self.copy_job(&mut output, job, &folder)?;
@@ -1057,6 +1058,32 @@ impl ReportOutput {
         let document = serde_json::from_slice(&text)
             .unwrap_or_else(|_| serde_json::json!({ "unreadable_document_bytes": text.len() }));
         self.write_json_document(to, document)
+    }
+
+    // Copies `drive.json`, which says what of the call's media is on Drive and why a file is
+    // gone, without its upload sessions: each session URI grants its upload.
+    fn copy_drive_record(
+        &mut self,
+        capture_folder: &Path,
+        to_folder: &Path,
+    ) -> std::io::Result<()> {
+        let file_name = call_folder::drive_record::DRIVE_RECORD_FILE_NAME;
+        let text = match std::fs::read(capture_folder.join(file_name)) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let mut document = serde_json::from_slice::<serde_json::Value>(&text)
+            .unwrap_or_else(|_| serde_json::json!({ "unreadable_document_bytes": text.len() }));
+        if let Some(sessions) = document
+            .get_mut("pending_sessions")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for session in sessions.values_mut() {
+                *session = serde_json::Value::String("redacted".to_owned());
+            }
+        }
+        self.write_json_document(&to_folder.join(file_name), document)
     }
 
     fn write_json_document(

@@ -1,6 +1,6 @@
 //! The settings window: plain HTML in `ui/`, calling the commands here. It edits the settings
-//! file through `SettingsStore`. Google account, LLM, transcription, Slack and Meet changes apply
-//! at once; the rest after a restart.
+//! file through `SettingsStore`. Google account, LLM, transcription, Slack, Meet and media archive
+//! changes apply at once; the rest after a restart.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use pipeline::calendar::AccountStatus;
 use pipeline::google::{self, OAuthClient};
 use pipeline::llm::claude_code_auth;
-use pipeline::settings::{MeetSettings, ProviderKind, SettingsError, SettingsFile, SlackSettings};
+use pipeline::settings::{
+    DriveSettings, MeetSettings, ProviderKind, SettingsError, SettingsFile, SlackSettings,
+};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt as _;
@@ -47,7 +49,22 @@ pub(crate) struct SettingsView {
     transcription: TranscriptionView,
     slack: SlackSettings,
     meet: MeetSettings,
+    drive: DriveView,
     settings_file: PathBuf,
+}
+
+#[derive(Serialize)]
+pub(crate) struct DriveView {
+    enabled: bool,
+    account: Option<String>,
+    /// The view never carries the token, only whether one is stored.
+    has_token: bool,
+    root_folder: String,
+    default_root_folder: String,
+    /// The picker's accounts: the calendar accounts, then the Drive account when it is not one.
+    accounts: Vec<String>,
+    status: String,
+    is_problem: bool,
 }
 
 #[derive(Serialize)]
@@ -134,6 +151,14 @@ pub(crate) struct SettingsForm {
     slack_read_captions: bool,
     slack_auto_start_captions: bool,
     meet_hide_captions: bool,
+    drive: DriveForm,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct DriveForm {
+    enabled: bool,
+    /// Blank takes the default folder name. The account changes only through `drive_sign_in`.
+    root_folder: String,
 }
 
 #[derive(Serialize)]
@@ -167,7 +192,7 @@ impl SettingsForm {
         file.vault_dir = non_blank(&self.vault_dir).map(PathBuf::from);
         file.my_name = non_blank(&self.my_name);
         file.time_zone = non_blank(&self.time_zone);
-        file.google.set_client_id(non_blank(&self.client_id));
+        file.set_google_client_id(non_blank(&self.client_id));
         if let Some(client_secret) = non_blank(&self.client_secret) {
             file.google.client_secret = Some(client_secret);
         }
@@ -183,6 +208,9 @@ impl SettingsForm {
         file.slack.read_captions = self.slack_read_captions;
         file.slack.auto_start_captions = self.slack_auto_start_captions;
         file.meet.hide_captions = self.meet_hide_captions;
+        file.drive.enabled = self.drive.enabled;
+        file.drive.root_folder = non_blank(&self.drive.root_folder)
+            .unwrap_or_else(|| DriveSettings::default().root_folder);
     }
 
     fn apply_transcription_to(&self, file: &mut SettingsFile) {
@@ -231,6 +259,7 @@ pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, 
             needs_sign_in: account.needs_sign_in,
         })
         .collect();
+    let drive = drive_view(&state, &file);
     Ok(SettingsView {
         vault_dir: file.vault_dir,
         my_name: file.my_name,
@@ -242,8 +271,36 @@ pub(crate) fn settings_load(state: State<'_, AppState>) -> Result<SettingsView, 
         transcription,
         slack: file.slack,
         meet: file.meet,
+        drive,
         settings_file: state.settings.app_dirs().settings_file(),
     })
+}
+
+fn drive_view(state: &AppState, file: &SettingsFile) -> DriveView {
+    let mut accounts = file.google.accounts.clone();
+    if let Some(account) = &file.drive.account
+        && !accounts.contains(account)
+    {
+        accounts.push(account.clone());
+    }
+    let archive_status = state.drive_archive.status();
+    let status = if !file.drive.enabled {
+        "Off. Call media stays on this computer.".to_owned()
+    } else if file.drive.refresh_token.is_none() {
+        "Pick the Drive account and sign in to start.".to_owned()
+    } else {
+        archive_status.line()
+    };
+    DriveView {
+        enabled: file.drive.enabled,
+        account: file.drive.account.clone(),
+        has_token: file.drive.refresh_token.is_some(),
+        root_folder: file.drive.root_folder.clone(),
+        default_root_folder: DriveSettings::default().root_folder,
+        accounts,
+        status,
+        is_problem: file.drive.enabled && archive_status.is_problem(),
+    }
 }
 
 #[tauri::command]
@@ -267,6 +324,10 @@ pub(crate) fn settings_save(
         .map_err(|error| error.to_string())?;
     tracing::info!("settings saved");
     crate::tray::refresh(&app);
+    // Gated like the media purge: only the Mac records media to archive.
+    if cfg!(target_os = "macos") && form.drive.enabled {
+        crate::drive_archive::start_sweep(&app, crate::drive_archive::SweepTrigger::SettingsSaved);
+    }
     state.browser_calls.send_settings(state.settings.meet());
     revoke_in_background(change.tokens_to_revoke);
     let mut saved = "Saved.".to_owned();
@@ -434,4 +495,82 @@ fn remove_account(app: &AppHandle, email: &str) -> Result<(), String> {
         google::revoke(email, refresh_token);
     }
     Ok(())
+}
+
+/// Signs the Drive account in for the `drive.file` scope and stores its token. `email` is the
+/// picked account, passed to Google as the login hint; `None` for "Add another account".
+#[tauri::command]
+pub(crate) async fn drive_sign_in(app: AppHandle, email: Option<String>) -> Result<String, String> {
+    // Sign-in blocks on the browser for up to 5 minutes.
+    tauri::async_runtime::spawn_blocking(move || sign_in_drive(&app, email.as_deref()))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn sign_in_drive(app: &AppHandle, login_hint: Option<&str>) -> Result<String, String> {
+    let state = app.state::<AppState>();
+    let file = state.settings.read().map_err(|error| error.to_string())?;
+    let client = OAuthClient::from_settings(&file.google)
+        .map_err(|error| error.to_string())?
+        .ok_or("save a Google client ID first")?;
+    let signed_in = google::sign_in_for_drive(&client, login_hint, |auth_url| {
+        app.opener()
+            .open_url(auth_url, None::<&str>)
+            .map_err(|error| error.to_string())
+    })
+    .map_err(|error| {
+        tracing::error!(exception.message = %error, "Drive sign-in failed");
+        error.to_string()
+    })?;
+
+    // The edit reads the file again: it may have changed during the minutes in the browser.
+    let email = signed_in.email;
+    let refresh_token = signed_in.refresh_token;
+    let edited = state.settings.edit(|file| {
+        // The token belongs to the client that signed in, and fails with any other.
+        if file.google.client_id() != Some(client.client_id.as_str()) {
+            return Err(SettingsError::GoogleClientChangedDuringSignIn);
+        }
+        file.drive.account = Some(email.clone());
+        file.drive.refresh_token = Some(refresh_token.clone());
+        Ok(())
+    });
+    let change = match edited {
+        Ok(change) => change,
+        Err(error) => {
+            revoke_unsaved_drive_token(app, &client, &email, &refresh_token);
+            return Err(error.to_string());
+        }
+    };
+    // Holds the old Drive account's token only when no calendar token shares its grant.
+    revoke_in_background(change.tokens_to_revoke);
+    tracing::info!(user.email = email, "Drive account signed in");
+    crate::tray::refresh(app);
+    if cfg!(target_os = "macos") {
+        crate::drive_archive::start_sweep(app, crate::drive_archive::SweepTrigger::SignedIn);
+    }
+    Ok(email)
+}
+
+// A token the file never took would stay valid at Google. A stored token of the same account and
+// client shares its grant, and the revoke would end that one too.
+fn revoke_unsaved_drive_token(
+    app: &AppHandle,
+    client: &OAuthClient,
+    email: &str,
+    refresh_token: &str,
+) {
+    match app.state::<AppState>().settings.read() {
+        Ok(file)
+            if file.google.client_id() != Some(client.client_id.as_str())
+                || !file.has_token_for(email) =>
+        {
+            google::revoke(email, refresh_token);
+        }
+        Ok(_) => {}
+        Err(error) => tracing::error!(
+            exception.message = %error,
+            "could not read the settings to revoke the unsaved Drive grant"
+        ),
+    }
 }

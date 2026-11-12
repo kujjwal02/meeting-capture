@@ -15,7 +15,7 @@ Each phase ends with a check on real calls. Estimates are evenings of about 3 ho
 | 4 | STT fallback | `stt` crate with one provider trait. Deepgram transcribes the 5-minute windows of a call whose captions are empty, sparse, failed, in another language or garbled, as Opus with silences cut, one request at a time, and waits out a poor network. Local models come later as more providers | A Meet call with captions off and a Hinglish call each get a Deepgram transcript; a call with good English captions and a rerun make no Deepgram request | 4 |
 | 5 | Windows capture | WASAPI loopback, mic | Phase 3 checks pass on the PC | 4 |
 | 6 | Extra sources | Soniox routing, dropped audio files, calendar from a secret iCal address | A Hinglish call gets a Soniox transcript; an iCal address matches a call with no Google sign-in | 3 |
-| 7 | Recording | Audio and video archive, Drive folder | Video and audio for 3 calls land in the Drive folder, none in the vault | 2 |
+| 7 | Recording | Audio and video archive, Drive folder. Delivered: `drive.json`, `mc archive` and `mc restore`, the app's hourly sweep, its tray line and settings section, notes that link the Drive copies, and reruns from the saved replies once the stems are gone. Open: recording consent | Video and audio for 3 calls land in the Drive folder, none in the vault | 2 |
 | 8 | Hardening | Tests, model download with checksum, commitment review | Two weeks without a lost meeting | 4 |
 
 Phase 1 took Meet captions from TranscripTonic's webhook. Phase 1b replaced it with mc-meet,

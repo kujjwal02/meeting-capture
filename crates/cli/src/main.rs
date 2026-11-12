@@ -1,6 +1,8 @@
 //! `mc`: reruns pipeline steps without the tray app, and reads saved debug reports.
 
+mod archive;
 mod debug;
+mod drive;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -77,6 +79,22 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         limit: u32,
     },
+    /// Upload a call folder's media to the Drive account's folder, then delete the local copy
+    /// once every upload is verified: `call.mp4` and the WAV stems, or each stem as FLAC when
+    /// the call has no `call.mp4`. `mc` does not see the app's open calls; a call counts as
+    /// ended an hour after its last capture file changed.
+    Archive(archive::ArchiveArgs),
+    /// Download a call folder's archived media from Drive back into it. A stem is written only
+    /// when it rebuilds the original WAV byte for byte.
+    Restore {
+        /// A call folder name or a meeting ID.
+        call: String,
+    },
+    /// Sign in to Google Drive, and upload or download a file.
+    Drive {
+        #[command(subcommand)]
+        command: drive::DriveCommand,
+    },
     /// Read a saved debug report.
     Debug {
         #[command(subcommand)]
@@ -105,6 +123,11 @@ fn main() -> anyhow::Result<()> {
         panic_dump_dir: Some(app_dirs.call_debug_dir()),
     })?;
     let settings_store = Arc::new(SettingsStore::new(app_dirs.clone()));
+    // Drive needs only the settings file, not the vault or the job store.
+    let command = match command {
+        Command::Drive { command } => return drive::run(command, &settings_store),
+        command => command,
+    };
     let pipeline = Pipeline::open(Arc::clone(&settings_store))?;
 
     let time_zone = pipeline.settings().time_zone.clone();
@@ -159,13 +182,9 @@ fn main() -> anyhow::Result<()> {
             let prompt = pipeline.extraction_prompt(MeetingId::new(meeting_id))?;
             if print_prompt {
                 print!("{}", prompt.render());
-                return Ok(());
+            } else {
+                print_extraction(&settings_store, &app_dirs, &prompt, reply, provider, model)?;
             }
-            let checked = match reply {
-                Some(reply_file) => check_saved_reply(&prompt, &reply_file)?,
-                None => extract(&settings_store, &app_dirs, &prompt, provider, model)?,
-            };
-            println!("{}", serde_json::to_string_pretty(&checked)?);
         }
         Command::Sweep => {
             pipeline.sweep(|id, outcome| {
@@ -177,12 +196,15 @@ fn main() -> anyhow::Result<()> {
                 }
             })?;
         }
+        Command::Archive(args) => archive::run(&pipeline, &settings_store, args)?,
+        Command::Restore { call } => archive::restore(&pipeline, &settings_store, &call)?,
         Command::List { limit } => {
             for meeting in pipeline.store().recent(limit)? {
                 print_meeting(&meeting, &time_zone);
             }
         }
         Command::Debug { command } => return debug::run(command),
+        Command::Drive { command } => return drive::run(command, &settings_store),
     }
     Ok(())
 }
@@ -202,6 +224,23 @@ impl From<InputKindArg> for InputKind {
             InputKindArg::BrowserCallLog => InputKind::BrowserCallLog,
         }
     }
+}
+
+/// Checks the saved reply, or calls the LLM, and prints the checked notes.
+fn print_extraction(
+    settings_store: &SettingsStore,
+    app_dirs: &AppDirs,
+    prompt: &Prompt,
+    reply: Option<PathBuf>,
+    provider: Option<ProviderArg>,
+    model: Option<String>,
+) -> anyhow::Result<()> {
+    let checked = match reply {
+        Some(reply_file) => check_saved_reply(prompt, &reply_file)?,
+        None => extract(settings_store, app_dirs, prompt, provider, model)?,
+    };
+    println!("{}", serde_json::to_string_pretty(&checked)?);
+    Ok(())
 }
 
 /// Calls the LLM in settings, or the provider and model given instead.

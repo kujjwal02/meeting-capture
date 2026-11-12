@@ -55,6 +55,9 @@ enum RecordedRun {
     Started,
     Written {
         skipped_video: Vec<SkippedVideo>,
+        /// `call.mp4`'s length when the run wrote it. Records from before it was kept have none.
+        #[serde(default)]
+        call_file_bytes: Option<u64>,
     },
     NoVideo {
         skipped_video: Vec<SkippedVideo>,
@@ -103,8 +106,10 @@ fn file_stamp(path: &Path) -> Result<Option<FileStamp>, FinalizeError> {
 /// Where the folder's finalize stands against its manifests now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FinalizeStanding {
-    /// `call.mp4` is written from the current manifests, or they hold no video to place.
-    Succeeded,
+    /// `call.mp4` is written from the current manifests and is still there.
+    Written,
+    /// The current manifests hold no video to place.
+    NoVideo,
     /// A run is due: none yet, a manifest changed since, `call.mp4` is gone, or a failed or
     /// killed run has a retry left.
     Pending,
@@ -128,10 +133,10 @@ pub(crate) fn finalize_standing(folder: &Path) -> FinalizeStanding {
     }
     match record.run {
         RecordedRun::Written { .. } if folder.join(OUTPUT_FILE_NAME).exists() => {
-            FinalizeStanding::Succeeded
+            FinalizeStanding::Written
         }
         RecordedRun::Written { .. } => FinalizeStanding::Pending,
-        RecordedRun::NoVideo { .. } => FinalizeStanding::Succeeded,
+        RecordedRun::NoVideo { .. } => FinalizeStanding::NoVideo,
         RecordedRun::Started | RecordedRun::Failed { .. }
             if record.attempt_count < MAX_ATTEMPTS =>
         {
@@ -148,19 +153,40 @@ pub(crate) fn recorded_skipped_video(folder: &Path) -> Option<Vec<SkippedVideo>>
     let record =
         read_record(folder).filter(|record| record.schema_version == SKIP_LIST_SCHEMA_VERSION)?;
     match record.run {
-        RecordedRun::Written { skipped_video } | RecordedRun::NoVideo { skipped_video } => {
+        RecordedRun::Written { skipped_video, .. } | RecordedRun::NoVideo { skipped_video } => {
             Some(skipped_video)
         }
         RecordedRun::Started | RecordedRun::Failed { .. } => None,
     }
 }
 
+/// What the last finished run recorded of `call.mp4`'s length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedCallFile {
+    Bytes(u64),
+    /// The record predates lengths, so only a non-empty file counts as written.
+    Unrecorded,
+}
+
+/// `call.mp4`'s length as the last written run recorded it. `None` when the record is missing,
+/// unreadable, of another schema version, or not of a written run.
+pub(crate) fn recorded_call_file(folder: &Path) -> Option<RecordedCallFile> {
+    match read_record(folder)?.run {
+        RecordedRun::Written {
+            call_file_bytes, ..
+        } => Some(call_file_bytes.map_or(RecordedCallFile::Unrecorded, RecordedCallFile::Bytes)),
+        RecordedRun::Started | RecordedRun::NoVideo { .. } | RecordedRun::Failed { .. } => None,
+    }
+}
+
 /// Whether the folder has video that `call.mp4` does not hold yet, and no finished or failed
-/// run on the same manifests. A folder whose video the purge deleted has none to finalize.
+/// run on the same manifests. A folder whose video the purge deleted, or whose media the
+/// archive owns, has none to finalize.
 #[must_use]
 pub fn needs_finalize(folder: &Path) -> bool {
     if !folder.join(video_capture::MANIFEST_FILE_NAME).exists()
         || crate::purge::has_purge_record(folder)
+        || call_folder::drive_record::is_archived(folder)
     {
         return false;
     }
@@ -175,14 +201,17 @@ pub(crate) fn write_started(folder: &Path, inputs: &InputStamp) -> Result<(), Fi
     write_record(folder, *inputs, attempt_count, RecordedRun::Started)
 }
 
-/// Busy, Recording and Purged never reach here: those runs read no media.
+/// Busy, Recording, Purged and Archived never reach here: those runs read no media.
 pub(crate) fn write_finished(
     folder: &Path,
     inputs: &InputStamp,
     outcome: &FinalizeOutcome,
 ) -> Result<(), FinalizeError> {
     let run = match outcome {
-        FinalizeOutcome::Busy | FinalizeOutcome::Recording | FinalizeOutcome::Purged => {
+        FinalizeOutcome::Busy
+        | FinalizeOutcome::Recording
+        | FinalizeOutcome::Purged
+        | FinalizeOutcome::Archived => {
             return Ok(());
         }
         FinalizeOutcome::NoVideo { skipped } => RecordedRun::NoVideo {
@@ -190,6 +219,14 @@ pub(crate) fn write_finished(
         },
         FinalizeOutcome::Written(summary) => RecordedRun::Written {
             skipped_video: skipped_video(&summary.skipped),
+            call_file_bytes: Some(
+                std::fs::metadata(&summary.file)
+                    .map_err(|source| FinalizeError::Io {
+                        path: summary.file.clone(),
+                        source,
+                    })?
+                    .len(),
+            ),
         },
         FinalizeOutcome::Failed { message } => RecordedRun::Failed {
             message: message.clone(),

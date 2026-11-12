@@ -109,6 +109,17 @@ pub(crate) fn after_network_failure(
     }
 }
 
+/// Tries in a row before this one that stopped on the same held resource as `failure`. Each
+/// such try is stored as a resume with the same message, so a resume of another cause, a success
+/// or another failure starts the count again.
+pub(crate) fn tries_while_held(meeting: &Meeting, failure: &str) -> u32 {
+    meeting
+        .failure
+        .as_ref()
+        .filter(|cause| cause.kind == crate::FailureKind::Resume && cause.message == failure)
+        .map_or(0, |_| meeting.extraction_attempts)
+}
+
 // `MEETING_CAPTURE_RETRY_DELAY_S` replaces every delay, so a dev run sees the whole schedule in
 // minutes.
 fn retry_delay(attempts: u32) -> Option<Duration> {

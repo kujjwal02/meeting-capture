@@ -13,6 +13,7 @@ mod call_metrics;
 mod call_status;
 mod calls;
 mod debug_mode;
+mod drive_archive;
 mod finished_logs;
 mod host_metrics;
 mod host_power;
@@ -48,6 +49,7 @@ pub(crate) struct AppState {
     pub call_capture: call_capture::CallCapture,
     pub call_debug: call_debug::CallDebug,
     pub debug_mode: debug_mode::AppDebugMode,
+    pub drive_archive: drive_archive::DriveArchive,
     pub updates: updates::Updates,
 }
 
@@ -134,6 +136,7 @@ fn run_tray_app() -> tauri::Result<()> {
             settings_window::google_account_add,
             settings_window::google_account_remove,
             settings_window::claude_code_check,
+            settings_window::drive_sign_in,
         ])
         .setup(|app| {
             // Tauri panics on a setup error, and a login item has no terminal, so the log is the
@@ -185,15 +188,17 @@ fn setup(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         settings_store.meet(),
     );
     let call_debug = call_debug::CallDebug::new(settings_store.app_dirs());
+    let open_calls_file = pipeline::archive::OpenCallsFile::new(settings_store.app_dirs());
     app.manage(AppState {
         pipeline: pipeline.clone(),
         pipeline_error,
         settings: settings_store,
         browser_calls,
-        calls: calls::Calls::new(detector_lines),
+        calls: calls::Calls::new(detector_lines, open_calls_file),
         call_capture: call_capture::CallCapture::new(),
         call_debug,
         debug_mode: debug_mode::AppDebugMode::new(file_level),
+        drive_archive: drive_archive::DriveArchive::new(),
         updates: updates::Updates::default(),
     });
     // Before the tray and the helpers, so they start in the stored mode.

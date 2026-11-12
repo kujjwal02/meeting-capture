@@ -149,6 +149,12 @@ impl AppDirs {
         self.data_dir.join("calls")
     }
 
+    /// The call folders the app holds open, for `mc archive` to leave alone.
+    #[must_use]
+    pub fn open_calls_file(&self) -> PathBuf {
+        self.data_dir.join("open-calls.json")
+    }
+
     /// The empty working folder for Claude Code, so it reads no project files.
     #[must_use]
     pub fn claude_code_dir(&self) -> PathBuf {
