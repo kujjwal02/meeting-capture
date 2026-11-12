@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 use directories::UserDirs;
 use jiff::tz::TimeZone;
 
-use super::{LlmSettings, ProviderKind, SettingsError, SettingsFile, TranscriptionSettings};
+use super::{
+    DriveSettings, LlmSettings, ProviderKind, SettingsError, SettingsFile, TranscriptionSettings,
+};
 
 /// The settings that apply at launch. LLM, transcription, Google, Slack and Meet settings change
 /// while the app runs, so `SettingsStore` holds them instead.
@@ -61,6 +63,7 @@ impl Settings {
         }
         file.llm.validate()?;
         file.transcription.validate()?;
+        file.drive.validate()?;
         file.debug.mode()?;
         Ok(Self {
             vault_dir,
@@ -72,6 +75,31 @@ impl Settings {
     #[must_use]
     pub fn meetings_dir(&self) -> PathBuf {
         self.vault_dir.join(Path::new("areas").join("meetings"))
+    }
+}
+
+impl DriveSettings {
+    /// # Errors
+    ///
+    /// Returns `SettingsError` naming the first invalid `drive` field.
+    pub fn validate(&self) -> Result<(), SettingsError> {
+        if let Some(email) = &self.account
+            && !email.contains('@')
+        {
+            return Err(SettingsError::DriveAccount {
+                email: email.clone(),
+            });
+        }
+        if self.refresh_token.is_some() && self.account.is_none() {
+            return Err(SettingsError::DriveTokenWithoutAccount);
+        }
+        // A '/' would read as a nested path to the user, but Drive takes it as part of one name.
+        if self.root_folder.trim().is_empty() || self.root_folder.contains('/') {
+            return Err(SettingsError::DriveRootFolder {
+                name: self.root_folder.clone(),
+            });
+        }
+        Ok(())
     }
 }
 

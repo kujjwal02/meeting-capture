@@ -200,6 +200,14 @@ fn close_writer(
         ))
         .map_err(|exception| mp4_error(exception_reason(exception)))?;
     finish(writer).map_err(mp4_error)?;
+    // On disk before the rename, so a power cut never leaves a short `call.mp4` that the
+    // fragment cleanup would trust.
+    File::open(partial)
+        .and_then(|handle| handle.sync_all())
+        .map_err(|source| FinalizeError::Io {
+            path: partial.to_owned(),
+            source,
+        })?;
     std::fs::rename(partial, output).map_err(|source| FinalizeError::Io {
         path: output.to_owned(),
         source,

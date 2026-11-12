@@ -35,7 +35,9 @@
 //! Recording list, so without this ask every huddle recorded audio only.
 //!
 //! At launch, after repair and finalize, and then once a day, `mc-capture purge-media` deletes
-//! the video of calls that ended more than 90 days ago. The stems stay for transcription.
+//! the video of calls that ended more than 90 days ago. The stems stay for transcription. At
+//! launch and then every hour, `mc-capture delete-finalized-fragments` deletes the video
+//! fragments `call.mp4` holds, an hour after the call, and the Drive archive sweep follows it.
 
 mod meet_shortcut;
 mod restart_backoff;
@@ -48,7 +50,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use capture_protocol::finalize::{
-    FinalizeOutcome, MEDIA_PURGE_INTERVAL, MediaPurge, PendingFinalize,
+    FinalizeOutcome, FragmentCleanup, MEDIA_PURGE_INTERVAL, MediaPurge, PendingFinalize,
 };
 use capture_protocol::{
     AudioCommand, AudioErrorKind, AudioReport, MicMoment, PermissionAnswer, PermissionService,
@@ -90,13 +92,15 @@ const FINALIZE_LIMIT: Duration = Duration::from_mins(20);
 const PENDING_LIST_LIMIT: Duration = Duration::from_secs(60);
 /// A capture process that outlived its call closes its segment within seconds of its stop.
 const RECORDING_RETRY_DELAY: Duration = Duration::from_secs(30);
-/// The purge reads a few file times per folder and unlinks at most a few thousand fragments.
+/// The purge and the fragment cleanup read a few file times per folder and unlink at most a few
+/// thousand fragments.
 const PURGE_LIMIT: Duration = Duration::from_mins(10);
 
 /// The request returns as soon as macOS has filed the ask; the dialog itself outlives the helper.
 const PERMISSION_REQUEST_LIMIT: Duration = Duration::from_secs(30);
 /// The purge interval is time on the wall clock, not the monotonic one, which stops while the
-/// Mac sleeps: a laptop asleep every night would otherwise purge every few days.
+/// Mac sleeps: a laptop asleep every night would otherwise purge every few days. The fragment
+/// cleanup runs at each check.
 const PURGE_CHECK_INTERVAL: Duration = Duration::from_hours(1);
 /// The helper's stderr file moves to `mc-capture-stderr.log.1` at a start once it is this big.
 const SIDECAR_STDERR_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
@@ -528,7 +532,8 @@ fn set_recording_stopped(app: &AppHandle, call_id: &Path, is_stopped: bool) {
 
 /// Starts the supervisor. Call before any call source starts, so it hears every call. Also
 /// repairs, in the background, the segments a dead helper left open in any call folder, then
-/// writes the `call.mp4` a crash or a quit left unwritten, then purges old video now and daily.
+/// writes the `call.mp4` a crash or a quit left unwritten, then purges old video now and daily,
+/// and the fragments `call.mp4` holds now and hourly.
 pub(crate) fn start(app: &AppHandle) {
     let state = app.state::<AppState>();
     let app_dirs = state.settings.app_dirs();
@@ -566,7 +571,7 @@ pub(crate) fn start(app: &AppHandle) {
         }
         if cfg!(target_os = "macos") {
             // After finalize, so a folder that waited for its `call.mp4` has it by now.
-            purge_media_daily(&launch_app, &calls_dir, &helper_logs).await;
+            delete_media_on_schedule(&launch_app, &calls_dir, &helper_logs).await;
         }
     });
     let stop_changes = state
@@ -685,25 +690,86 @@ async fn finalize_pending(calls_dir: &Path, helper_logs: &HelperLogs) {
 }
 
 /// Runs the purge now, then whenever a day has passed on the wall clock, and marks the purged
-/// video in each call's note. Never returns.
-async fn purge_media_daily(app: &AppHandle, calls_dir: &Path, helper_logs: &HelperLogs) {
+/// video in each call's note. Runs the fragment cleanup now and at every check. Never returns.
+async fn delete_media_on_schedule(app: &AppHandle, calls_dir: &Path, helper_logs: &HelperLogs) {
+    let mut last_purge: Option<SystemTime> = None;
     loop {
-        let purged_folders = purge_media(calls_dir, helper_logs).await;
-        if !purged_folders.is_empty() {
-            refresh_note_recordings(app, purged_folders).await;
-        }
-        let last_run = SystemTime::now();
-        loop {
-            tokio::time::sleep(PURGE_CHECK_INTERVAL).await;
-            // A clock set back waits until it passes the last run again.
-            let is_due = SystemTime::now()
-                .duration_since(last_run)
-                .is_ok_and(|elapsed| elapsed >= MEDIA_PURGE_INTERVAL);
-            if is_due {
-                break;
+        // A clock set back waits until it passes the last purge again.
+        let is_purge_due = last_purge.is_none_or(|last_purge| {
+            SystemTime::now()
+                .duration_since(last_purge)
+                .is_ok_and(|elapsed| elapsed >= MEDIA_PURGE_INTERVAL)
+        });
+        if is_purge_due {
+            let purged_folders = purge_media(calls_dir, helper_logs).await;
+            if !purged_folders.is_empty() {
+                refresh_note_recordings(app, purged_folders).await;
             }
+            last_purge = Some(SystemTime::now());
+        }
+        delete_finalized_fragments(app, calls_dir, helper_logs).await;
+        // After the cleanup, which an archived folder no longer gets. On its own task, so an
+        // upload of hours never holds up the next purge or cleanup.
+        crate::drive_archive::start_sweep(app, crate::drive_archive::SweepTrigger::HourlyCheck);
+        tokio::time::sleep(PURGE_CHECK_INTERVAL).await;
+    }
+}
+
+/// Deletes the video fragments `call.mp4` holds through the helper's
+/// `delete-finalized-fragments`. The helper logs each deletion in the helper log; the app logs
+/// the totals. Notes link `call.mp4` and the stems, never a fragment, so none changes.
+///
+/// Every call the call book holds open keeps its fragments, recorded or stopped: a resumed
+/// segment makes finalize read them all again, however long the folder sat idle.
+async fn delete_finalized_fragments(app: &AppHandle, calls_dir: &Path, helper_logs: &HelperLogs) {
+    let open_call_folders = open_call_folders(app, calls_dir);
+    let mut args: Vec<&std::ffi::OsStr> = vec![
+        "delete-finalized-fragments".as_ref(),
+        "--calls-dir".as_ref(),
+        calls_dir.as_os_str(),
+    ];
+    for folder in &open_call_folders {
+        args.push("--keep".as_ref());
+        args.push(folder.as_os_str());
+    }
+    let run = run_helper(&args, helper_logs, PURGE_LIMIT).await;
+    match run.map(|stdout| serde_json::from_str::<FragmentCleanup>(stdout.trim())) {
+        Ok(Ok(cleanup)) => tracing::info!(
+            file.directory = %calls_dir.display(),
+            purge.cleaned_folder_count = cleanup.cleaned.len(),
+            purge.deleted_file_count = cleanup
+                .cleaned
+                .iter()
+                .map(|call| call.deleted_file_count)
+                .sum::<u64>(),
+            purge.deleted_bytes = cleanup
+                .cleaned
+                .iter()
+                .map(|call| call.deleted_bytes)
+                .sum::<u64>(),
+            "fragments.cleanup_finished"
+        ),
+        Ok(Err(error)) => {
+            tracing::error!(exception.message = %error, "fragments.cleanup_unreadable");
+        }
+        Err(reason) => {
+            tracing::error!(
+                exception.message = reason,
+                "fragments.cleanup_helper_failed"
+            );
         }
     }
+}
+
+/// The folders of the calls the call book holds open, recorded or stopped. The fragment cleanup
+/// and the Drive archive leave them alone.
+pub(crate) fn open_call_folders(app: &AppHandle, calls_dir: &Path) -> Vec<PathBuf> {
+    app.state::<AppState>()
+        .calls
+        .open_calls()
+        .iter()
+        .map(|call| calls_dir.join(call_folder_name(&call.id)))
+        .collect()
 }
 
 /// Asks macOS for Screen Recording through the helper's `request-screen-recording`, so the app
@@ -860,6 +926,11 @@ async fn finalize_once(folder: &Path, helper_logs: &HelperLogs) -> Option<Finali
             file.directory = %folder.display(),
             finalize.outcome = outcome.as_str(),
             finalize.skipped_count = skipped.len(),
+            "finalize.finished"
+        ),
+        FinalizeOutcome::Archived => tracing::info!(
+            file.directory = %folder.display(),
+            finalize.outcome = outcome.as_str(),
             "finalize.finished"
         ),
         FinalizeOutcome::Busy | FinalizeOutcome::Recording | FinalizeOutcome::Purged => {
@@ -1393,7 +1464,7 @@ fn spawn_process<P: CaptureProcess>(
 
 /// The call folder's name: the call log's file name without its extension, which is unique per
 /// call.
-fn call_folder_name(call_id: &Path) -> String {
+pub(crate) fn call_folder_name(call_id: &Path) -> String {
     call_id.file_stem().map_or_else(
         || "call".to_owned(),
         |stem| stem.to_string_lossy().into_owned(),

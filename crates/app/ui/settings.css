@@ -89,7 +89,8 @@ footer {
 }
 
 #message.error,
-#claude-code-status.error {
+#claude-code-status.error,
+#drive-status.error {
   color: #c0392b;
 }
 

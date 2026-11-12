@@ -1,12 +1,14 @@
 //! One call stream from every call source: each source reports when a call opens and ends, and
 //! this logs `call.started`, `call.resumed` and `call.ended` and broadcasts them. The status
-//! board hears the same opens and ends, so it never sees a call the stream has not.
+//! board hears the same opens and ends, so it never sees a call the stream has not. Each open
+//! and end also rewrites `open-calls.json`, which `mc archive` reads to leave those calls alone.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use capture_protocol::WindowHint;
+use pipeline::archive::OpenCallsFile;
 use sources::browser_call::EndReason;
 use tokio::sync::broadcast;
 
@@ -68,6 +70,7 @@ pub(crate) struct Calls {
     tally: Mutex<CallTally>,
     sender: broadcast::Sender<CallEvent>,
     status: CallBoard,
+    open_calls_file: OpenCallsFile,
 }
 
 #[derive(Default)]
@@ -80,12 +83,16 @@ struct CallTally {
 
 impl Calls {
     /// `detector_lines` is the queue the telemetry tap fills for the status board.
-    pub fn new(detector_lines: Arc<detectors::LineQueue>) -> Self {
-        Self {
+    /// Writes an empty `open-calls.json`: a list a quit left names no call open now.
+    pub fn new(detector_lines: Arc<detectors::LineQueue>, open_calls_file: OpenCallsFile) -> Self {
+        let calls = Self {
             tally: Mutex::new(CallTally::default()),
             sender: broadcast::channel(EVENT_BACKLOG).0,
             status: CallBoard::new(detector_lines),
-        }
+            open_calls_file,
+        };
+        calls.write_open_calls(&calls.lock());
+        calls
     }
 
     /// Each open call's state, and the calls that ended in this run.
@@ -126,6 +133,7 @@ impl Calls {
             Moment::now(),
         );
         tally.open.insert(call.id.clone(), call.clone());
+        self.write_open_calls(&tally);
         let event = if tally.ended.remove(id) {
             CallEvent::Resumed(call)
         } else {
@@ -162,6 +170,7 @@ impl Calls {
             return;
         };
         tally.ended.insert(call.id.clone());
+        self.write_open_calls(&tally);
         self.status.end(id, Moment::now());
         self.publish(CallEvent::Ended { call, reason });
     }
@@ -179,6 +188,19 @@ impl Calls {
                 call,
                 reason: CallEndReason::AppRestarted,
             });
+        }
+    }
+
+    /// Under the tally's lock, so two changes cannot land in the file swapped.
+    fn write_open_calls(&self, tally: &CallTally) {
+        let call_folder_names = tally
+            .open
+            .keys()
+            .map(|id| crate::call_capture::call_folder_name(id))
+            .collect();
+        if let Err(error) = self.open_calls_file.write(call_folder_names) {
+            // `mc archive` then sees an older list; the capture locks still keep a call that records.
+            tracing::warn!(exception.message = %error, "open_calls.not_written");
         }
     }
 

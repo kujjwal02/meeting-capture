@@ -308,7 +308,8 @@ Done when:
   placement by browser UTC is code only.
 - [x] One video track for parts of different sizes or codecs: a differing part is encoded again in
   the first part's codec and size, letterboxed.
-- [ ] Delete fragments after a good finalize.
+- [x] Delete fragments after a good finalize: one hour after the call, so a Meet rejoin still
+  finalizes from them. Code only.
 - [x] 90-day purge of call media: `call.mp4` and the video fragments of calls that ended over 90
   days ago, only after a finalize succeeded, never the stems. Run on synthetic call folders
   only: it kept a young folder, a locked one, one with no `finalize.json`, one with a retry left,
@@ -498,6 +499,29 @@ Done when:
 ## Phase 7: recording
 
 - [ ] Audio archive and a Drive folder for media. No media in the vault.
+- [x] `drive.json`, `mc archive` and `mc restore`: a call folder's `call.mp4` with its unmixed
+  stems, or all its stems, goes to Drive as FLAC where a stem, and the local copy goes once every
+  upload is verified. Finalize, repair, the purge and the fragment cleanup skip an archived
+  folder. FLAC round trip byte-identical on synthetic stems only; no real upload yet.
+- [ ] Kill `mc archive` mid-deletion; the next run deletes what is left and uploads nothing.
+- [ ] A restored folder keeps its files for 7 days, then `mc archive` deletes them with no upload.
+- [ ] Archive a real call with video and one without on a signed-in Drive, then restore both:
+  the restored stems match their recorded MD5.
+- [ ] Quit `mc archive` mid-upload; the next run resumes the upload and makes no second copy.
+- [ ] At a real launch, finalize, repair, the purge and the fragment cleanup leave an archived
+  folder alone.
+- [x] The app's sweep archives on a schedule and passes its open calls: hourly after the
+  fragment cleanup and when a note is written, one sweep at a time, paused by a full Drive or a
+  Drive sign-in until the next hourly check. Built only; not run against a real Drive.
+- [x] Tray line for the archive, amber when Drive is full, needs a sign-in or the sweep failed.
+- [x] Settings "Media archive" section: enable, Drive account picker with sign-in, root folder,
+  status line.
+- [x] Notes link the Drive copy of each deleted file; `meetingcapture://` links open it when the
+  local file is gone.
+- [x] A rerun after the stems are archived reuses the saved replies and sends nothing;
+  `mc transcribe` asks for `mc restore` first, or says only the mixed recording remains.
+- [ ] Turn the archive on in the app with a real Drive account: a call past its hour archives,
+  its note links Drive, and a rerun keeps the speech transcript.
 - [ ] Recording consent: the tray shows recording state; a per-client "never record" list.
 
 Done when:

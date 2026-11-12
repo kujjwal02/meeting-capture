@@ -11,8 +11,8 @@ use std::path::PathBuf;
 pub use app_dirs::AppDirs;
 pub use edit::{SettingsChange, SettingsStore};
 pub use file::{
-    DebugSettings, Effort, GoogleSettings, LlmSettings, MeetSettings, ProviderKind, SettingsFile,
-    SlackSettings, TranscriptionSettings,
+    DebugSettings, DriveSettings, Effort, GoogleSettings, LlmSettings, MeetSettings, ProviderKind,
+    SettingsFile, SlackSettings, TranscriptionSettings,
 };
 pub use validate::Settings;
 
@@ -54,6 +54,16 @@ pub enum SettingsError {
     GoogleClientChangedDuringSignIn,
     #[error("settings field google.accounts: {email:?} is not an email address or is listed twice")]
     GoogleAccount { email: String },
+    #[error("settings field drive.account: {email:?} is not an email address")]
+    DriveAccount { email: String },
+    #[error(
+        "settings field drive.refresh_token: set without drive.account; run `mc drive sign-in`"
+    )]
+    DriveTokenWithoutAccount,
+    #[error(
+        "settings field drive.root_folder: {name:?} must be one folder name, not blank and without '/'"
+    )]
+    DriveRootFolder { name: String },
     #[error("settings field llm.{field}: required for provider {provider}")]
     LlmFieldMissing {
         field: &'static str,

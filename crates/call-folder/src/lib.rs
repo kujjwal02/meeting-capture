@@ -1,5 +1,6 @@
 //! What every capture process shares about a call folder: the lock that says which process may
-//! write its media, the walk over the app's `calls/` folder, and the media a person opens in it.
+//! write its media, the walk over the app's `calls/` folder, the media a person opens in it, and
+//! the record of what went to Google Drive.
 //!
 //! Each capture process has its own lock file, such as `audio.lock` and later `video.lock`. A
 //! recording holds it for its whole life and repair holds it while it works, so repair never
@@ -12,6 +13,7 @@
 //! It holds the holder's pid for people reading the folder. Only Unix lets them read it while it
 //! is held: `LockFileEx` also blocks other processes' reads.
 
+pub mod drive_record;
 pub mod media;
 
 use std::fs::{File, TryLockError};
@@ -98,4 +100,24 @@ pub fn call_folders(calls_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
     }
     folders.sort();
     Ok(folders)
+}
+
+/// Syncs a folder, so a rename in it survives a power cut.
+///
+/// # Errors
+///
+/// Fails when the folder cannot be opened or synced.
+#[cfg(unix)]
+pub fn sync_folder(folder: &Path) -> std::io::Result<()> {
+    File::open(folder).and_then(|handle| handle.sync_all())
+}
+
+/// NTFS journals the rename itself, and Windows opens no folder handle to sync.
+///
+/// # Errors
+///
+/// Never fails; the signature matches the Unix version.
+#[cfg(not(unix))]
+pub fn sync_folder(_folder: &Path) -> std::io::Result<()> {
+    Ok(())
 }

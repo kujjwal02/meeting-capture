@@ -7,7 +7,9 @@
 //! segments a dead writer left open in a call folder, audio and video, as the app does at launch;
 //! `finalize` writes a call folder's `call.mp4`, as the app does when a call ends and at launch
 //! for each folder `pending-finalize` lists; `purge-media` deletes the video of calls older than
-//! 90 days, as the app does at launch and once a day; `request-screen-recording` shows the
+//! 90 days, as the app does at launch and once a day; `delete-finalized-fragments` deletes the
+//! fragments `call.mp4` holds an hour after the call, as the app does at launch and every hour;
+//! `request-screen-recording` shows the
 //! system's Screen Recording dialog when the app has never been asked, as the app does at launch.
 
 #[cfg(target_os = "macos")]
@@ -157,6 +159,16 @@ enum Command {
         #[arg(long)]
         calls_dir: PathBuf,
     },
+    /// Delete the video fragments that `call.mp4` holds, in each call that ended more than an
+    /// hour ago. `call.mp4` and the stems stay. Prints one JSON object.
+    DeleteFinalizedFragments {
+        /// The folder that holds the call folders. Nothing outside it is deleted.
+        #[arg(long)]
+        calls_dir: PathBuf,
+        /// The call folder of a call the app holds open, which keeps its fragments. Repeatable.
+        #[arg(long = "keep")]
+        open_call_folders: Vec<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -237,12 +249,11 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Finalize { folder } => finalize(&folder),
         Command::PendingFinalize { calls_dir } => pending_finalize(&calls_dir),
-        Command::PurgeMedia { calls_dir } => {
-            let purge =
-                call_finalize::purge_expired_media(&calls_dir, std::time::SystemTime::now())?;
-            println!("{}", serde_json::to_string(&purge)?);
-            Ok(())
-        }
+        Command::PurgeMedia { calls_dir } => purge_media(&calls_dir),
+        Command::DeleteFinalizedFragments {
+            calls_dir,
+            open_call_folders,
+        } => delete_finalized_fragments(&calls_dir, &open_call_folders),
         Command::Video => {
             #[cfg(target_os = "macos")]
             return video::serve();
@@ -333,6 +344,25 @@ fn request_screen_recording() -> anyhow::Result<()> {
     let state = capture::request_screen_recording();
     let answer = capture_protocol::PermissionAnswer { state };
     println!("{}", serde_json::to_string(&answer)?);
+    Ok(())
+}
+
+fn purge_media(calls_dir: &std::path::Path) -> anyhow::Result<()> {
+    let purge = call_finalize::purge_expired_media(calls_dir, std::time::SystemTime::now())?;
+    println!("{}", serde_json::to_string(&purge)?);
+    Ok(())
+}
+
+fn delete_finalized_fragments(
+    calls_dir: &std::path::Path,
+    open_call_folders: &[PathBuf],
+) -> anyhow::Result<()> {
+    let cleanup = call_finalize::delete_finalized_fragments(
+        calls_dir,
+        open_call_folders,
+        std::time::SystemTime::now(),
+    )?;
+    println!("{}", serde_json::to_string(&cleanup)?);
     Ok(())
 }
 

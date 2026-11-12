@@ -270,6 +270,45 @@ impl std::fmt::Debug for GoogleSettings {
     }
 }
 
+/// The Drive account that keeps call media. It signs in on its own, apart from the calendar
+/// accounts, for the `drive.file` scope only, so it may be one of them or another account.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DriveSettings {
+    pub enabled: bool,
+    /// Written by the Drive sign-in. Kept as the login hint when a client change drops the token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// Written by the Drive sign-in. Removing it signs Drive out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    /// The top folder in My Drive for everything the app uploads.
+    pub root_folder: String,
+}
+
+impl Default for DriveSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            account: None,
+            refresh_token: None,
+            root_folder: "Meeting capture".to_owned(),
+        }
+    }
+}
+
+impl std::fmt::Debug for DriveSettings {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("DriveSettings")
+            .field("enabled", &self.enabled)
+            .field("account", &self.account)
+            .field("refresh_token", &secret_marker(self.refresh_token.as_ref()))
+            .field("root_folder", &self.root_folder)
+            .finish()
+    }
+}
+
 /// The settings file as written, before defaults fill the gaps. Edits go through
 /// `SettingsStore::edit`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -290,6 +329,8 @@ pub struct SettingsFile {
     pub llm: LlmSettings,
     #[serde(default, skip_serializing_if = "is_default")]
     pub transcription: TranscriptionSettings,
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub drive: DriveSettings,
     #[serde(default)]
     pub slack: SlackSettings,
     #[serde(default)]
@@ -320,6 +361,10 @@ const SETTINGS_HEADER: &str = "\
 #   failed, in another language or garbled, the provider transcribes the call's audio.
 # [transcription] api_key: the key for the provider.
 # [transcription] model, language: default nova-3 and multi (deepgram).
+# [drive] enabled: keep call media on Google Drive. Default false.
+# [drive] account, refresh_token: the Drive account and its grant, written by `mc drive sign-in`.
+#   Removing the token signs Drive out. The account may also be a calendar account.
+# [drive] root_folder: the top folder in My Drive for uploads. Default \"Meeting capture\".
 # [slack] read_captions: read Slack huddle captions from the Slack desktop app (macOS).
 # [slack] auto_start_captions: press the huddle's Captions tab when its caption panel is hidden.
 # [slack] min_huddle_seconds: a shorter huddle writes no note. Default 120.
@@ -392,8 +437,8 @@ impl SettingsFile {
     }
 }
 
-fn is_default(transcription: &TranscriptionSettings) -> bool {
-    *transcription == TranscriptionSettings::default()
+fn is_default<Section: Default + PartialEq>(section: &Section) -> bool {
+    *section == Section::default()
 }
 
 impl SettingsFile {
@@ -446,14 +491,25 @@ impl GoogleSettings {
     pub fn client_id(&self) -> Option<&str> {
         self.client_id.as_deref()
     }
+}
 
+impl SettingsFile {
     /// Google issued the stored secret and grants to the old client, and they fail with a new
-    /// one, so a new client ID drops the secret and every refresh token.
-    pub fn set_client_id(&mut self, client_id: Option<String>) {
-        if self.client_id != client_id {
-            self.client_secret = None;
-            self.refresh_tokens.clear();
+    /// one, so a new client ID drops the secret and every refresh token, calendar and Drive.
+    pub fn set_google_client_id(&mut self, client_id: Option<String>) {
+        if self.google.client_id != client_id {
+            self.google.client_secret = None;
+            self.google.refresh_tokens.clear();
+            self.drive.refresh_token = None;
         }
-        self.client_id = client_id;
+        self.google.client_id = client_id;
+    }
+
+    /// Whether a calendar or Drive refresh token is stored for `email`. Google keeps one grant
+    /// per account and client, so a revoke would end that token too.
+    #[must_use]
+    pub fn has_token_for(&self, email: &str) -> bool {
+        self.google.refresh_tokens.contains_key(email)
+            || (self.drive.refresh_token.is_some() && self.drive.account.as_deref() == Some(email))
     }
 }

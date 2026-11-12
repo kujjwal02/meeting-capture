@@ -1,6 +1,8 @@
 //! Calendar match, LLM extraction and the vault write. No Tauri dependency.
 
+pub mod archive;
 pub mod calendar;
+pub mod drive;
 pub mod extraction;
 pub mod google;
 mod intake;
@@ -31,7 +33,7 @@ use crate::extraction::{CheckedNotes, Prompt};
 use crate::google::GoogleError;
 use crate::intake::read_transcript;
 use crate::llm::{ExtractionError, Provider};
-use crate::render::{CallRecording, NoteInput};
+use crate::render::{CallRecording, DriveCopy, NoteInput};
 use crate::settings::{AppDirs, LlmSettings, Settings, SettingsError, SettingsStore};
 use crate::vault::{SectionWrite, Vault};
 
@@ -368,7 +370,11 @@ impl Pipeline {
         };
         let folder = folder_link.folder_in(&self.app_dirs.calls_dir());
         match CallMedia::scan(&folder) {
-            Ok(media) => Some(CallRecording { folder_link, media }),
+            Ok(media) => Some(CallRecording {
+                folder_link,
+                media,
+                drive_copies: drive_copies(&folder),
+            }),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => {
                 tracing::warn!(
@@ -635,6 +641,38 @@ enum RecordingWrite {
 }
 
 /// Written, not failed, and owing no extraction: nothing but a rewrite would touch the note.
+/// The Drive copies of the archived files no longer in `folder`, for the note's links. Files
+/// still here keep their local link.
+fn drive_copies(folder: &Path) -> std::collections::BTreeMap<String, DriveCopy> {
+    let record = match archive::DriveRecord::read(folder) {
+        Ok(Some(record)) => record,
+        Ok(None) => return std::collections::BTreeMap::new(),
+        Err(error) => {
+            tracing::warn!(
+                file.directory = %folder.display(),
+                exception.message = %error,
+                "drive.json unreadable; the note gets no Drive links"
+            );
+            return std::collections::BTreeMap::new();
+        }
+    };
+    record
+        .files
+        .into_iter()
+        .filter(|file| !folder.join(&file.local_name).exists())
+        .filter_map(|file| {
+            let web_view_link = file.drive_link()?.to_owned();
+            Some((
+                file.local_name,
+                DriveCopy {
+                    web_view_link,
+                    size_bytes: file.size_bytes,
+                },
+            ))
+        })
+        .collect()
+}
+
 fn is_settled(meeting: &Meeting) -> bool {
     matches!(meeting.state(), JobState::Written { .. }) && !meeting.is_extraction_owed()
 }

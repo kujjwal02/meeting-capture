@@ -2,6 +2,12 @@
 //! folder whose call ended more than `MEDIA_RETENTION_DAYS` ago. The WAV stems, both manifests,
 //! the finalize record and every other file stay: phase 4 transcribes the stems later.
 //!
+//! The fragment cleanup deletes the `NNN-video` folders sooner, once `call.mp4` holds their
+//! frames and the call ended more than `FRAGMENT_KEEP_AFTER_CALL_END` ago on the purge clock. It
+//! skips the folders of calls the app holds open, checks `call.mp4` has the length finalize
+//! recorded, keeps the same folders the purge keeps, and takes the same locks. It writes no purge
+//! record, so finalize still sees the folder as finalized and the note still links `call.mp4`.
+//!
 //! A call ended at the newest change to a capture file: a stem, `audio.json`, `video.json` or a
 //! file in an `NNN-video` folder. Finalize's own output does not count, so a late finalize does
 //! not move the end. The purge holds `audio.lock`, `video.lock` and `finalize.lock` while it
@@ -14,6 +20,9 @@
 //! its `call.mp4` keeps everything too: the next launch finalizes it, and a later purge takes it.
 //! A segment that finalize skipped for any reason but `Empty`, or that `video.json` does not
 //! list, never reached `call.mp4`, so its folder stays.
+//!
+//! A folder whose `drive.json` says every upload is recorded, or cannot be read, is skipped by
+//! both: the archive owns it.
 //!
 //! The purge record, `media-purge.json`, is written and its folder synced before anything is
 //! deleted. A run killed in the middle leaves it, so finalize refuses the folder, and the next
@@ -48,15 +57,27 @@ use jiff::{SignedDuration, Timestamp};
 use serde::{Deserialize, Serialize};
 
 use call_folder::FolderLock;
+use call_folder::drive_record::is_archived;
 use call_folder::media::{PURGE_RECORD_FILE_NAME, PURGE_RECORD_SCHEMA_VERSION, PurgeRecord};
-use capture_protocol::finalize::{KeepReason, KeptCall, MediaPurge, PurgedCall};
+use capture_protocol::finalize::{
+    CleanedCall, FragmentCleanup, KeepReason, KeptCall, MediaPurge, PurgedCall,
+};
 use video_capture::{VideoManifest, VideoSegmentState};
 
-use crate::record::{FinalizeStanding, finalize_standing, recorded_skipped_video};
+use crate::record::{
+    FinalizeStanding, RecordedCallFile, finalize_standing, recorded_call_file,
+    recorded_skipped_video,
+};
 use crate::{FinalizeError, LOCK_FILE_NAME, OUTPUT_FILE_NAME, SkipReason};
 
 /// How long a call's video stays after the call ends. Phase 7 moves it to Drive first.
 pub const MEDIA_RETENTION_DAYS: u64 = 90;
+
+/// How long a call's `NNN-video` folders stay after its last capture file changed, once
+/// `call.mp4` holds them. A Meet rejoin up to 10 minutes after the end (`REJOIN_WINDOW`), or late
+/// events up to 5 minutes after an idle end, resumes the call in the same folder, and the
+/// finalize that follows reads every segment from its fragments again.
+pub const FRAGMENT_KEEP_AFTER_CALL_END: Duration = Duration::from_hours(1);
 
 /// In each call folder with video: when a purge run first saw it.
 pub const FIRST_SEEN_FILE_NAME: &str = "media-first-seen.json";
@@ -81,7 +102,7 @@ struct FirstSeenRecord {
 
 /// The purge clock, both times UTC.
 #[derive(Debug, Serialize, Deserialize)]
-struct PurgeRunRecord {
+pub(crate) struct PurgeRunRecord {
     schema_version: u32,
     /// The wall clock at the last run.
     last_clock_at: Timestamp,
@@ -93,6 +114,24 @@ struct PurgeRunRecord {
 enum FolderPurge {
     Purged(PurgedCall),
     Kept(KeepReason),
+}
+
+/// Why a deletion pass removes video, for its logs.
+#[derive(Clone, Copy)]
+enum DeletionCause {
+    /// The call is older than `MEDIA_RETENTION_DAYS`.
+    RetentionExpired,
+    /// `call.mp4` holds the fragments.
+    Finalized,
+}
+
+impl DeletionCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::RetentionExpired => "retention_expired",
+            Self::Finalized => "finalized",
+        }
+    }
 }
 
 /// What one deletion pass over a folder removed and left.
@@ -199,6 +238,225 @@ pub fn purge_expired_media(calls_dir: &Path, now: SystemTime) -> Result<MediaPur
     Ok(purge)
 }
 
+/// Deletes the `NNN-video` folders whose frames `call.mp4` holds, in each call folder whose call
+/// ended more than `FRAGMENT_KEEP_AFTER_CALL_END` ago on the purge clock. `open_call_folders` are
+/// the folders of calls the app holds open; a resumed segment there would need every fragment
+/// again, so they stay. The folder keeps `call.mp4`, and no purge record is written, so the
+/// 90-day purge still takes the file later. A folder that fails is logged and the others go on.
+///
+/// The purge clock is read, never moved: the purge owns it. With no clock yet, nothing goes.
+///
+/// # Errors
+///
+/// Fails when `calls_dir` exists but cannot be resolved or listed.
+pub fn delete_finalized_fragments(
+    calls_dir: &Path,
+    open_call_folders: &[PathBuf],
+    now: SystemTime,
+) -> Result<FragmentCleanup, FinalizeError> {
+    let mut cleanup = FragmentCleanup {
+        cleaned: Vec::new(),
+    };
+    let io_error = |source| FinalizeError::Io {
+        path: calls_dir.to_owned(),
+        source,
+    };
+    if !calls_dir.is_dir() {
+        return Ok(cleanup);
+    }
+    let Some(clock) = read_purge_clock(calls_dir) else {
+        tracing::info!(file.directory = %calls_dir.display(), "fragments.no_purge_clock");
+        return Ok(cleanup);
+    };
+    let trusted_now = advance_purge_clock(&clock, timestamp_of(now, calls_dir)?);
+    let keep =
+        SignedDuration::try_from(FRAGMENT_KEEP_AFTER_CALL_END).unwrap_or(SignedDuration::MAX);
+    let Ok(cutoff) = trusted_now.checked_sub(keep) else {
+        return Ok(cleanup);
+    };
+    let folders = call_folder::call_folders(calls_dir).map_err(io_error)?;
+    let root = calls_dir.canonicalize().map_err(io_error)?;
+    // A call folder not created yet has nothing to delete.
+    let open_call_folders: BTreeSet<PathBuf> = open_call_folders
+        .iter()
+        .filter_map(|folder| folder.canonicalize().ok())
+        .collect();
+    for folder in folders {
+        match delete_folder_fragments(&root, &folder, &open_call_folders, cutoff) {
+            Ok(Some(call)) => cleanup.cleaned.push(call),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                file.directory = %folder.display(),
+                exception.message = %error,
+                "fragments.folder_failed"
+            ),
+        }
+    }
+    Ok(cleanup)
+}
+
+/// One folder's fragment deletion. `None` when it keeps every `NNN-video` folder.
+fn delete_folder_fragments(
+    root: &Path,
+    folder: &Path,
+    open_call_folders: &BTreeSet<PathBuf>,
+    cutoff: Timestamp,
+) -> Result<Option<CleanedCall>, FinalizeError> {
+    let folder = folder.canonicalize().map_err(|source| FinalizeError::Io {
+        path: folder.to_owned(),
+        source,
+    })?;
+    if folder.parent() != Some(root) {
+        return Ok(None);
+    }
+    if open_call_folders.contains(&folder) {
+        tracing::debug!(
+            file.directory = %folder.display(),
+            purge.keep_reason = "call_open",
+            "fragments.folder_kept"
+        );
+        return Ok(None);
+    }
+    // The archive owns the folder once its uploads are recorded, and deletes on its own terms.
+    if is_archived(&folder) {
+        tracing::debug!(
+            file.directory = %folder.display(),
+            purge.keep_reason = "archived",
+            "fragments.folder_kept"
+        );
+        return Ok(None);
+    }
+    // Cheap checks first, so recent, already cleaned and unplaced-only folders are never
+    // locked, and their fragments are not read every hour.
+    if !has_deletable_segment_folder(&folder)? || !is_ended_before(&folder, cutoff)? {
+        return Ok(None);
+    }
+    let _locks = match take_folder_locks(&folder)? {
+        Ok(locks) => locks,
+        Err(reason) => {
+            tracing::debug!(
+                file.directory = %folder.display(),
+                purge.keep_reason = reason.as_str(),
+                "fragments.folder_kept"
+            );
+            return Ok(None);
+        }
+    };
+    // Again under the locks: a resumed call may have written in between.
+    let Some(call_ended_at) = ended_at(&folder)? else {
+        return Ok(None);
+    };
+    let call_ended_at = timestamp_of(call_ended_at, &folder)?;
+    if call_ended_at >= cutoff {
+        return Ok(None);
+    }
+    let entries = match released_video_media(&folder)? {
+        VideoRelease::Released {
+            entries,
+            unplaced_segments: _,
+            is_call_file_written: true,
+        } => entries,
+        VideoRelease::Released {
+            is_call_file_written: false,
+            ..
+        } => return Ok(None),
+        VideoRelease::Kept(reason) => {
+            tracing::debug!(
+                file.directory = %folder.display(),
+                purge.keep_reason = reason.as_str(),
+                "fragments.folder_kept"
+            );
+            return Ok(None);
+        }
+    };
+    if !is_call_file_as_recorded(&folder)? {
+        return Ok(None);
+    }
+    let segment_folders: Vec<PathBuf> = entries
+        .into_iter()
+        .filter(|path| segment_number_of(path).is_some())
+        .collect();
+    if segment_folders.is_empty() {
+        return Ok(None);
+    }
+    let deleted = delete_video_media(&segment_folders, call_ended_at, DeletionCause::Finalized)?;
+    let deleted_segments: Vec<u32> = segment_folders
+        .iter()
+        .filter_map(|path| segment_number_of(path))
+        .collect();
+    tracing::info!(
+        file.directory = %folder.display(),
+        purge.call_ended_at = %call_ended_at,
+        purge.deleted_segment_count = deleted_segments.len(),
+        purge.deleted_file_count = deleted.file_count,
+        purge.deleted_bytes = deleted.bytes,
+        purge.refused_entry_count = deleted.refused_entry_count,
+        "fragments.folder_cleaned"
+    );
+    Ok(Some(CleanedCall {
+        folder,
+        call_ended_at,
+        deleted_segments,
+        deleted_file_count: deleted.file_count,
+        deleted_bytes: deleted.bytes,
+        refused_entry_count: deleted.refused_entry_count,
+    }))
+}
+
+/// Whether the folder holds `call.mp4` written from the current manifests and an `NNN-video`
+/// folder whose frames it holds. Reads the two manifests and the finalize record, no fragment.
+pub(crate) fn has_deletable_segment_folder(folder: &Path) -> Result<bool, FinalizeError> {
+    if finalize_standing(folder) != FinalizeStanding::Written {
+        return Ok(false);
+    }
+    let Some(unplaced) = unplaced_segments(folder)? else {
+        return Ok(false);
+    };
+    Ok(video_media(folder)?
+        .iter()
+        .any(|path| segment_number_of(path).is_some_and(|segment| !unplaced.contains(&segment))))
+}
+
+/// Whether `call.mp4` is a regular file of the length the written run recorded, or non-empty
+/// for a record from before lengths were kept. A mismatch is logged: the file was cut short or
+/// replaced, and the fragments are all that can rebuild it.
+pub(crate) fn is_call_file_as_recorded(folder: &Path) -> Result<bool, FinalizeError> {
+    let path = folder.join(OUTPUT_FILE_NAME);
+    let metadata = std::fs::symlink_metadata(&path).map_err(|source| FinalizeError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let actual_bytes = metadata.len();
+    let recorded = recorded_call_file(folder);
+    let is_as_recorded = metadata.file_type().is_file()
+        && match recorded {
+            Some(RecordedCallFile::Bytes(recorded_bytes)) => actual_bytes == recorded_bytes,
+            Some(RecordedCallFile::Unrecorded) => actual_bytes > 0,
+            None => false,
+        };
+    if !is_as_recorded {
+        tracing::warn!(
+            file.path = %path.display(),
+            file.size = actual_bytes,
+            finalize.recorded_bytes = match recorded {
+                Some(RecordedCallFile::Bytes(recorded_bytes)) => Some(recorded_bytes),
+                Some(RecordedCallFile::Unrecorded) | None => None,
+            },
+            "fragments.call_file_mismatch"
+        );
+    }
+    Ok(is_as_recorded)
+}
+
+/// Whether the call's last capture file changed before `cutoff`. A folder with no capture file
+/// has no end, so it never qualifies.
+fn is_ended_before(folder: &Path, cutoff: Timestamp) -> Result<bool, FinalizeError> {
+    let Some(ended) = ended_at(folder)? else {
+        return Ok(false);
+    };
+    Ok(timestamp_of(ended, folder)? < cutoff)
+}
+
 /// Whether a purge started deleting this folder's video. Finalize then has nothing to work on.
 pub(crate) fn has_purge_record(folder: &Path) -> bool {
     folder.join(PURGE_RECORD_FILE_NAME).exists()
@@ -206,7 +464,7 @@ pub(crate) fn has_purge_record(folder: &Path) -> bool {
 
 /// An unreadable, older or newer record counts as none: the clock starts again from the newest
 /// capture file, which never ages a call past its real age.
-fn read_purge_clock(calls_dir: &Path) -> Option<PurgeRunRecord> {
+pub(crate) fn read_purge_clock(calls_dir: &Path) -> Option<PurgeRunRecord> {
     let text = std::fs::read_to_string(calls_dir.join(PURGE_RUN_FILE_NAME)).ok()?;
     serde_json::from_str::<PurgeRunRecord>(&text)
         .ok()
@@ -215,7 +473,7 @@ fn read_purge_clock(calls_dir: &Path) -> Option<PurgeRunRecord> {
 
 /// The wall time since the last run, clamped to `0..=MAX_CLOCK_STEP`, added to the purge
 /// clock, and never past the wall clock.
-fn advance_purge_clock(clock: &PurgeRunRecord, now: Timestamp) -> Timestamp {
+pub(crate) fn advance_purge_clock(clock: &PurgeRunRecord, now: Timestamp) -> Timestamp {
     let max_step = SignedDuration::try_from(MAX_CLOCK_STEP).unwrap_or(SignedDuration::MAX);
     let step = now
         .duration_since(clock.last_clock_at)
@@ -298,6 +556,15 @@ fn purge_folder(
             Some(FolderPurge::Kept(KeepReason::OutsideRoot)),
         ));
     }
+    // The archive owns the folder once its uploads are recorded; the purge must not race it.
+    if is_archived(&folder) {
+        tracing::debug!(
+            file.directory = %folder.display(),
+            purge.keep_reason = "archived",
+            "purge.folder_skipped"
+        );
+        return Ok(sight(false, None));
+    }
     // Cheap checks first, so young folders are never locked.
     if video_media(&folder)?.is_empty() {
         return Ok(sight(false, None));
@@ -316,20 +583,9 @@ fn purge_aged_folder(
     first_seen_at: Timestamp,
     cutoff: Timestamp,
 ) -> Result<Option<FolderPurge>, FinalizeError> {
-    let lock = |name: &str| {
-        FolderLock::try_take(folder, name).map_err(|source| FinalizeError::Io {
-            path: folder.join(name),
-            source,
-        })
-    };
-    let Some(_audio_lock) = lock(stem_writer::LOCK_FILE_NAME)? else {
-        return Ok(Some(FolderPurge::Kept(KeepReason::Recording)));
-    };
-    let Some(_video_lock) = lock(video_capture::LOCK_FILE_NAME)? else {
-        return Ok(Some(FolderPurge::Kept(KeepReason::Recording)));
-    };
-    let Some(_finalize_lock) = lock(LOCK_FILE_NAME)? else {
-        return Ok(Some(FolderPurge::Kept(KeepReason::Finalizing)));
+    let _locks = match take_folder_locks(folder)? {
+        Ok(locks) => locks,
+        Err(reason) => return Ok(Some(FolderPurge::Kept(reason))),
     };
     // Again under the locks: a writer may have finished in between.
     if !is_aged_before(folder, first_seen_at, cutoff)? {
@@ -338,34 +594,14 @@ fn purge_aged_folder(
     let Some(call_ended_at) = ended_at(folder)? else {
         return Ok(None);
     };
-    if has_open_video_segment(folder)? {
-        return Ok(Some(FolderPurge::Kept(KeepReason::OpenVideoSegment)));
-    }
-    // A record means an earlier purge passed this check and was cut short.
-    if !has_purge_record(folder) {
-        match finalize_standing(folder) {
-            FinalizeStanding::Succeeded => {}
-            FinalizeStanding::Pending => {
-                return Ok(Some(FolderPurge::Kept(KeepReason::FinalizePending)));
-            }
-            FinalizeStanding::Failed => {
-                return Ok(Some(FolderPurge::Kept(KeepReason::FinalizeFailed)));
-            }
-        }
-    }
-    let Some(unplaced) = unplaced_segments(folder)? else {
-        return Ok(Some(FolderPurge::Kept(KeepReason::FinalizeFailed)));
+    let (deletable, unplaced_segments) = match released_video_media(folder)? {
+        VideoRelease::Released {
+            entries,
+            unplaced_segments,
+            is_call_file_written: _,
+        } => (entries, unplaced_segments),
+        VideoRelease::Kept(reason) => return Ok(Some(FolderPurge::Kept(reason))),
     };
-    let deletable: Vec<PathBuf> = video_media(folder)?
-        .into_iter()
-        .filter(|path| segment_number_of(path).is_none_or(|segment| !unplaced.contains(&segment)))
-        .collect();
-    let unplaced_segments: Vec<u32> = unplaced.into_iter().collect();
-    if deletable.is_empty() {
-        return Ok(Some(FolderPurge::Kept(KeepReason::UnplacedVideo {
-            segments: unplaced_segments,
-        })));
-    }
     let call_ended_at = timestamp_of(call_ended_at, folder)?;
     write_atomically(
         folder,
@@ -376,7 +612,7 @@ fn purge_aged_folder(
             call_ended_at,
         },
     )?;
-    let deleted = delete_video_media(&deletable, call_ended_at)?;
+    let deleted = delete_video_media(&deletable, call_ended_at, DeletionCause::RetentionExpired)?;
     tracing::info!(
         file.directory = %folder.display(),
         purge.call_ended_at = %call_ended_at,
@@ -396,6 +632,93 @@ fn purge_aged_folder(
         refused_entry_count: deleted.refused_entry_count,
         unplaced_segments,
     })))
+}
+
+/// Held while a deletion works, so no capture process or finalize run touches the folder.
+pub(crate) struct FolderLocks {
+    _audio: FolderLock,
+    _video: FolderLock,
+    _finalize: FolderLock,
+}
+
+/// The folder's three locks, or why one is taken.
+pub(crate) fn take_folder_locks(
+    folder: &Path,
+) -> Result<Result<FolderLocks, KeepReason>, FinalizeError> {
+    let lock = |name: &str| {
+        FolderLock::try_take(folder, name).map_err(|source| FinalizeError::Io {
+            path: folder.join(name),
+            source,
+        })
+    };
+    let Some(audio) = lock(stem_writer::LOCK_FILE_NAME)? else {
+        return Ok(Err(KeepReason::Recording));
+    };
+    let Some(video) = lock(video_capture::LOCK_FILE_NAME)? else {
+        return Ok(Err(KeepReason::Recording));
+    };
+    let Some(finalize) = lock(LOCK_FILE_NAME)? else {
+        return Ok(Err(KeepReason::Finalizing));
+    };
+    Ok(Ok(FolderLocks {
+        _audio: audio,
+        _video: video,
+        _finalize: finalize,
+    }))
+}
+
+/// Which video entries finalize is done with, whatever the call's age.
+enum VideoRelease {
+    Released {
+        /// `call.mp4`, what a killed finalize left, and each `NNN-video` folder whose frames
+        /// `call.mp4` holds or that finalize skipped as `Empty`.
+        entries: Vec<PathBuf>,
+        unplaced_segments: Vec<u32>,
+        /// The finalize record on the current manifests says `call.mp4` is written, and it is
+        /// there. False for a folder with no video to place, or one a cut-short purge holds.
+        is_call_file_written: bool,
+    },
+    Kept(KeepReason),
+}
+
+/// The video entries a deletion may take. The caller holds the folder's three locks.
+fn released_video_media(folder: &Path) -> Result<VideoRelease, FinalizeError> {
+    if has_open_video_segment(folder)? {
+        return Ok(VideoRelease::Kept(KeepReason::OpenVideoSegment));
+    }
+    // A record means an earlier purge passed this check and was cut short.
+    let is_call_file_written = if has_purge_record(folder) {
+        false
+    } else {
+        match finalize_standing(folder) {
+            FinalizeStanding::Written => true,
+            FinalizeStanding::NoVideo => false,
+            FinalizeStanding::Pending => {
+                return Ok(VideoRelease::Kept(KeepReason::FinalizePending));
+            }
+            FinalizeStanding::Failed => {
+                return Ok(VideoRelease::Kept(KeepReason::FinalizeFailed));
+            }
+        }
+    };
+    let Some(unplaced) = unplaced_segments(folder)? else {
+        return Ok(VideoRelease::Kept(KeepReason::FinalizeFailed));
+    };
+    let entries: Vec<PathBuf> = video_media(folder)?
+        .into_iter()
+        .filter(|path| segment_number_of(path).is_none_or(|segment| !unplaced.contains(&segment)))
+        .collect();
+    let unplaced_segments: Vec<u32> = unplaced.into_iter().collect();
+    if entries.is_empty() {
+        return Ok(VideoRelease::Kept(KeepReason::UnplacedVideo {
+            segments: unplaced_segments,
+        }));
+    }
+    Ok(VideoRelease::Released {
+        entries,
+        unplaced_segments,
+        is_call_file_written,
+    })
 }
 
 /// The `NNN-video` folders whose frames `call.mp4` does not hold: those the last finished
@@ -486,7 +809,7 @@ fn is_aged_before(
 
 /// The newest modified time of the capture files: the stems, both manifests and the files in the
 /// `NNN-video` folders, links not followed. `None` when the folder has none.
-fn ended_at(folder: &Path) -> Result<Option<SystemTime>, FinalizeError> {
+pub(crate) fn ended_at(folder: &Path) -> Result<Option<SystemTime>, FinalizeError> {
     let mut newest: Option<SystemTime> = None;
     let mut track_newest_modified = |path: &Path| -> Result<(), FinalizeError> {
         let modified = std::fs::symlink_metadata(path)
@@ -546,7 +869,7 @@ fn has_open_video_segment(folder: &Path) -> Result<bool, FinalizeError> {
         .any(|segment| segment.state == VideoSegmentState::Open))
 }
 
-fn timestamp_of(time: SystemTime, path: &Path) -> Result<Timestamp, FinalizeError> {
+pub(crate) fn timestamp_of(time: SystemTime, path: &Path) -> Result<Timestamp, FinalizeError> {
     Timestamp::try_from(time).map_err(|error| FinalizeError::Io {
         path: path.to_owned(),
         source: std::io::Error::other(error),
@@ -601,6 +924,7 @@ fn sync_folder(_folder: &Path) -> Result<(), FinalizeError> {
 fn delete_video_media(
     media: &[PathBuf],
     call_ended_at: Timestamp,
+    cause: DeletionCause,
 ) -> Result<DeletionCount, FinalizeError> {
     let mut deleted = DeletionCount::default();
     for path in media {
@@ -618,13 +942,18 @@ fn delete_video_media(
                 file.path = %path.display(),
                 file.size = metadata.len(),
                 purge.call_ended_at = %call_ended_at,
+                purge.cause = cause.as_str(),
                 "purge.file_deleted"
             );
         } else if file_type.is_dir() {
-            delete_segment_folder(path, call_ended_at, &mut deleted)?;
+            delete_segment_folder(path, call_ended_at, cause, &mut deleted)?;
         } else {
             deleted.refused_entry_count += 1;
-            tracing::warn!(file.path = %path.display(), "purge.entry_refused");
+            tracing::warn!(
+                file.path = %path.display(),
+                purge.cause = cause.as_str(),
+                "purge.entry_refused"
+            );
         }
     }
     Ok(deleted)
@@ -635,6 +964,7 @@ fn delete_video_media(
 fn delete_segment_folder(
     segment_folder: &Path,
     call_ended_at: Timestamp,
+    cause: DeletionCause,
     deleted: &mut DeletionCount,
 ) -> Result<(), FinalizeError> {
     let io_error = |source| FinalizeError::Io {
@@ -659,6 +989,7 @@ fn delete_segment_folder(
         purge.deleted_file_count = file_count,
         purge.deleted_bytes = bytes,
         purge.call_ended_at = %call_ended_at,
+        purge.cause = cause.as_str(),
         "purge.segment_folder_deleted"
     );
     Ok(())

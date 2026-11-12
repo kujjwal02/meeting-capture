@@ -15,6 +15,11 @@
 //! The step's output lives in the call folder's `stt/`, not the job store: each reply with the
 //! audio it answers, the caption verdict, and `choice.json`, what the step settled on. A later
 //! run reads them and makes no request.
+//!
+//! Once the Drive archive has taken a folder's stems, the saved replies are the transcript: a
+//! rerun reads them without checking them against the stems, and sends nothing. The archive
+//! deletes stems only under `audio.lock`, so the step decides whether they are gone, and reads
+//! saved replies against them, under that lock.
 
 mod audio;
 mod checks;
@@ -27,6 +32,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use call_folder::drive_record::DriveStanding;
 use jobs::{JobState, LeasedRun, Meeting, MeetingId, NetworkFault, RunOutcome, Step, StepRetry};
 use serde::{Deserialize, Serialize};
 use sources::Transcript;
@@ -55,6 +61,11 @@ const FORCED_FILE_NAME: &str = "forced";
 /// How long the step waits for the audio writer to close the call's last segment. The call
 /// log ends a moment before the capture process stops.
 const AUDIO_SETTLE_WAIT: Duration = Duration::from_secs(60);
+
+/// Tries in a row that find `audio.lock` held before the meeting fails. A deletion holds the
+/// lock for seconds, and each try waits `AUDIO_SETTLE_WAIT` at 5-minute sweeps, so 12 cover an
+/// hour: a lock held that long belongs to a stuck process, which a person must look at.
+const AUDIO_BUSY_TRY_LIMIT: u32 = 12;
 
 /// Shorter stems hold no speech worth a request.
 const MIN_STEM_SAMPLES: u64 = stem_writer::OUTPUT_RATE_HZ as u64 / 2;
@@ -219,6 +230,16 @@ pub enum TranscribeError {
     OpenSegment(PathBuf),
     #[error("could not read or repair the call audio: {0}")]
     Stems(#[from] stem_writer::StemWriterError),
+    #[error("the stems of meeting {0} are on Google Drive; run `mc restore {0}` first")]
+    StemsOnDrive(MeetingId),
+    #[error("stems archived; only the mixed recording remains")]
+    StemsMixedOnly(MeetingId),
+    #[error("{0} is busy with a capture or the Drive archive; the next sweep tries again")]
+    AudioBusy(PathBuf),
+    #[error(
+        "audio.lock in {folder} stayed held through {tries} tries in a row; find the process that holds it, then retry"
+    )]
+    AudioLockStuck { folder: PathBuf, tries: u32 },
 }
 
 impl TranscribeError {
@@ -244,7 +265,10 @@ impl TranscribeError {
                     }
                 }
             }
+            // The lock goes once the deletion or the capture ends; nothing failed.
+            Self::AudioBusy(_) => StepRetry::WhenFree,
             Self::SpeechToText(_)
+            | Self::AudioLockStuck { .. }
             | Self::StaleReplies
             | Self::Placement(_)
             | Self::Saved { .. }
@@ -253,7 +277,9 @@ impl TranscribeError {
             | Self::NoCallAudio(_)
             | Self::StillRecording(_)
             | Self::OpenSegment(_)
-            | Self::Stems(_) => StepRetry::Manual,
+            | Self::Stems(_)
+            | Self::StemsOnDrive(_)
+            | Self::StemsMixedOnly(_) => StepRetry::Manual,
         }
     }
 
@@ -271,7 +297,11 @@ impl TranscribeError {
             | Self::NoCallAudio(_)
             | Self::StillRecording(_)
             | Self::OpenSegment(_)
-            | Self::Stems(_) => false,
+            | Self::Stems(_)
+            | Self::StemsOnDrive(_)
+            | Self::StemsMixedOnly(_)
+            | Self::AudioBusy(_)
+            | Self::AudioLockStuck { .. } => false,
         }
     }
 
@@ -279,7 +309,7 @@ impl TranscribeError {
     /// run may get the transcript.
     fn is_network_wait(&self) -> bool {
         match self.retry() {
-            StepRetry::AfterNetworkWait { .. } | StepRetry::Resume => true,
+            StepRetry::AfterNetworkWait { .. } | StepRetry::Resume | StepRetry::WhenFree => true,
             StepRetry::Manual => false,
         }
     }
@@ -347,6 +377,15 @@ impl Pipeline {
         run: &LeasedRun<'_>,
         captions: Transcript,
     ) -> Result<SettledTranscript, PipelineError> {
+        self.settle_transcript(run, captions)
+            .map_err(|error| fail_stuck_audio_lock(run.meeting(), error))
+    }
+
+    fn settle_transcript(
+        &self,
+        run: &LeasedRun<'_>,
+        captions: Transcript,
+    ) -> Result<SettledTranscript, PipelineError> {
         let meeting = run.meeting();
         let _span = tracing::info_span!(
             "pipeline.transcribe",
@@ -355,6 +394,18 @@ impl Pipeline {
         )
         .entered();
         if meeting.finished_step < Step::Transcribed {
+            if let Some(folder) = self.call_folder(meeting)
+                && let Some(choice) = archived_choice(&folder)?
+            {
+                // The stems are on Drive or gone, so nothing could be checked or sent again.
+                let settled =
+                    saved_transcript(&folder, captions, self.settings.my_name.as_deref(), choice)?;
+                tracing::info!(meeting.id = %meeting.id, "stems archived; saved transcript reused");
+                run.confirm_current_input()?;
+                write_json(&stt_dir(&folder), CHOICE_FILE_NAME, &settled.choice)?;
+                run.record_transcription()?;
+                return Ok(settled);
+            }
             let settled = self.transcribe(run, captions, Phase::First)?;
             if let Some(folder) = self.call_folder(meeting) {
                 run.confirm_current_input()?;
@@ -434,8 +485,9 @@ impl Pipeline {
     /// # Errors
     ///
     /// Returns `TranscribeError::NoProvider` with no provider in settings,
-    /// `TranscribeError::NoCallAudio` when the meeting has no call folder with stems, and the
-    /// errors of `reprocess`.
+    /// `TranscribeError::NoCallAudio` when the meeting has no call folder with stems,
+    /// `TranscribeError::StemsOnDrive` or `TranscribeError::StemsMixedOnly` when the Drive
+    /// archive took them, and the errors of `reprocess`.
     pub fn transcribe_again(
         &self,
         id: MeetingId,
@@ -449,6 +501,11 @@ impl Pipeline {
             .call_folder(&meeting)
             .filter(|folder| has_stems(folder))
             .ok_or(TranscribeError::NoCallAudio(id))?;
+        match stems_standing(&folder) {
+            StemsStanding::Local => {}
+            StemsStanding::OnDrive => return Err(TranscribeError::StemsOnDrive(id).into()),
+            StemsStanding::MixedOnly => return Err(TranscribeError::StemsMixedOnly(id).into()),
+        }
         write_file(
             &stt_dir(&folder),
             FORCED_FILE_NAME,
@@ -836,9 +893,13 @@ fn saved_transcript(
             });
         }
     };
+    // Held while the replies are checked against the stems, so the archive deletes none
+    // mid-read; once they are gone, the check is skipped.
+    let _audio_lock = take_audio_lock(folder)?;
+    let standing = stems_standing(folder);
     let mut pieces = Vec::new();
     for (request, saved) in speech.replies.iter().enumerate() {
-        let answered = requests::saved_answer(folder, &saved.file_name)?;
+        let answered = requests::saved_answer(folder, &saved.file_name, standing)?;
         let mut by_window: BTreeMap<usize, Vec<Utterance>> = BTreeMap::new();
         for utterance in speech.provider.utterances(&answered.reply)? {
             let utterance = on_call_clock(utterance, &answered.cut);
@@ -905,6 +966,16 @@ fn fallback(
         );
         return Ok(None);
     };
+    match stems_standing(&folder) {
+        StemsStanding::Local => {}
+        StemsStanding::OnDrive | StemsStanding::MixedOnly => {
+            tracing::info!(
+                meeting.id = %meeting.id,
+                "stems archived and no saved transcript; captions only"
+            );
+            return Ok(None);
+        }
+    }
     if !kind.is_available() {
         tracing::warn!(
             provider = kind.as_str(),
@@ -1005,6 +1076,115 @@ fn repair_outcome(repair: &stem_writer::FolderRepair) -> &'static str {
     }
 }
 
+/// Where a call folder's stems stand against the Drive archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StemsStanding {
+    /// Every stem `audio.json` lists is here, or the folder is not archived.
+    Local,
+    /// The archive deleted stems that Drive holds as FLAC; `mc restore` brings them back.
+    OnDrive,
+    /// The archive deleted stems that live on only in `call.mp4`'s mix.
+    MixedOnly,
+}
+
+impl StemsStanding {
+    /// Whether the saved replies stand without the stems they were read from.
+    pub(super) fn is_archived(self) -> bool {
+        match self {
+            Self::Local => false,
+            Self::OnDrive | Self::MixedOnly => true,
+        }
+    }
+}
+
+/// Whether the archive took any stem `audio.json` lists. A record that cannot be read counts as
+/// on Drive, so `mc restore` reports what is wrong with it.
+fn stems_standing(folder: &Path) -> StemsStanding {
+    if !call_folder::drive_record::is_archived(folder) {
+        return StemsStanding::Local;
+    }
+    let Ok(manifest) = stem_writer::AudioManifest::load(folder) else {
+        return StemsStanding::Local;
+    };
+    let missing_names: Vec<&str> = manifest
+        .segments
+        .iter()
+        .flat_map(|segment| &segment.stems)
+        .map(|stem| stem.file.as_str())
+        .filter(|file_name| !folder.join(file_name).is_file())
+        .collect();
+    if missing_names.is_empty() {
+        return StemsStanding::Local;
+    }
+    match crate::archive::DriveRecord::read(folder) {
+        Ok(Some(record))
+            if missing_names
+                .iter()
+                .any(|name| record.mixed_stem_names.iter().any(|mixed| mixed == name)) =>
+        {
+            StemsStanding::MixedOnly
+        }
+        Ok(_) => StemsStanding::OnDrive,
+        Err(error) => {
+            tracing::warn!(exception.message = %error, "drive.json unreadable; stems count as on Drive");
+            StemsStanding::OnDrive
+        }
+    }
+}
+
+/// `AudioBusy` once `AUDIO_BUSY_TRY_LIMIT` tries in a row found `audio.lock` held, this one
+/// included, becomes a failure the tray shows, so a stuck lock never hides behind retries.
+fn fail_stuck_audio_lock(meeting: &Meeting, error: PipelineError) -> PipelineError {
+    if let PipelineError::Transcribe(TranscribeError::AudioBusy(folder)) = &error {
+        let tries = meeting.tries_while_held(&error.to_string()) + 1;
+        if tries >= AUDIO_BUSY_TRY_LIMIT {
+            return TranscribeError::AudioLockStuck {
+                folder: folder.clone(),
+                tries,
+            }
+            .into();
+        }
+    }
+    error
+}
+
+/// `audio.lock`, waited for as `wait_for_audio` does. The archive takes it with no wait, so
+/// holding it keeps every stem in place. Still held after the wait, the run stops and the next
+/// sweep tries again, since what it read without the lock could vanish mid-read.
+fn take_audio_lock(folder: &Path) -> Result<call_folder::FolderLock, TranscribeError> {
+    call_folder::FolderLock::take_within(folder, stem_writer::LOCK_FILE_NAME, AUDIO_SETTLE_WAIT)
+        .map_err(|source| TranscribeError::Saved {
+            path: folder.join(stem_writer::LOCK_FILE_NAME),
+            source,
+        })?
+        .ok_or_else(|| TranscribeError::AudioBusy(folder.to_path_buf()))
+}
+
+/// The settled choice a run reuses because the archive took the stems it was made from. Decided
+/// under `audio.lock`: a deletion under way finishes first, and the run's meeting has left
+/// `Written`, so none starts after it.
+fn archived_choice(folder: &Path) -> Result<Option<SavedChoice>, TranscribeError> {
+    // With no record, an archive run would still have to upload, then plan again under the
+    // locks, where this run's meeting holds it.
+    if DriveStanding::of(folder) == DriveStanding::Local {
+        return Ok(None);
+    }
+    let _audio_lock = take_audio_lock(folder)?;
+    if !stems_standing(folder).is_archived() {
+        return Ok(None);
+    }
+    Ok(
+        match read_json::<SavedChoice>(&stt_dir(folder).join(CHOICE_FILE_NAME))? {
+            Some(SavedChoice::Pending { .. }) | None => None,
+            Some(
+                choice @ (SavedChoice::Captions
+                | SavedChoice::Speech(_)
+                | SavedChoice::CaptionsKept { .. }),
+            ) => Some(choice),
+        },
+    )
+}
+
 /// Whether `audio.json` lists a stem with samples.
 fn has_stems(folder: &Path) -> bool {
     if !folder.join(stem_writer::MANIFEST_FILE_NAME).is_file() {
@@ -1019,6 +1199,67 @@ fn has_stems(folder: &Path) -> bool {
         Err(error) => {
             tracing::warn!(exception.message = %error, "audio.json unreadable");
             false
+        }
+    }
+}
+
+/// What a call folder's saved transcript choice says, for the archive, which must keep the
+/// stems while speech-to-text is owed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SavedTranscriptStanding {
+    /// No choice is saved, or it is final.
+    Settled,
+    /// The note holds the captions while speech-to-text is owed.
+    Pending,
+    Unreadable,
+}
+
+/// Whether each saved speech-to-text reply still matches the stems it was read from, for the
+/// archive, which checks under the folder's locks before it deletes them. Once a stem is gone
+/// the check is skipped: the run that deleted the first one checked every reply. Anything
+/// unreadable counts as no match.
+pub(crate) fn saved_replies_match_stems(folder: &Path) -> bool {
+    if stems_standing(folder).is_archived() {
+        return true;
+    }
+    let speech = match read_json::<SavedChoice>(&stt_dir(folder).join(CHOICE_FILE_NAME)) {
+        Ok(Some(SavedChoice::Speech(speech))) => speech,
+        Ok(
+            None
+            | Some(
+                SavedChoice::Captions
+                | SavedChoice::Pending { .. }
+                | SavedChoice::CaptionsKept { .. },
+            ),
+        ) => return true,
+        Err(error) => {
+            tracing::warn!(exception.message = %error, "saved transcript choice unreadable");
+            return false;
+        }
+    };
+    for saved in &speech.replies {
+        if let Err(error) = requests::saved_answer(folder, &saved.file_name, StemsStanding::Local) {
+            tracing::warn!(
+                file.name = saved.file_name,
+                exception.message = %error,
+                "saved reply does not match the stems"
+            );
+            return false;
+        }
+    }
+    true
+}
+
+pub(crate) fn saved_transcript_standing(folder: &Path) -> SavedTranscriptStanding {
+    match read_json::<SavedChoice>(&stt_dir(folder).join(CHOICE_FILE_NAME)) {
+        Ok(Some(SavedChoice::Pending { .. })) => SavedTranscriptStanding::Pending,
+        Ok(
+            None
+            | Some(SavedChoice::Captions | SavedChoice::Speech(_) | SavedChoice::CaptionsKept { .. }),
+        ) => SavedTranscriptStanding::Settled,
+        Err(error) => {
+            tracing::warn!(exception.message = %error, "saved transcript choice unreadable");
+            SavedTranscriptStanding::Unreadable
         }
     }
 }

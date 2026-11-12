@@ -46,6 +46,65 @@ function renderAccounts(accounts) {
 let llm = null;
 let transcription = null;
 let savedClient = null;
+let drive = null;
+
+// The picker's value for "Add another account…": no email is one.
+const ADD_DRIVE_ACCOUNT = "";
+
+// Lists the calendar accounts and the Drive account, with the Drive account picked.
+function renderDriveAccounts() {
+  const select = field("drive-account");
+  select.replaceChildren();
+  if (drive.account === null) {
+    const none = document.createElement("option");
+    none.value = "none";
+    none.textContent = "Pick an account";
+    none.disabled = true;
+    select.append(none);
+  }
+  for (const email of drive.accounts) {
+    const option = document.createElement("option");
+    option.value = email;
+    const needsSignIn = email === drive.account && !drive.has_token;
+    option.textContent = needsSignIn ? `${email} (sign in)` : email;
+    select.append(option);
+  }
+  const add = document.createElement("option");
+  add.value = ADD_DRIVE_ACCOUNT;
+  add.textContent = "Add another account…";
+  select.append(add);
+  select.value = drive.account ?? "none";
+}
+
+function showDriveStatus() {
+  const status = field("drive-status");
+  status.textContent = drive.status;
+  status.classList.toggle("error", drive.is_problem);
+}
+
+// Picking an account without a Drive token starts its sign-in; the account in use stays.
+async function pickDriveAccount() {
+  const select = field("drive-account");
+  const email = select.value;
+  if (email === drive.account && drive.has_token) {
+    return;
+  }
+  select.disabled = true;
+  field("drive-sign-in-status").hidden = false;
+  try {
+    const signedIn = await invoke("drive_sign_in", {
+      email: email === ADD_DRIVE_ACCOUNT ? null : email,
+    });
+    showMessage(`Drive signed in as ${signedIn}.`, false);
+    await load();
+  } catch (error) {
+    showMessage(String(error), true);
+    select.value = drive.account ?? "none";
+  } finally {
+    select.disabled = false;
+    field("drive-sign-in-status").hidden = true;
+  }
+}
 
 // The stored secret belongs to the saved client ID; saving another drops it.
 function showClientSecretState() {
@@ -178,6 +237,12 @@ async function load() {
     field("slack-auto-start-captions").checked = settings.slack.auto_start_captions;
     showSlackFields();
     field("meet-hide-captions").checked = settings.meet.hide_captions;
+    drive = settings.drive;
+    field("drive-enabled").checked = drive.enabled;
+    field("drive-root-folder").value = drive.root_folder;
+    field("drive-root-folder").placeholder = drive.default_root_folder;
+    renderDriveAccounts();
+    showDriveStatus();
     renderAccounts(settings.accounts);
   } catch (error) {
     showMessage(String(error), true);
@@ -208,6 +273,10 @@ async function save(event) {
     slack_read_captions: field("slack-read-captions").checked,
     slack_auto_start_captions: field("slack-auto-start-captions").checked,
     meet_hide_captions: field("meet-hide-captions").checked,
+    drive: {
+      enabled: field("drive-enabled").checked,
+      root_folder: field("drive-root-folder").value,
+    },
   };
   try {
     showMessage(await invoke("settings_save", { form }), false);
@@ -271,4 +340,5 @@ field("transcription-provider").addEventListener("change", showTranscriptionFiel
 field("client-id").addEventListener("input", showClientSecretState);
 field("check-claude-code").addEventListener("click", checkClaudeCode);
 field("slack-read-captions").addEventListener("change", showSlackFields);
+field("drive-account").addEventListener("change", pickDriveAccount);
 load();

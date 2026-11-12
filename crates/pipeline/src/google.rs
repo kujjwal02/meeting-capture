@@ -1,5 +1,7 @@
 //! Google sign-in and the Calendar API. The OAuth client, the account list and one refresh token
-//! per account live in the settings file.
+//! per account live in the settings file. Drive signs in through the same flow with its own
+//! refresh token. Google keeps one grant per account and client, so on an account that is also a
+//! calendar account, revoking either token ends both.
 
 use std::io::{Read as _, Write as _};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
@@ -23,7 +25,8 @@ const REVOKE_URL: &str = "https://oauth2.googleapis.com/revoke";
 const USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 const EVENTS_URL: &str = "https://www.googleapis.com/calendar/v3/calendars/primary/events";
 const CALENDAR_SCOPE: &str = "https://www.googleapis.com/auth/calendar.events.readonly";
-const SCOPES: [&str; 3] = [CALENDAR_SCOPE, "openid", "email"];
+pub(crate) const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
+const IDENTITY_SCOPES: [&str; 2] = ["openid", "email"];
 const SIGN_IN_TIMEOUT: Duration = Duration::from_mins(5);
 // Long enough for a browser on the same machine to send its request line and headers.
 const REDIRECT_READ_TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,10 +54,14 @@ pub enum GoogleError {
         "Google did not grant calendar access; add the account again and tick the calendar box"
     )]
     NoCalendarAccess,
+    #[error("Google did not grant Drive access; sign in to Drive again and tick the Drive box")]
+    NoDriveAccess,
     #[error("could not open the browser: {0}")]
     OpenBrowser(String),
     #[error("Google token request failed: {0}")]
     TokenRequest(String),
+    #[error("could not reach Google's token endpoint: {0}")]
+    TokenUnreachable(String),
     #[error("Google Calendar refused the request: {message}")]
     Forbidden { message: String },
     #[error("Google {action} request failed: {source}")]
@@ -206,8 +213,39 @@ impl std::fmt::Debug for SignedIn {
     }
 }
 
-/// Signs an account in through the default browser: authorization code with PKCE and a loopback
-/// redirect. Blocks for up to 5 minutes.
+/// The scope one sign-in asks for. Each sign-in gets its own refresh token, but Google keeps one
+/// grant per account and client, so revoking a token ends every token of that account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Grant {
+    Calendar,
+    Drive,
+}
+
+impl Grant {
+    fn required_scope(self) -> &'static str {
+        match self {
+            Self::Calendar => CALENDAR_SCOPE,
+            Self::Drive => DRIVE_SCOPE,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Calendar => "calendar",
+            Self::Drive => "drive",
+        }
+    }
+
+    fn missing_scope_error(self) -> GoogleError {
+        match self {
+            Self::Calendar => GoogleError::NoCalendarAccess,
+            Self::Drive => GoogleError::NoDriveAccess,
+        }
+    }
+}
+
+/// Signs a calendar account in through the default browser: authorization code with PKCE and a
+/// loopback redirect. Blocks for up to 5 minutes.
 ///
 /// # Errors
 ///
@@ -216,7 +254,30 @@ pub fn sign_in(
     client: &OAuthClient,
     open_browser: impl FnOnce(&str) -> Result<(), String>,
 ) -> Result<SignedIn, GoogleError> {
-    let _span = tracing::info_span!("google.sign_in").entered();
+    sign_in_for(Grant::Calendar, client, None, open_browser)
+}
+
+/// Signs the Drive account in, the same way as `sign_in`, for the `drive.file` scope only.
+/// `login_hint` preselects an account on Google's chooser.
+///
+/// # Errors
+///
+/// Returns `GoogleError` when the user refuses, the time runs out, or a request fails.
+pub fn sign_in_for_drive(
+    client: &OAuthClient,
+    login_hint: Option<&str>,
+    open_browser: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<SignedIn, GoogleError> {
+    sign_in_for(Grant::Drive, client, login_hint, open_browser)
+}
+
+fn sign_in_for(
+    grant: Grant,
+    client: &OAuthClient,
+    login_hint: Option<&str>,
+    open_browser: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<SignedIn, GoogleError> {
+    let _span = tracing::info_span!("google.sign_in", mc.google.grant = grant.as_str()).entered();
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).map_err(GoogleError::Redirect)?;
     let port = listener.local_addr().map_err(GoogleError::Redirect)?.port();
     let redirect_url = RedirectUrl::new(format!("http://127.0.0.1:{port}"))
@@ -224,14 +285,21 @@ pub fn sign_in(
     let oauth = client.oauth(Some(redirect_url));
 
     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
-    let (auth_url, state) = oauth
+    let scopes = [grant.required_scope()]
+        .into_iter()
+        .chain(IDENTITY_SCOPES)
+        .map(|scope| Scope::new(scope.to_owned()));
+    let mut authorize = oauth
         .authorize_url(CsrfToken::new_random)
-        .add_scopes(SCOPES.map(|scope| Scope::new(scope.to_owned())))
+        .add_scopes(scopes)
         .add_extra_param("access_type", "offline")
         // Consent each time, so Google sends a refresh token even for an account it has seen.
         .add_extra_param("prompt", "select_account consent")
-        .set_pkce_challenge(pkce_challenge)
-        .url();
+        .set_pkce_challenge(pkce_challenge);
+    if let Some(login_hint) = login_hint {
+        authorize = authorize.add_extra_param("login_hint", login_hint);
+    }
+    let (auth_url, state) = authorize.url();
     open_browser(auth_url.as_str()).map_err(GoogleError::OpenBrowser)?;
     let code = await_redirect(&listener, state.secret())?;
 
@@ -241,12 +309,14 @@ pub fn sign_in(
         .set_pkce_verifier(pkce_verifier)
         .request(&http)
         .map_err(|error| GoogleError::TokenRequest(token_error_message(&error)))?;
-    // Google's consent screen lets the user untick the calendar box and still sign in.
-    let has_calendar_scope = token
-        .scopes()
-        .is_some_and(|scopes| scopes.iter().any(|scope| scope.as_str() == CALENDAR_SCOPE));
-    if !has_calendar_scope {
-        return Err(GoogleError::NoCalendarAccess);
+    // Google's consent screen lets the user untick the scope's box and still sign in.
+    let has_required_scope = token.scopes().is_some_and(|scopes| {
+        scopes
+            .iter()
+            .any(|scope| scope.as_str() == grant.required_scope())
+    });
+    if !has_required_scope {
+        return Err(grant.missing_scope_error());
     }
     let refresh_token = token
         .refresh_token()
@@ -470,27 +540,36 @@ pub fn access_token(
             tracing::warn!(user.email = email, exception.message = %response, "Google refused the refresh token");
             Err(sign_in_again())
         }
+        // A dropped network clears by itself, so the caller may retry this one.
+        Err(RequestTokenError::Request(error)) => {
+            Err(GoogleError::TokenUnreachable(error.to_string()))
+        }
+        // Google answers every refusal with a JSON error. An empty, non-JSON or unparsable reply
+        // comes from an outage or a proxy, which clears by itself.
+        Err(error @ (RequestTokenError::Parse(..) | RequestTokenError::Other(_))) => {
+            Err(GoogleError::TokenUnreachable(token_error_message(&error)))
+        }
         Err(error) => Err(GoogleError::TokenRequest(token_error_message(&error))),
     }
 }
 
 #[derive(Deserialize)]
-struct ApiErrorBody {
-    error: ApiError,
+pub(crate) struct ApiErrorBody {
+    pub error: ApiError,
 }
 
 #[derive(Deserialize)]
-struct ApiError {
+pub(crate) struct ApiError {
     #[serde(default)]
-    message: String,
+    pub message: String,
     #[serde(default)]
-    errors: Vec<ApiErrorDetail>,
+    pub errors: Vec<ApiErrorDetail>,
 }
 
 #[derive(Deserialize)]
-struct ApiErrorDetail {
+pub(crate) struct ApiErrorDetail {
     #[serde(default)]
-    reason: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Deserialize)]

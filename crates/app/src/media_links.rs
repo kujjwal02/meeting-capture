@@ -1,12 +1,14 @@
 //! Opens the `meetingcapture://call/...` links in meeting notes. The OS hands a clicked link to
 //! the running app: on macOS as an open-URL event, on Windows as a second launch that the
-//! single-instance plugin forwards. A link to media this machine lacks shows why in a
+//! single-instance plugin forwards. A link to a file the Drive archive took opens its Drive copy,
+//! from the folder's `drive.json`. A link to other media this machine lacks shows why in a
 //! notification, and opens the call folder when it exists.
 
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use call_folder::media::{MediaLink, MediaTarget, PurgeRecord};
+use call_folder::drive_record::DriveRecord;
+use call_folder::media::{MediaLink, MediaTarget, PurgeRecord, VIDEO_FILE_NAME};
 use tauri::{AppHandle, Manager as _};
 use tauri_plugin_deep_link::DeepLinkExt as _;
 use tauri_plugin_opener::OpenerExt as _;
@@ -82,6 +84,12 @@ fn open(app: &AppHandle, url: &str) {
         return;
     }
     let path = link.path_in(&calls_dir);
+    if !path.exists()
+        && let Some(drive_copy) = drive_copy(&folder, &link)
+    {
+        open_drive_copy(app, &drive_copy);
+        return;
+    }
     let (opened, missing_reason) = if path.exists() {
         (path, None)
     } else {
@@ -121,5 +129,69 @@ fn open(app: &AppHandle, url: &str) {
             exception.message = %error,
             "could not open"
         );
+    }
+}
+
+/// The Drive copy a link opens in place of a file the archive deleted.
+struct DriveCopy {
+    web_view_link: String,
+    /// The stem lives on only in the video's mix, so the video opens instead.
+    is_in_video_mix: bool,
+}
+
+/// The Drive copy of the link's file, from `drive.json`. A stem the archive deleted with the
+/// video that mixed it opens the video's copy.
+fn drive_copy(folder: &std::path::Path, link: &MediaLink) -> Option<DriveCopy> {
+    let local_name = match link.target {
+        MediaTarget::Video => VIDEO_FILE_NAME.to_owned(),
+        MediaTarget::Stem { number, side } => side.file_name(number),
+        MediaTarget::Folder => return None,
+    };
+    let record = match DriveRecord::<serde::de::IgnoredAny>::read(folder) {
+        Ok(record) => record?,
+        Err(error) => {
+            tracing::warn!(exception.message = %error, "drive.json unreadable; no Drive copy to open");
+            return None;
+        }
+    };
+    let link_of = |name: &str| {
+        record
+            .files
+            .iter()
+            .find(|file| file.local_name == name)
+            .and_then(|file| file.drive_link().map(str::to_owned))
+    };
+    if let Some(web_view_link) = link_of(&local_name) {
+        return Some(DriveCopy {
+            web_view_link,
+            is_in_video_mix: false,
+        });
+    }
+    if record.mixed_stem_names.contains(&local_name) {
+        return link_of(VIDEO_FILE_NAME).map(|web_view_link| DriveCopy {
+            web_view_link,
+            is_in_video_mix: true,
+        });
+    }
+    None
+}
+
+fn open_drive_copy(app: &AppHandle, drive_copy: &DriveCopy) {
+    tracing::info!(
+        mc.media.is_in_video_mix = drive_copy.is_in_video_mix,
+        "media archived; opening its Drive copy"
+    );
+    if drive_copy.is_in_video_mix {
+        crate::notify(
+            app,
+            "Opening the video on Google Drive",
+            "This audio was archived inside the call's video. The video opens instead.",
+        );
+    }
+    if let Err(error) = app
+        .opener()
+        .open_url(&drive_copy.web_view_link, None::<&str>)
+    {
+        tracing::error!(exception.message = %error, "could not open the Drive copy");
     }
 }

@@ -1,8 +1,12 @@
 //! Finalize: after a call, one `call.mp4` in its call folder, with the video segments as one
 //! track and the mic and remote stems mixed into one AAC track, each at its place in time. The
-//! WAV stems and the video fragments stay as they are.
+//! WAV stems and the video fragments stay as they are; `purge` deletes the fragments later.
 //!
-//! `purge` deletes `call.mp4` and the fragments 90 days after the call. It is portable.
+//! `purge` deletes the fragments an hour after the call once `call.mp4` holds them, and
+//! `call.mp4` with any fragments left 90 days after the call. It is portable.
+//!
+//! `archive` tells the Drive archive which media of a call folder it may take, by the same
+//! finalize record, purge clock and locks.
 //!
 //! Placing and mixing are portable, in `plan` and `mix`, so the Windows capture can reuse them.
 //! Writing the MP4 is macOS only, in `mac`, through AVFoundation: the video passes through as it
@@ -14,8 +18,11 @@ use std::time::Duration;
 use jiff::Timestamp;
 
 use call_folder::FolderLock;
-pub use capture_protocol::finalize::{FinalizeOutcome, MediaPurge, Mp4Summary, PendingFinalize};
+pub use capture_protocol::finalize::{
+    FinalizeOutcome, FragmentCleanup, MediaPurge, Mp4Summary, PendingFinalize,
+};
 
+mod archive;
 #[cfg(target_os = "macos")]
 mod mac;
 pub mod mix;
@@ -23,13 +30,17 @@ pub mod plan;
 mod purge;
 mod record;
 
+pub use archive::{
+    ArchivableCall, ArchiveHold, ArchiveKind, MediaLocks, archive_readiness, take_media_locks,
+};
 pub use call_folder::media::PURGE_RECORD_FILE_NAME;
 pub use plan::{
     CallTimeline, InputTrack, PartStart, PlacedPart, PlacedStem, SkipReason, SkippedInput,
     StemChunk, VideoPartInput, plan, plan_folder,
 };
 pub use purge::{
-    FIRST_SEEN_FILE_NAME, MEDIA_RETENTION_DAYS, PURGE_RUN_FILE_NAME, purge_expired_media,
+    FIRST_SEEN_FILE_NAME, FRAGMENT_KEEP_AFTER_CALL_END, MEDIA_RETENTION_DAYS, PURGE_RUN_FILE_NAME,
+    delete_finalized_fragments, purge_expired_media,
 };
 pub use record::{FINALIZE_RECORD_FILE_NAME, needs_finalize};
 
@@ -117,6 +128,11 @@ pub fn finalize_folder(folder: &Path) -> Result<FinalizeOutcome, FinalizeError> 
 
 /// The run under the folder lock. An error is the outcome `Failed`, recorded by the caller.
 fn finalize_locked(folder: &Path) -> Result<FinalizeOutcome, FinalizeError> {
+    // The archive owns the media now; a run could rewrite call.mp4 under a recorded upload.
+    if call_folder::drive_record::is_archived(folder) {
+        tracing::info!(file.directory = %folder.display(), "finalize.skipped_archived_folder");
+        return Ok(FinalizeOutcome::Archived);
+    }
     // The fragments are gone or going, so a run would only record a failure.
     if purge::has_purge_record(folder) {
         tracing::warn!(file.directory = %folder.display(), "finalize.refused_purged_folder");

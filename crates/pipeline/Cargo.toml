@@ -14,9 +14,12 @@ wispr = ["stt/wispr"]
 [dependencies]
 call-finalize.workspace = true
 call-folder.workspace = true
+claxon.workspace = true
 directories.workspace = true
+flacenc.workspace = true
 jiff.workspace = true
 jobs.workspace = true
+md-5.workspace = true
 minijinja.workspace = true
 oauth2.workspace = true
 reqwest.workspace = true

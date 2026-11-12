@@ -1,6 +1,6 @@
-//! What `mc-capture finalize`, `mc-capture pending-finalize` and `mc-capture purge-media` print
-//! on stdout: one JSON object each. The app parses them with these types, so the two sides
-//! cannot drift.
+//! What `mc-capture finalize`, `mc-capture pending-finalize`, `mc-capture purge-media` and
+//! `mc-capture delete-finalized-fragments` print on stdout: one JSON object each. The app parses
+//! them with these types, so the two sides cannot drift.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -29,6 +29,8 @@ pub enum FinalizeOutcome {
     },
     /// The purge deleted the folder's video, so there is nothing to finalize.
     Purged,
+    /// The folder's media went to Google Drive and its local copy is gone.
+    Archived,
 }
 
 impl FinalizeOutcome {
@@ -41,6 +43,7 @@ impl FinalizeOutcome {
             Self::Written(_) => "written",
             Self::Failed { .. } => "failed",
             Self::Purged => "purged",
+            Self::Archived => "archived",
         }
     }
 }
@@ -141,6 +144,27 @@ pub struct PurgedCall {
     pub refused_entry_count: u64,
     /// `NNN-video` folders left in place because `call.mp4` does not hold their frames.
     pub unplaced_segments: Vec<u32>,
+}
+
+/// What one `mc-capture delete-finalized-fragments --calls-dir` run did. The helper also logs
+/// each deletion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FragmentCleanup {
+    pub cleaned: Vec<CleanedCall>,
+}
+
+/// A call folder whose `NNN-video` folders the run deleted because `call.mp4` holds their frames.
+/// Its `call.mp4` and stems stay.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CleanedCall {
+    pub folder: PathBuf,
+    /// The newest modified time of a capture file: a stem, a manifest or a video fragment.
+    pub call_ended_at: Timestamp,
+    pub deleted_segments: Vec<u32>,
+    pub deleted_file_count: u64,
+    pub deleted_bytes: u64,
+    /// Symbolic links and other entries the run would not delete through.
+    pub refused_entry_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2,7 +2,9 @@
 //! or ends. Dropping a menu closes it if it is open, so the once-a-second call status update
 //! changes the text of the existing call lines instead. The icon shows the worst call state: grey
 //! idle, a red dot while captions or audio record, amber at a problem. Each open call has an
-//! audio line and "Stop recording this call", or "Resume recording" once stopped.
+//! audio line and "Stop recording this call", or "Resume recording" once stopped. With the media
+//! archive on, one line says where it stands; a full Drive, a Drive sign-in or a failed sweep
+//! turns the icon amber.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -359,7 +361,11 @@ pub(crate) fn refresh(app: &AppHandle) {
 // The icon follows the worst call state, and the tooltip carries each call's status line.
 fn show_look(app: &AppHandle, tray: &TrayIcon, view: &BoardView) -> tauri::Result<()> {
     let capture = &app.state::<AppState>().call_capture;
-    let look = if capture.is_tab_video_failing() || !capture.refused_permissions().is_empty() {
+    let drive_problem = drive_archive_problem(app);
+    let look = if capture.is_tab_video_failing()
+        || !capture.refused_permissions().is_empty()
+        || drive_problem.is_some()
+    {
         TrayLook::Problem
     } else {
         match view.tray_look() {
@@ -381,6 +387,7 @@ fn show_look(app: &AppHandle, tray: &TrayIcon, view: &BoardView) -> tauri::Resul
     for service in capture.refused_permissions() {
         tooltip.push(recording_permission_line(service));
     }
+    tooltip.extend(drive_problem);
     let audio_states = capture.states();
     let video_states = capture.video_states();
     for call in &view.calls {
@@ -474,6 +481,7 @@ fn compose_menu(app: &AppHandle, view: &BoardView) -> tauri::Result<Menu<Wry>> {
 
     if let Some(pipeline) = &state.pipeline {
         append_google_accounts(app, &menu, &state.settings)?;
+        append_drive_archive(app, &menu, &state)?;
         menu.append(&PredefinedMenuItem::separator(app)?)?;
         append_meetings(app, &menu, pipeline)?;
         menu.append(&PredefinedMenuItem::separator(app)?)?;
@@ -646,6 +654,32 @@ fn append_google_accounts(
         }
     }
     Ok(())
+}
+
+// One line while the media archive is on. One the user fixes in settings opens the window.
+fn append_drive_archive(app: &AppHandle, menu: &Menu<Wry>, state: &AppState) -> tauri::Result<()> {
+    if !state.settings.drive().enabled {
+        return Ok(());
+    }
+    let status = state.drive_archive.status();
+    let label = shorten(&status.line(), MAX_FAILURE_CHARS);
+    if status.needs_settings() {
+        menu.append(&action_entry(app, &MenuAction::OpenSettings, &label, true)?)
+    } else {
+        menu.append(&label_entry(app, &label)?)
+    }
+}
+
+// The archive's line when it turns the icon amber.
+fn drive_archive_problem(app: &AppHandle) -> Option<String> {
+    let state = app.state::<AppState>();
+    if !state.settings.drive().enabled {
+        return None;
+    }
+    let status = state.drive_archive.status();
+    status
+        .is_problem()
+        .then(|| shorten(&status.line(), MAX_FAILURE_CHARS))
 }
 
 fn append_meetings(app: &AppHandle, menu: &Menu<Wry>, pipeline: &Pipeline) -> tauri::Result<()> {
